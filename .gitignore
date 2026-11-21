@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+/dist/
+*.tsbuildinfo
+
+# Logs & temporary files
+*.log
+.DS_Store
+Thumbs.db
+tmp/
+.tmp/
+
+# Local environment overrides
+.env
+.env.local

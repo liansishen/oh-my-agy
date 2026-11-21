@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@stencil-hq/tern",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["bun"],
+    "paths": {
+      "@stencil-hq/tern": ["./vendor/tern/src/index.ts"],
+      "@stencil-hq/tern/jsx-runtime": ["./vendor/tern/src/jsx-runtime.ts"],
+      "@stencil-hq/tern/jsx-dev-runtime": ["./vendor/tern/src/jsx-dev-runtime.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx"]
+}

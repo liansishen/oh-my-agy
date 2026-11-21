@@ -1,0 +1,7 @@
+schema = 1
+id = "oma-reopen"
+name = "Oh My Agy Session Reopen"
+version = "0.1.0"
+description = "Restore oma sessions when Tern rebuilds panes after a restart."
+icon = "history"
+host = "host.luau"

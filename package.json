@@ -1,0 +1,23 @@
+{
+  "name": "oh-my-agy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "oma": "./src/bin/oma.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/bin/oma.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build:win": "bun build --compile src/bin/oma.ts --outfile dist/oma.exe",
+    "build:linux": "bun build --compile --target=bun-linux-x64 src/bin/oma.ts --outfile dist/oma"
+  },
+  "dependencies": {
+    "@stencil-hq/tern": "file:./vendor/tern"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

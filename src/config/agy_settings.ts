@@ -1,0 +1,379 @@
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { homedir as osHomedir } from 'node:os';
+import { basename, dirname, posix, win32 } from 'node:path';
+
+/**
+ * Strict safe allowlist of `agy` settings keys in `~/.gemini/antigravity-cli/settings.json`.
+ *
+ * Security & ToS boundary:
+ * - Only these five non-sensitive safety/behavior keys may be read or written.
+ * - Unknown keys in `settings.json` are preserved verbatim on write and never exposed.
+ * - OAuth / Keyring / API Key credential files are strictly forbidden.
+ */
+export const AGY_SAFE_SETTING_KEYS = [
+  'toolPermission',
+  'enableTerminalSandbox',
+  'allowNonWorkspaceAccess',
+  'artifactReviewPolicy',
+  'useG1Credits',
+] as const;
+
+export type AgySafeSettingKey = (typeof AGY_SAFE_SETTING_KEYS)[number];
+
+export const AGY_TOOL_PERMISSION_VALUES = [
+  'request-review',
+  'proceed-in-sandbox',
+  'strict',
+  'always-proceed',
+] as const;
+
+export type AgyToolPermission = (typeof AGY_TOOL_PERMISSION_VALUES)[number];
+
+export const AGY_ARTIFACT_REVIEW_POLICY_VALUES = [
+  'asks-for-review',
+  'always-proceed',
+] as const;
+
+export type AgyArtifactReviewPolicy = (typeof AGY_ARTIFACT_REVIEW_POLICY_VALUES)[number];
+
+export interface AgySafeSettings {
+  readonly toolPermission: AgyToolPermission;
+  readonly enableTerminalSandbox: boolean;
+  readonly allowNonWorkspaceAccess: boolean;
+  readonly artifactReviewPolicy: AgyArtifactReviewPolicy;
+  readonly useG1Credits: boolean;
+}
+
+export const DEFAULT_AGY_SAFE_SETTINGS: AgySafeSettings = Object.freeze({
+  toolPermission: 'request-review',
+  enableTerminalSandbox: false,
+  allowNonWorkspaceAccess: false,
+  artifactReviewPolicy: 'asks-for-review',
+  useG1Credits: false,
+});
+
+export interface AgySettingsPathOptions {
+  /** Explicit path override for unit tests. */
+  readonly path?: string;
+  readonly homedir?: string;
+  readonly platform?: NodeJS.Platform;
+}
+
+export interface LoadAgySettingsResult {
+  readonly path: string;
+  readonly exists: boolean;
+  readonly settings: AgySafeSettings;
+  /** Safe allowlisted keys currently explicitly present in `settings.json`. */
+  readonly presentKeys: readonly AgySafeSettingKey[];
+  readonly warnings: readonly string[];
+}
+
+export type AgySafeSettingsPatch = {
+  readonly [K in AgySafeSettingKey]?: AgySafeSettings[K] | null;
+};
+
+export interface SaveAgySettingsResult {
+  readonly path: string;
+  readonly settings: AgySafeSettings;
+  readonly updatedKeys: readonly AgySafeSettingKey[];
+  readonly deletedKeys: readonly AgySafeSettingKey[];
+  readonly ignoredKeys: readonly string[];
+}
+
+const SAFE_KEY_SET: ReadonlySet<string> = new Set(AGY_SAFE_SETTING_KEYS);
+const TOOL_PERMISSION_SET: ReadonlySet<string> = new Set(AGY_TOOL_PERMISSION_VALUES);
+const ARTIFACT_REVIEW_SET: ReadonlySet<string> = new Set(AGY_ARTIFACT_REVIEW_POLICY_VALUES);
+
+const FORBIDDEN_CREDENTIAL_FILENAMES = new Set([
+  'oauth_creds.json',
+  'google_accounts.json',
+  'jetski-standalone-oauth-token',
+  'credentials.json',
+  'auth.json',
+  'tokens.json',
+]);
+
+function assertSafeSettingsPath(filePath: string): void {
+  const base = basename(filePath.replace(/\\/g, '/')).toLowerCase();
+  if (
+    FORBIDDEN_CREDENTIAL_FILENAMES.has(base) ||
+    base.includes('oauth') ||
+    base.includes('keyring') ||
+    base.includes('credential') ||
+    base.includes('token')
+  ) {
+    throw new Error(`Refusing to access credential-like file: ${filePath}`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Resolves the default `~/.gemini/antigravity-cli/settings.json` path (or an injected test path).
+ */
+export function getAgySettingsPath(options: AgySettingsPathOptions = {}): string {
+  if (options.path) {
+    assertSafeSettingsPath(options.path);
+    return options.path;
+  }
+  const platform = options.platform ?? process.platform;
+  const home = options.homedir ?? osHomedir();
+  const resolved =
+    platform === 'win32'
+      ? win32.join(home, '.gemini', 'antigravity-cli', 'settings.json')
+      : posix.join(home, '.gemini', 'antigravity-cli', 'settings.json');
+  assertSafeSettingsPath(resolved);
+  return resolved;
+}
+
+export function isAgySafeSettingKey(key: string): key is AgySafeSettingKey {
+  return SAFE_KEY_SET.has(key);
+}
+
+function extractSafeSettings(
+  raw: Record<string, unknown>,
+  warnings: string[],
+): { settings: AgySafeSettings; presentKeys: AgySafeSettingKey[] } {
+  const presentKeys: AgySafeSettingKey[] = [];
+
+  let toolPermission: AgyToolPermission = DEFAULT_AGY_SAFE_SETTINGS.toolPermission;
+  if ('toolPermission' in raw && raw['toolPermission'] !== undefined) {
+    presentKeys.push('toolPermission');
+    const v = raw['toolPermission'];
+    if (typeof v === 'string' && TOOL_PERMISSION_SET.has(v)) {
+      toolPermission = v as AgyToolPermission;
+    } else {
+      warnings.push(`toolPermission: invalid value "${String(v)}", using default`);
+    }
+  }
+
+  let enableTerminalSandbox = DEFAULT_AGY_SAFE_SETTINGS.enableTerminalSandbox;
+  if ('enableTerminalSandbox' in raw && raw['enableTerminalSandbox'] !== undefined) {
+    presentKeys.push('enableTerminalSandbox');
+    const v = raw['enableTerminalSandbox'];
+    if (typeof v === 'boolean') {
+      enableTerminalSandbox = v;
+    } else {
+      warnings.push('enableTerminalSandbox: expected boolean, using default');
+    }
+  }
+
+  let allowNonWorkspaceAccess = DEFAULT_AGY_SAFE_SETTINGS.allowNonWorkspaceAccess;
+  if ('allowNonWorkspaceAccess' in raw && raw['allowNonWorkspaceAccess'] !== undefined) {
+    presentKeys.push('allowNonWorkspaceAccess');
+    const v = raw['allowNonWorkspaceAccess'];
+    if (typeof v === 'boolean') {
+      allowNonWorkspaceAccess = v;
+    } else {
+      warnings.push('allowNonWorkspaceAccess: expected boolean, using default');
+    }
+  }
+
+  let artifactReviewPolicy: AgyArtifactReviewPolicy =
+    DEFAULT_AGY_SAFE_SETTINGS.artifactReviewPolicy;
+  if ('artifactReviewPolicy' in raw && raw['artifactReviewPolicy'] !== undefined) {
+    presentKeys.push('artifactReviewPolicy');
+    const v = raw['artifactReviewPolicy'];
+    if (typeof v === 'string' && ARTIFACT_REVIEW_SET.has(v)) {
+      artifactReviewPolicy = v as AgyArtifactReviewPolicy;
+    } else {
+      warnings.push(`artifactReviewPolicy: invalid value "${String(v)}", using default`);
+    }
+  }
+
+  let useG1Credits = DEFAULT_AGY_SAFE_SETTINGS.useG1Credits;
+  if ('useG1Credits' in raw && raw['useG1Credits'] !== undefined) {
+    presentKeys.push('useG1Credits');
+    const v = raw['useG1Credits'];
+    if (typeof v === 'boolean') {
+      useG1Credits = v;
+    } else {
+      warnings.push('useG1Credits: expected boolean, using default');
+    }
+  }
+
+  return {
+    settings: {
+      toolPermission,
+      enableTerminalSandbox,
+      allowNonWorkspaceAccess,
+      artifactReviewPolicy,
+      useG1Credits,
+    },
+    presentKeys,
+  };
+}
+
+function validateSafeSettingValue(key: AgySafeSettingKey, value: unknown): boolean {
+  switch (key) {
+    case 'toolPermission':
+      return typeof value === 'string' && TOOL_PERMISSION_SET.has(value);
+    case 'artifactReviewPolicy':
+      return typeof value === 'string' && ARTIFACT_REVIEW_SET.has(value);
+    case 'enableTerminalSandbox':
+    case 'allowNonWorkspaceAccess':
+    case 'useG1Credits':
+      return typeof value === 'boolean';
+  }
+}
+
+/**
+ * Reads only the 5 allowlisted safe settings from `~/.gemini/antigravity-cli/settings.json`.
+ * Never throws on missing or malformed files; never exposes unknown keys.
+ */
+export async function loadAgySettings(
+  options: AgySettingsPathOptions = {},
+): Promise<LoadAgySettingsResult> {
+  const filePath = getAgySettingsPath(options);
+  try {
+    const text = await readFile(filePath, 'utf8');
+    if (text.trim().length === 0) {
+      return {
+        path: filePath,
+        exists: true,
+        settings: DEFAULT_AGY_SAFE_SETTINGS,
+        presentKeys: [],
+        warnings: [],
+      };
+    }
+    const parsed: unknown = JSON.parse(text);
+    if (!isPlainObject(parsed)) {
+      return {
+        path: filePath,
+        exists: true,
+        settings: DEFAULT_AGY_SAFE_SETTINGS,
+        presentKeys: [],
+        warnings: ['agy settings.json root must be a JSON object, using defaults'],
+      };
+    }
+    const warnings: string[] = [];
+    const { settings, presentKeys } = extractSafeSettings(parsed, warnings);
+    return {
+      path: filePath,
+      exists: true,
+      settings,
+      presentKeys,
+      warnings,
+    };
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === 'ENOENT') {
+      return {
+        path: filePath,
+        exists: false,
+        settings: DEFAULT_AGY_SAFE_SETTINGS,
+        presentKeys: [],
+        warnings: [],
+      };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      path: filePath,
+      exists: true,
+      settings: DEFAULT_AGY_SAFE_SETTINGS,
+      presentKeys: [],
+      warnings: [`Failed to read ${filePath}: ${message}`],
+    };
+  }
+}
+
+/**
+ * Atomically updates allowlisted safe keys in `~/.gemini/antigravity-cli/settings.json`.
+ *
+ * Guarantees:
+ * - Preserves 100% of all unknown keys already present in `settings.json`.
+ * - Ignores any non-allowlisted keys passed in `patch`.
+ * - Deletes an allowlisted key when its value is reset to the official default (or `null`).
+ * - Refuses to overwrite a corrupted existing JSON file.
+ * - Writes atomically via temp file + `rename`.
+ */
+export async function saveAgySettings(
+  patch: AgySafeSettingsPatch | Record<string, unknown>,
+  options: AgySettingsPathOptions = {},
+): Promise<SaveAgySettingsResult> {
+  const filePath = getAgySettingsPath(options);
+
+  // 1. Read existing JSON document while preserving all unknown keys verbatim
+  let existing: Record<string, unknown> = {};
+  try {
+    const text = await readFile(filePath, 'utf8');
+    if (text.trim().length > 0) {
+      const parsed: unknown = JSON.parse(text);
+      if (!isPlainObject(parsed)) {
+        throw new Error(`Existing ${filePath} is not a JSON object; refusing to overwrite`);
+      }
+      existing = { ...parsed };
+    }
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code !== 'ENOENT') {
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  // 2. Apply strictly allowlisted updates; delete keys when set to default or null
+  const updatedKeys: AgySafeSettingKey[] = [];
+  const deletedKeys: AgySafeSettingKey[] = [];
+  const ignoredKeys: string[] = [];
+
+  for (const [key, value] of Object.entries(patch)) {
+    if (!isAgySafeSettingKey(key)) {
+      ignoredKeys.push(key);
+      continue;
+    }
+    if (value === undefined) {
+      continue;
+    }
+    const defaultValue = DEFAULT_AGY_SAFE_SETTINGS[key];
+    if (value === null || value === defaultValue) {
+      if (key in existing) {
+        delete existing[key];
+      }
+      deletedKeys.push(key);
+      continue;
+    }
+    if (!validateSafeSettingValue(key, value)) {
+      throw new Error(`Invalid value for agy setting "${key}": ${String(value)}`);
+    }
+    existing[key] = value;
+    updatedKeys.push(key);
+  }
+
+  // 3. Atomic write via temp file + rename
+  await mkdir(dirname(filePath), { recursive: true });
+  const serialized = `${JSON.stringify(existing, null, 2)}\n`;
+  const nonce = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}`;
+  const tmpPath = `${filePath}.${nonce}.tmp`;
+
+  try {
+    await writeFile(tmpPath, serialized, 'utf8');
+    await rename(tmpPath, filePath);
+  } catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+
+  const warnings: string[] = [];
+  const { settings } = extractSafeSettings(existing, warnings);
+
+  return {
+    path: filePath,
+    settings,
+    updatedKeys,
+    deletedKeys,
+    ignoredKeys,
+  };
+}
+
+/**
+ * Convenience helper to update (or reset with `null`) a single allowlisted `agy` setting.
+ */
+export async function updateAgySetting<K extends AgySafeSettingKey>(
+  key: K,
+  value: AgySafeSettings[K] | null,
+  options: AgySettingsPathOptions = {},
+): Promise<SaveAgySettingsResult> {
+  return saveAgySettings({ [key]: value } as AgySafeSettingsPatch, options);
+}
