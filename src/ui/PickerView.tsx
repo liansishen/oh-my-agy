@@ -1990,6 +1990,7 @@ const SHORT_BUILTIN_COMMAND_DESC: Readonly<Record<string, string>> = {
   quit: 'Exit oma cleanly',
   board: 'Open swarm board',
   jobs: 'Inspect background jobs',
+  git: 'Inspect Git diff & commit',
 };
 
 function clampHelpDesc(text: string, maxLen = 28): string {

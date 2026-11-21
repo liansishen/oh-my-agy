@@ -4243,7 +4243,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     host.input.emit('\x1b');
     await waitFor(() => controller.store.getState().infoOverlay === null);
 
-    // 4. Streaming turn: live TPS lights up (`info`), then after end_turn calibrates from transcript (`250/s`) & dims (`muted`), and tokens increment!
+    // 4. Streaming turn: live TPS lights up (`info`), then after end_turn calibrates from transcript (`250 tok/s`) & dims (`muted`), and tokens increment!
     await controller.submitInput('Show live TPS and calibrate');
     await waitFor(
       () =>
@@ -4261,6 +4261,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(liveTpsSeg?.p['icon']).toBe('bolt');
     expect(liveTpsSeg?.p['tone']).toBe('info');
     expect(JSON.stringify(liveTpsSeg?.p['spans'])).toContain('"s":"info"');
+    expect(JSON.stringify(liveTpsSeg?.p['spans'])).toContain(' tok/s');
 
     // Switch git mock to non-git before turn finishes (after >1500ms clock advance inside prompt) to verify non-git auto-hides
     gitIsRepo = false;
@@ -4280,14 +4281,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       return (
         !nodes.has('dock.composer.bar.extras.git') &&
         tps?.p['tone'] === 'muted' &&
-        JSON.stringify(tps?.p['spans'] ?? '').includes('250/s') &&
+        JSON.stringify(tps?.p['spans'] ?? '').includes('250 tok/s') &&
         JSON.stringify(tok?.p['spans'] ?? '').includes('↑1.2M')
       );
     });
     current = replayCurrentWireNodes();
     expect(current.has('dock.composer.bar.extras.git')).toBe(false);
     expect(current.get('dock.composer.bar.extras.tps')?.p['spans']).toEqual([
-      { t: '250/s', s: 'muted' },
+      { t: '250 tok/s', s: 'muted' },
     ]);
     expect(current.get('dock.composer.bar.extras.tokens')?.p['spans']).toEqual([
       { t: '↑1.2M', s: 'info' },
@@ -4507,6 +4508,427 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const lateDoneIdx = lateStream.indexOf('\x1b]7501;state=done');
     expect(lateTextIdx).toBeGreaterThanOrEqual(0);
     expect(lateDoneIdx).toBeGreaterThan(lateTextIdx);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('clicking bottom git status segment (status.git) and /git open omp.app.git fullscreen UI with diff, stage/unstage, commit, and clean HEAD view', async () => {
+    const tmp = makeTempDir();
+    const repoDir = join(tmp, 'repo');
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+
+    const runGit = (args: string[]) => {
+      const res = Bun.spawnSync(['git', ...args], {
+        cwd: repoDir,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      if (res.exitCode !== 0) {
+        throw new Error(`git ${args.join(' ')} failed: ${res.stderr.toString('utf8')}`);
+      }
+      return res.stdout.toString('utf8');
+    };
+
+    runGit(['init', '-b', 'main']);
+    runGit(['config', 'user.name', 'OMA Tester']);
+    runGit(['config', 'user.email', 'tester@oma.local']);
+    writeFileSync(join(repoDir, 'src', 'hello.ts'), 'export const greeting = "hello";\n', 'utf8');
+    runGit(['add', '.']);
+    runGit(['commit', '-m', 'Initial commit']);
+
+    // Modify tracked file so working tree is dirty
+    writeFileSync(
+      join(repoDir, 'src', 'hello.ts'),
+      'export const greeting = "hello world";\nexport const version = 2;\n',
+      'utf8'
+    );
+
+    const host = new FakeTernHost({
+      features: ['blobs', 'styles', 'settle', 'dock', 'scroll', 'font', 'aside'],
+    });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-git-ui', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: repoDir,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: join(tmp, 'brain'),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { p: Record<string, unknown> }>();
+      const addSubtree = (node: WireNode): void => {
+        nodes.set(node.id, { p: { ...(node.p ?? {}) } });
+        if (Array.isArray(node.c)) {
+          for (const child of node.c) {
+            addSubtree(child);
+          }
+        }
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          addSubtree(op[4]);
+        } else if (op[0] === 'del') {
+          deleteSubtree(op[1]);
+        } else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const findDiffNode = (
+      nodes: Map<string, { p: Record<string, unknown> }>
+    ): { p: Record<string, unknown> } | undefined => {
+      for (const [id, node] of nodes) {
+        if (id.startsWith('layer.git.app.main.diff-')) return node;
+      }
+      return undefined;
+    };
+
+    // 1. Bottom composer git segment is rendered with clickable `status.git` action
+    await waitFor(() => {
+      const gitSeg = replayNodes().get('dock.composer.bar.extras.git');
+      const spansJson = JSON.stringify(gitSeg?.p?.['spans'] ?? '');
+      return Boolean(gitSeg && spansJson.includes('"main"') && spansJson.includes('"*"'));
+    });
+    const gitSeg = replayNodes().get('dock.composer.bar.extras.git');
+    expect(gitSeg?.p?.['actions']).toEqual({ click: 'status.git' });
+
+    // 2. Clicking bottom git segment opens fullscreen `omp.app.git` overlay
+    host.input.emitTspEvent({
+      ev: 'action',
+      sf: 'oma',
+      id: 'dock.composer.bar.extras.git',
+      act: 'status.git',
+    });
+    await waitFor(() => {
+      const g = controller.store.getState().gitOverlay;
+      return Boolean(
+        g &&
+          !g.loading &&
+          g.snapshot?.branch === 'main' &&
+          g.snapshot.unstaged.length === 1 &&
+          g.diff &&
+          !g.diffLoading
+      );
+    });
+
+    await waitFor(() => {
+      const nodes = replayNodes();
+      return nodes.has('layer.git') && Boolean(findDiffNode(nodes));
+    });
+    let nodes = replayNodes();
+    expect(nodes.get('layer.git')?.p?.['size']).toBe('full');
+    expect(nodes.get('layer.git')?.p?.['role']).toBe('oma.overlay.git');
+    expect(nodes.get('layer.git.app')?.p?.['role']).toBe('omp.app.git');
+    const diffNode = findDiffNode(nodes);
+    expect(diffNode?.p?.['role']).toBe('omp.app.git.diff');
+    expect(diffNode?.p?.['mode']).toBe('split');
+    expect(String(diffNode?.p?.['text'] ?? '')).toContain('hello world');
+
+    // 3. View mode switching (`inline`, `split`) and sidebar style (`tree`)
+    host.input.emitTspEvent({
+      ev: 'select',
+      sf: 'oma',
+      id: 'layer.git.app.main.bar.tools.views',
+      item: 'inline',
+    });
+    await waitFor(() => findDiffNode(replayNodes())?.p?.['mode'] === 'unified');
+
+    host.input.emitTspEvent({
+      ev: 'select',
+      sf: 'oma',
+      id: 'layer.git.app.side.head.style',
+      item: 'tree',
+    });
+    await waitFor(() => controller.store.getState().gitOverlay?.sidebarStyle === 'tree');
+
+    // 4. Stage file via `s` hotkey, commit via Commit form, and verify Clean Tree HEAD commit view
+    host.input.emit('s');
+    await waitFor(
+      () =>
+        controller.store.getState().gitOverlay?.snapshot?.staged.length === 1 &&
+        controller.store.getState().gitOverlay?.snapshot?.unstaged.length === 0
+    );
+
+    controller.store.setGitCommitSummary('feat: update greeting');
+    await waitFor(
+      () =>
+        replayNodes().get('layer.git.app.side.commit.foot.commit-btn')?.p?.['disabled'] === false
+    );
+    host.input.emitTspEvent({
+      ev: 'action',
+      sf: 'oma',
+      id: 'layer.git.app.side.commit.foot.commit-btn',
+      act: 'git.commit',
+    });
+    await waitFor(() => {
+      const g = controller.store.getState().gitOverlay;
+      return Boolean(
+        g &&
+          !g.busy &&
+          g.snapshot?.clean === true &&
+          g.snapshot.headCommit?.subject === 'feat: update greeting'
+      );
+    });
+    await waitFor(() => replayNodes().has('layer.git.app.side.head'));
+    nodes = replayNodes();
+    expect(nodes.get('layer.git.app.side.head')?.p?.['role']).toBe('omp.app.git.commit-info');
+    expect(controller.store.getState().gitStatus?.isDirty).toBe(false);
+
+    // 5. Esc closes Git overlay and restores composer editor focus
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().gitOverlay === null);
+    expect(controller.store.getDesiredSurfaceFocus()).toBe(EDITOR_NODE_ID);
+
+    // 6. `/git` slash command opens the same Git overlay and `q` closes it
+    await controller.submitInput('/git');
+    await waitFor(() => {
+      const g = controller.store.getState().gitOverlay;
+      return Boolean(g && !g.loading && g.snapshot?.headCommit?.subject === 'feat: update greeting');
+    });
+    host.input.emit('q');
+    await waitFor(() => controller.store.getState().gitOverlay === null);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('elicitation/create (ask_question): advertises clientCapabilities.elicitation.form, pairs qN + qN_other into Other inputs, supports back/next/skip/arrows/custom write-in', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost({
+      features: ['blobs', 'styles', 'settle', 'dock', 'scroll', 'font', 'aside'],
+    });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let initClientCaps: Record<string, unknown> | undefined;
+    let promptCount = 0;
+    let activePromptId: string | number | undefined;
+    const elicitationReplies: RpcEnvelope[] = [];
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        initClientCaps = msg.params?.['clientCapabilities'] as Record<string, unknown> | undefined;
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-ask-q', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptCount += 1;
+        activePromptId = msg.id;
+        if (promptCount === 1) {
+          h.send({
+            jsonrpc: '2.0',
+            id: 'elic-multi-1',
+            method: 'elicitation/create',
+            params: {
+              sessionId: 'sess-ask-q',
+              mode: 'form',
+              message: 'Clarify deployment choices',
+              requestedSchema: {
+                type: 'object',
+                properties: {
+                  q1: {
+                    type: 'string',
+                    title: 'Repository visibility?',
+                    oneOf: [
+                      { const: 'public', title: 'Public' },
+                      { const: 'private', title: 'Private' },
+                    ],
+                  },
+                  q1_other: {
+                    type: 'string',
+                    title: 'Other visibility notes',
+                  },
+                  q2: {
+                    type: 'array',
+                    title: 'Features to include?',
+                    items: {
+                      type: 'string',
+                      oneOf: [
+                        { const: 'installer', title: 'Install script' },
+                        { const: 'updater', title: 'Self updater' },
+                      ],
+                    },
+                  },
+                  q2_other: {
+                    type: 'string',
+                    description: 'Extra feature',
+                  },
+                },
+                required: ['q1'],
+              },
+            },
+          });
+        } else {
+          h.send({
+            jsonrpc: '2.0',
+            id: 'elic-other-2',
+            method: 'elicitation/create',
+            params: {
+              sessionId: 'sess-ask-q',
+              mode: 'form',
+              requestedSchema: {
+                type: 'object',
+                properties: {
+                  q1: {
+                    type: 'string',
+                    title: 'Pick target',
+                    enum: ['win', 'linux'],
+                  },
+                  q1_other: {
+                    type: 'string',
+                    description: 'Custom target',
+                  },
+                },
+              },
+            },
+          });
+        }
+      } else if ((msg.id === 'elic-multi-1' || msg.id === 'elic-other-2') && msg.result) {
+        elicitationReplies.push(msg);
+        h.send({ jsonrpc: '2.0', id: activePromptId, result: { stopReason: 'end_turn' } });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: join(tmp, 'brain'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Verify initialize handshake explicitly advertises elicitation form & url capabilities
+    expect(initClientCaps).toEqual({
+      elicitation: { form: {}, url: {} },
+    });
+
+    // 2. Round 1: q1 + q1_other and q2 + q2_other merge into 2 questions (not 4) with Other inputs
+    void controller.submitInput('ask two paired questions');
+    await waitFor(() => controller.store.getState().activeQuestion !== null);
+
+    const card = controller.store.getState().activeQuestion!;
+    expect(card.items.length).toBe(2);
+    expect(card.items[0]?.id).toBe('q1');
+    expect(card.items[0]?.writeInFieldId).toBe('q1_other');
+    expect(card.items[0]?.other).toBeTruthy();
+    expect(card.items[1]?.id).toBe('q2');
+    expect(card.items[1]?.writeInFieldId).toBe('q2_other');
+    expect(card.items[1]?.multi).toBe(true);
+    expect(card.items[1]?.other).toBeTruthy();
+
+    expect(host.findWireNodes(n => n.id === 'main.questions.q1.other').length).toBeGreaterThan(0);
+    expect(host.findWireNodes(n => n.id === 'main.questions.q2.other').length).toBeGreaterThan(0);
+
+    // ArrowDown selects first choice ('public'), ArrowDown again selects 'private', ArrowUp returns to 'public'
+    host.input.emit('\x1b[B');
+    await waitFor(() => controller.store.getState().activeQuestion?.answers['q1'] === 'public');
+    host.input.emit('\x1b[B');
+    await waitFor(() => controller.store.getState().activeQuestion?.answers['q1'] === 'private');
+    host.input.emit('\x1b[A');
+    await waitFor(() => controller.store.getState().activeQuestion?.answers['q1'] === 'public');
+
+    // Step forward via Tern `next` action and test `back` -> `next`
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'next' });
+    await waitFor(() => controller.store.getState().activeQuestion?.step === 1);
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'back' });
+    await waitFor(() => controller.store.getState().activeQuestion?.step === 0);
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'next' });
+    await waitFor(() => controller.store.getState().activeQuestion?.step === 1);
+
+    // Multi-select: press '1' for 'installer', then '3' (N+1) to focus q2.other and type 'homebrew'
+    host.input.emit('1');
+    await waitFor(() =>
+      JSON.stringify(controller.store.getState().activeQuestion?.answers['q2']) ===
+      JSON.stringify(['installer'])
+    );
+    host.input.emit('3');
+    await waitFor(() => controller.currentSurfaceFocus === 'main.questions.q2.other');
+    host.input.emit('homebrew\r');
+
+    await waitFor(() => elicitationReplies.length === 1);
+    expect(elicitationReplies[0]!.result).toEqual({
+      action: 'accept',
+      content: {
+        q1: 'public',
+        q2: ['installer'],
+        q2_other: 'homebrew',
+      },
+    });
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // 3. Round 2: Single-select answered via Other write-in writes ONLY `q1_other` (never invalid enum value in `q1`)
+    void controller.submitInput('ask single question with other');
+    await waitFor(() => controller.store.getState().activeQuestion !== null);
+    host.input.emit('3'); // N+1 focuses q1.other
+    await waitFor(() => controller.currentSurfaceFocus === 'main.questions.q1.other');
+    host.input.emit('macos-arm64\r');
+
+    await waitFor(() => elicitationReplies.length === 2);
+    expect(elicitationReplies[1]!.result).toEqual({
+      action: 'accept',
+      content: {
+        q1_other: 'macos-arm64',
+      },
+    });
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(controller.currentSurfaceFocus).toBe(EDITOR_NODE_ID);
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

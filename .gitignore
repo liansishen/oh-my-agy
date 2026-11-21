@@ -1,9 +1,13 @@
-# Dependencies
+# Dependencies & caches
 node_modules/
+.bun-cache/
 
 # Build outputs
 /dist/
+/release-assets/
 *.tsbuildinfo
+*.old
+*.new
 
 # Logs & temporary files
 *.log

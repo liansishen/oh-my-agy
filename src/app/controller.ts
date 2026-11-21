@@ -81,6 +81,17 @@ import {
   type GitExecFn,
 } from '../state/git_status';
 import {
+  commitGitChanges,
+  getAllVisibleGitFiles,
+  gitFileKey,
+  loadGitFileDiff,
+  loadGitRepoSnapshot,
+  stageGitFiles,
+  unstageGitFiles,
+  type GitChangedFile,
+  type GitDiffViewMode,
+} from '../state/git_tui';
+import {
   areSessionMetricsEqual,
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
@@ -357,6 +368,8 @@ export class AppController {
   #gitProbePendingForce = false;
   #gitLastProbedAt = 0;
   #gitLastProbedCwd = '';
+  #gitOverlayLoadSeq = 0;
+  #gitOverlayDiffSeq = 0;
   #authMethods: AuthMethod[] = [];
   #lastFocusedId: string | null | undefined = undefined;
   #workingStartedAt: number | undefined = undefined;
@@ -776,7 +789,12 @@ export class AppController {
       const initRes = await client.initialize({
         protocolVersion: 1,
         clientInfo: { name: 'oma', version: OMA_VERSION },
-        clientCapabilities: {},
+        clientCapabilities: {
+          elicitation: {
+            form: {},
+            url: {},
+          },
+        },
       });
       this.#authMethods = initRes.authMethods ?? [];
       this.store.setAgentInitializeInfo(
@@ -1175,6 +1193,9 @@ export class AppController {
       }
       this.osc.setStatusBlocked('question');
       this.scheduler.renderNow();
+      if (this.surface && this.session.caps.features.includes('scroll')) {
+        this.surface.reveal('main.questions', 'end');
+      }
       this.syncFocus();
       return;
     }
@@ -1336,6 +1357,7 @@ export class AppController {
       !state.isBusy &&
       !state.picker &&
       !state.swarmBoardOpen &&
+      !state.gitOverlay &&
       !state.infoOverlay &&
       !state.helpOpen &&
       !(state.settings && state.focusMode === 'settings') &&
@@ -1355,6 +1377,12 @@ export class AppController {
     // Priority 2b: Dedicated native `agy`-style Swarm Board overlay
     if (state.swarmBoardOpen) {
       await this.#handleSwarmBoardKey(key);
+      return;
+    }
+
+    // Priority 2b+: Fullscreen Git UI (`omp.app.git`)
+    if (state.gitOverlay) {
+      await this.#handleGitOverlayKey(key);
       return;
     }
 
@@ -2148,12 +2176,11 @@ export class AppController {
 
     const name = key.name.toLowerCase();
 
-    if (name === 'escape') {
-      this.#resolveQuestion({ action: 'cancel' });
-      return true;
-    }
-
     if (card.mode === 'url') {
+      if (name === 'escape') {
+        this.#resolveQuestion({ action: 'cancel' });
+        return true;
+      }
       if (name === 'enter') {
         this.#resolveQuestion({ action: 'accept', content: {} });
         return true;
@@ -2162,11 +2189,38 @@ export class AppController {
     }
 
     const currentQ = card.items[card.step];
-    if (!currentQ) return true;
+    if (!currentQ) {
+      if (name === 'escape') {
+        this.#resolveQuestion({ action: 'cancel' });
+      }
+      return true;
+    }
 
     // If focused on `<qId>.other`, route typing/backspace/enter to the other draft
     if (card.focusedOtherId === currentQ.id) {
       const curText = card.otherDrafts[currentQ.id] ?? '';
+      if (name === 'escape') {
+        if (currentQ.choices && currentQ.choices.length > 0) {
+          this.store.setQuestionFocusedOther(null);
+          this.scheduler.renderNow();
+          this.syncFocus();
+        } else {
+          this.#resolveQuestion({ action: 'cancel' });
+        }
+        return true;
+      }
+      if (name === 'up' && currentQ.choices && currentQ.choices.length > 0) {
+        this.store.setQuestionFocusedOther(null);
+        if (!currentQ.multi) {
+          const lastChoice = currentQ.choices[currentQ.choices.length - 1];
+          if (lastChoice) {
+            this.store.setQuestionAnswer(currentQ.id, lastChoice.value);
+          }
+        }
+        this.scheduler.renderNow();
+        this.syncFocus();
+        return true;
+      }
       if (name === 'enter') {
         if (card.step < card.items.length - 1) {
           this.store.setQuestionStep(card.step + 1);
@@ -2198,10 +2252,16 @@ export class AppController {
       return true;
     }
 
-    // Number keys 1-9 select choice on current question
+    if (name === 'escape') {
+      this.#resolveQuestion({ action: 'cancel' });
+      return true;
+    }
+
+    // Number keys 1-9 select choice on current question; N+1 focuses Other input if available
     if (!key.ctrl && !key.alt && !key.meta && /^[1-9]$/.test(name)) {
       const idx = Number(name) - 1;
-      const choice = currentQ.choices?.[idx];
+      const choices = currentQ.choices ?? [];
+      const choice = choices[idx];
       if (choice) {
         if (currentQ.multi) {
           const prev = card.answers[currentQ.id];
@@ -2214,15 +2274,67 @@ export class AppController {
           this.store.setQuestionAnswer(currentQ.id, choice.value);
         }
         this.scheduler.renderNow();
+        this.syncFocus();
+        return true;
+      }
+      if (idx === choices.length && currentQ.other) {
+        this.store.setQuestionFocusedOther(currentQ.id);
+        this.scheduler.renderNow();
+        this.syncFocus();
         return true;
       }
     }
 
-    if (name === 'tab' || name === 'enter') {
+    // Up/Down cycles choices on single-select questions (and enters Other input after last choice)
+    if (
+      (name === 'up' || name === 'down') &&
+      !key.ctrl &&
+      !key.alt &&
+      !key.meta &&
+      currentQ.choices &&
+      currentQ.choices.length > 0
+    ) {
+      const choices = currentQ.choices;
+      if (!currentQ.multi) {
+        const curAns = card.answers[currentQ.id];
+        const curIdx =
+          typeof curAns === 'string' ? choices.findIndex(c => c.value === curAns) : -1;
+        if (name === 'down') {
+          if (curIdx === choices.length - 1 && currentQ.other) {
+            this.store.setQuestionFocusedOther(currentQ.id);
+            this.scheduler.renderNow();
+            this.syncFocus();
+            return true;
+          }
+          const nextIdx = curIdx < 0 ? 0 : (curIdx + 1) % choices.length;
+          const nextChoice = choices[nextIdx];
+          if (nextChoice) {
+            this.store.setQuestionAnswer(currentQ.id, nextChoice.value);
+            this.scheduler.renderNow();
+          }
+        } else {
+          const prevIdx =
+            curIdx <= 0 ? choices.length - 1 : curIdx - 1;
+          const prevChoice = choices[prevIdx];
+          if (prevChoice) {
+            this.store.setQuestionAnswer(currentQ.id, prevChoice.value);
+            this.scheduler.renderNow();
+          }
+        }
+        return true;
+      }
+    }
+
+    // Left / Shift+Tab moves to previous question step
+    if ((name === 'left' || (name === 'tab' && key.shift)) && !key.ctrl && !key.alt && !key.meta) {
+      this.#stepQuestion(-1);
+      return true;
+    }
+
+    // Right / Tab moves to next question step; Enter advances or submits on last step
+    if ((name === 'right' || name === 'tab' || name === 'enter') && !key.ctrl && !key.alt && !key.meta) {
       if (card.step < card.items.length - 1) {
-        this.store.setQuestionStep(card.step + 1);
-        this.#syncQuestionAutoFocus();
-        this.scheduler.renderNow();
+        this.#stepQuestion(1);
       } else if (name === 'enter') {
         this.#submitCurrentQuestion();
       }
@@ -2230,6 +2342,32 @@ export class AppController {
     }
 
     return true;
+  }
+
+  #stepQuestion(delta: -1 | 1): void {
+    const card = this.store.getState().activeQuestion;
+    if (!card) return;
+    const nextStep = Math.max(0, Math.min(card.items.length - 1, card.step + delta));
+    if (nextStep === card.step) return;
+    this.store.setQuestionStep(nextStep);
+    this.#syncQuestionAutoFocus();
+    this.scheduler.renderNow();
+  }
+
+  #skipCurrentQuestion(): void {
+    const card = this.store.getState().activeQuestion;
+    if (!card) return;
+    const currentQ = card.items[card.step];
+    if (currentQ && !currentQ.required) {
+      this.store.clearQuestionAnswer(currentQ.id);
+    }
+    if (card.step < card.items.length - 1) {
+      this.store.setQuestionStep(card.step + 1);
+      this.#syncQuestionAutoFocus();
+      this.scheduler.renderNow();
+    } else {
+      this.#submitCurrentQuestion();
+    }
   }
 
   #syncQuestionAutoFocus(): void {
@@ -2252,8 +2390,17 @@ export class AppController {
     if (!card) return;
     if (overrideAnswers) {
       for (const [k, v] of Object.entries(overrideAnswers)) {
+        const item = card.items.find(q => q.id === k);
         if (typeof v === 'string') {
-          this.store.setQuestionAnswer(k, v);
+          if (v.length === 0 && (card.otherDrafts[k]?.trim() || card.answers[k])) {
+            continue;
+          }
+          const isPreset = Boolean(item?.choices?.some(c => c.value === v));
+          if (item && item.writeInFieldId && !isPreset && v.trim().length > 0) {
+            this.store.setQuestionOtherDraft(k, v);
+          } else {
+            this.store.setQuestionAnswer(k, v);
+          }
         } else if (Array.isArray(v)) {
           this.store.setQuestionAnswer(
             k,
@@ -2262,7 +2409,8 @@ export class AppController {
         }
       }
     }
-    const content = buildElicitationContent(card);
+    const latestCard = this.store.getState().activeQuestion ?? card;
+    const content = buildElicitationContent(latestCard);
     this.#resolveQuestion({ action: 'accept', content });
   }
 
@@ -2457,6 +2605,9 @@ export class AppController {
       },
       openJobs: () => {
         this.#openInfoOverlay('jobs');
+      },
+      openGit: async () => {
+        await this.#openGitOverlay();
       },
       openMcp: async (args?: string) => {
         await this.#handleMcpCommand(args);
@@ -4476,6 +4627,346 @@ export class AppController {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Fullscreen Git UI (`omp.app.git`) Lifecycle & Actions
+  // -------------------------------------------------------------------------
+
+  async #openGitOverlay(): Promise<void> {
+    if (this.#shuttingDown) return;
+    this.store.openGitOverlay();
+    this.scheduler.renderNow();
+    this.syncFocus();
+    await this.#refreshGitOverlay();
+  }
+
+  #closeGitOverlay(): void {
+    this.#gitOverlayLoadSeq += 1;
+    this.#gitOverlayDiffSeq += 1;
+    if (!this.store.closeGitOverlay()) return;
+    this.scheduler.renderNow();
+    this.syncFocus();
+  }
+
+  async #refreshGitOverlay(): Promise<void> {
+    if (this.#shuttingDown) return;
+    const state = this.store.getState();
+    if (!state.gitOverlay) return;
+    const seq = ++this.#gitOverlayLoadSeq;
+    const cwd = state.cwd;
+
+    try {
+      const snapshot = await loadGitRepoSnapshot(cwd, {
+        ...(this.#gitExec ? { exec: this.#gitExec } : {}),
+      });
+      if (this.#shuttingDown || seq !== this.#gitOverlayLoadSeq || !this.store.getState().gitOverlay) {
+        return;
+      }
+      const selectedKey = this.store.setGitOverlaySnapshot(snapshot);
+      const prevGitStatus = this.store.getState().gitStatus;
+      const syncBranch = snapshot.branch ?? snapshot.headCommit?.shortSha ?? prevGitStatus?.branch;
+      if (syncBranch) {
+        const untrackedCount = snapshot.unstaged.filter(f => f.kind === 'untracked').length;
+        const unstagedTrackedCount = snapshot.unstaged.length - untrackedCount;
+        this.store.setGitStatus({
+          branch: syncBranch,
+          isDirty: !snapshot.clean,
+          staged: snapshot.staged.length,
+          unstaged: unstagedTrackedCount,
+          untracked: untrackedCount,
+          ahead: prevGitStatus?.ahead ?? 0,
+          behind: prevGitStatus?.behind ?? 0,
+          detached: snapshot.branch === null || snapshot.branch === 'HEAD' || prevGitStatus?.detached === true,
+        });
+      }
+      this.scheduler.renderNow();
+      if (selectedKey) {
+        const all = getAllVisibleGitFiles(snapshot);
+        const file = all.find(f => gitFileKey(f.area, f.path) === selectedKey);
+        if (file) {
+          await this.#loadGitOverlayDiff(file);
+        }
+      }
+    } catch (err) {
+      if (this.#shuttingDown || seq !== this.#gitOverlayLoadSeq || !this.store.getState().gitOverlay) {
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      this.store.setGitOverlayLoading(false, msg);
+      this.scheduler.renderNow();
+    }
+  }
+
+  async #loadGitOverlayDiff(file: GitChangedFile): Promise<void> {
+    const state = this.store.getState();
+    const git = state.gitOverlay;
+    if (!git) return;
+    const seq = ++this.#gitOverlayDiffSeq;
+    const key = gitFileKey(file.area, file.path);
+    this.store.selectGitFileKey(key);
+    this.scheduler.renderNow();
+
+    const diff = await loadGitFileDiff(state.cwd, file, {
+      wholeFile: git.viewMode === 'file',
+      headSha: git.snapshot?.headCommit?.sha,
+      ...(this.#gitExec ? { exec: this.#gitExec } : {}),
+    });
+    if (this.#shuttingDown || seq !== this.#gitOverlayDiffSeq || !this.store.getState().gitOverlay) {
+      return;
+    }
+    this.store.setGitFileDiff(diff);
+    this.scheduler.renderNow();
+  }
+
+  async #selectGitOverlayFile(file: GitChangedFile): Promise<void> {
+    const git = this.store.getState().gitOverlay;
+    if (!git) return;
+    if (git.focusedField !== null) {
+      this.store.setGitFocusedField(null);
+      this.syncFocus();
+    }
+    await this.#loadGitOverlayDiff(file);
+  }
+
+  async #stepGitOverlayFile(delta: -1 | 1): Promise<void> {
+    const git = this.store.getState().gitOverlay;
+    const files = getAllVisibleGitFiles(git?.snapshot ?? null);
+    if (!git || files.length === 0) return;
+    const curIdx = git.selectedFileKey
+      ? files.findIndex(f => gitFileKey(f.area, f.path) === git.selectedFileKey)
+      : -1;
+    const baseIdx = curIdx >= 0 ? curIdx : delta > 0 ? -1 : 0;
+    const nextIdx = (baseIdx + delta + files.length) % files.length;
+    const nextFile = files[nextIdx];
+    if (nextFile) {
+      await this.#loadGitOverlayDiff(nextFile);
+    }
+  }
+
+  async #setGitOverlayViewMode(mode: GitDiffViewMode): Promise<void> {
+    const git = this.store.getState().gitOverlay;
+    if (!git || git.viewMode === mode) return;
+    const needReload = (git.viewMode === 'file') !== (mode === 'file');
+    this.store.setGitViewMode(mode);
+    this.scheduler.renderNow();
+    if (needReload && git.selectedFileKey) {
+      const files = getAllVisibleGitFiles(git.snapshot);
+      const cur = files.find(f => gitFileKey(f.area, f.path) === git.selectedFileKey);
+      if (cur) {
+        await this.#loadGitOverlayDiff(cur);
+      }
+    }
+  }
+
+  async #runGitOverlayStage(file: GitChangedFile, op: 'stage' | 'unstage'): Promise<void> {
+    const state = this.store.getState();
+    const git = state.gitOverlay;
+    if (!git || git.busy) return;
+    this.store.setGitOverlayBusy(true);
+    this.scheduler.renderNow();
+    try {
+      const opts = this.#gitExec ? { exec: this.#gitExec } : undefined;
+      const res =
+        op === 'stage'
+          ? await stageGitFiles(state.cwd, [file.path], opts)
+          : await unstageGitFiles(state.cwd, [file.path], opts);
+      this.store.setGitOverlayStatus({
+        text: res.message,
+        tone: res.ok ? 'success' : 'error',
+      });
+      await this.#refreshGitOverlay();
+      void this.#refreshGitStatus({ force: true });
+    } finally {
+      this.store.setGitOverlayBusy(false);
+      this.scheduler.renderNow();
+    }
+  }
+
+  async #runGitOverlayStageAll(op: 'stage' | 'unstage'): Promise<void> {
+    const state = this.store.getState();
+    const git = state.gitOverlay;
+    if (!git || git.busy) return;
+    this.store.setGitOverlayBusy(true);
+    this.scheduler.renderNow();
+    try {
+      const opts = this.#gitExec ? { exec: this.#gitExec } : undefined;
+      const res =
+        op === 'stage'
+          ? await stageGitFiles(state.cwd, 'all', opts)
+          : await unstageGitFiles(state.cwd, 'all', opts);
+      this.store.setGitOverlayStatus({
+        text: res.message,
+        tone: res.ok ? 'success' : 'error',
+      });
+      await this.#refreshGitOverlay();
+      void this.#refreshGitStatus({ force: true });
+    } finally {
+      this.store.setGitOverlayBusy(false);
+      this.scheduler.renderNow();
+    }
+  }
+
+  async #runGitOverlayCommit(): Promise<void> {
+    const state = this.store.getState();
+    const git = state.gitOverlay;
+    if (!git || git.busy) return;
+    const stagedCount = git.snapshot?.staged.length ?? 0;
+    const unstagedCount = git.snapshot?.unstaged.length ?? 0;
+    const stageAllIfEmpty = stagedCount === 0 && unstagedCount > 0;
+
+    this.store.setGitOverlayBusy(true);
+    this.scheduler.renderNow();
+    try {
+      const res = await commitGitChanges(
+        state.cwd,
+        {
+          summary: git.commitSummary,
+          body: git.commitBody,
+          amend: git.commitAmend,
+          stageAllIfEmpty,
+        },
+        this.#gitExec ? { exec: this.#gitExec } : undefined,
+      );
+      if (res.ok) {
+        this.store.clearGitCommitForm();
+        this.store.setGitOverlayStatus({ text: res.message, tone: 'success' });
+        await this.#refreshGitOverlay();
+        void this.#refreshGitStatus({ force: true });
+        this.syncFocus();
+      } else {
+        this.store.setGitOverlayStatus({ text: res.message, tone: 'error' });
+      }
+    } finally {
+      this.store.setGitOverlayBusy(false);
+      this.scheduler.renderNow();
+    }
+  }
+
+  async #handleGitOverlayKey(key: Key): Promise<void> {
+    const state = this.store.getState();
+    const git = state.gitOverlay;
+    if (!git) return;
+    const name = key.name.toLowerCase();
+
+    // When editing commit Summary / Description field
+    if (git.focusedField !== null) {
+      if (name === 'escape') {
+        this.store.setGitFocusedField(null);
+        this.scheduler.renderNow();
+        this.syncFocus();
+        return;
+      }
+      if (name === 'tab') {
+        this.store.setGitFocusedField(git.focusedField === 'summary' ? 'description' : 'summary');
+        this.scheduler.renderNow();
+        this.syncFocus();
+        return;
+      }
+      if (name === 'enter' && (git.focusedField === 'summary' || key.ctrl || key.meta)) {
+        await this.#runGitOverlayCommit();
+        return;
+      }
+      if (git.focusedField === 'summary') {
+        if (name === 'backspace') {
+          if (git.commitSummary.length > 0) {
+            const prev = prevCodePointOffset(git.commitSummary, git.commitSummary.length);
+            this.store.setGitCommitSummary(git.commitSummary.slice(0, prev));
+            this.scheduler.renderNow();
+          }
+          return;
+        }
+        if (key.text && !key.ctrl && !key.alt && !key.meta) {
+          this.store.setGitCommitSummary(git.commitSummary + key.text.replace(/\r?\n/g, ' '));
+          this.scheduler.renderNow();
+        }
+        return;
+      }
+      if (git.focusedField === 'description') {
+        if (name === 'backspace') {
+          if (git.commitBody.length > 0) {
+            const prev = prevCodePointOffset(git.commitBody, git.commitBody.length);
+            this.store.setGitCommitBody(git.commitBody.slice(0, prev));
+            this.scheduler.renderNow();
+          }
+          return;
+        }
+        if (name === 'enter') {
+          this.store.setGitCommitBody(`${git.commitBody}\n`);
+          this.scheduler.renderNow();
+          return;
+        }
+        if (key.text && !key.ctrl && !key.alt && !key.meta) {
+          this.store.setGitCommitBody(git.commitBody + key.text);
+          this.scheduler.renderNow();
+        }
+        return;
+      }
+    }
+
+    // Navigation mode inside Git UI
+    if (name === 'escape' || (name === 'q' && !key.ctrl && !key.alt && !key.meta)) {
+      this.#closeGitOverlay();
+      return;
+    }
+    if (name === 'up' || name === 'k' || key.text === '[') {
+      await this.#stepGitOverlayFile(-1);
+      return;
+    }
+    if (name === 'down' || name === 'j' || key.text === ']') {
+      await this.#stepGitOverlayFile(1);
+      return;
+    }
+    if ((name === 'space' || name === 's') && !key.ctrl && !key.alt && !key.meta) {
+      const files = getAllVisibleGitFiles(git.snapshot);
+      const cur = git.selectedFileKey
+        ? files.find(f => gitFileKey(f.area, f.path) === git.selectedFileKey)
+        : undefined;
+      if (cur?.area === 'unstaged') {
+        await this.#runGitOverlayStage(cur, 'stage');
+      } else if (cur?.area === 'staged') {
+        await this.#runGitOverlayStage(cur, 'unstage');
+      }
+      return;
+    }
+    if (name === 'r' && !key.alt && !key.meta) {
+      await this.#refreshGitOverlay();
+      return;
+    }
+    if (name === 'w' && !key.ctrl && !key.alt && !key.meta) {
+      this.store.toggleGitWrap();
+      this.scheduler.renderNow();
+      return;
+    }
+    if (name === 't' && !key.ctrl && !key.alt && !key.meta) {
+      this.store.setGitSidebarStyle(git.sidebarStyle === 'path' ? 'tree' : 'path');
+      this.scheduler.renderNow();
+      return;
+    }
+    if (name === 'v' && !key.ctrl && !key.alt && !key.meta) {
+      const order: readonly GitDiffViewMode[] = ['split', 'inline', 'file'];
+      const next = order[(order.indexOf(git.viewMode) + 1) % order.length]!;
+      await this.#setGitOverlayViewMode(next);
+      return;
+    }
+    if (key.text === '1' && !key.ctrl && !key.alt && !key.meta) {
+      await this.#setGitOverlayViewMode('split');
+      return;
+    }
+    if (key.text === '2' && !key.ctrl && !key.alt && !key.meta) {
+      await this.#setGitOverlayViewMode('inline');
+      return;
+    }
+    if (key.text === '3' && !key.ctrl && !key.alt && !key.meta) {
+      await this.#setGitOverlayViewMode('file');
+      return;
+    }
+    if (name === 'c' && !key.ctrl && !key.alt && !key.meta && git.snapshot && !git.snapshot.clean) {
+      this.store.setGitFocusedField('summary');
+      this.scheduler.renderNow();
+      this.syncFocus();
+      return;
+    }
+  }
+
   #registerSignals(): void {
     const onSignal = (code: number) => () => {
       void this.shutdown({ cleanExit: false, exitCode: code }).finally(() => {
@@ -4580,6 +5071,7 @@ export class AppController {
           onQuestionChange: (questionId, value) => {
             this.store.setQuestionAnswer(questionId, value);
             this.scheduler.renderNow();
+            this.syncFocus();
           },
           onQuestionOtherEdit: (questionId, ev) => {
             const card = this.store.getState().activeQuestion;
@@ -4593,6 +5085,15 @@ export class AppController {
           onQuestionOtherFocus: questionId => {
             this.store.setQuestionFocusedOther(questionId);
             this.syncFocus();
+          },
+          onQuestionBack: () => {
+            this.#stepQuestion(-1);
+          },
+          onQuestionNext: () => {
+            this.#stepQuestion(1);
+          },
+          onQuestionSkip: () => {
+            this.#skipCurrentQuestion();
           },
           onQuestionSubmit: answers => {
             this.#submitCurrentQuestion(answers);
@@ -4642,6 +5143,9 @@ export class AppController {
           },
           onOpenJobs: () => {
             this.#openInfoOverlay('jobs');
+          },
+          onOpenGit: () => {
+            void this.#openGitOverlay();
           },
           onOpenContext: () => {
             this.#openInfoOverlay('context');
@@ -4760,6 +5264,83 @@ export class AppController {
           onClearQuery: () => {
             this.store.setSwarmBoardQuery('');
             this.scheduler.renderNow();
+          },
+        },
+        git: {
+          onClose: () => {
+            this.#closeGitOverlay();
+          },
+          onRefresh: () => {
+            void this.#refreshGitOverlay();
+          },
+          onSelectFile: file => {
+            void this.#selectGitOverlayFile(file);
+          },
+          onStepFile: delta => {
+            void this.#stepGitOverlayFile(delta);
+          },
+          onSetViewMode: mode => {
+            void this.#setGitOverlayViewMode(mode);
+          },
+          onToggleWrap: () => {
+            this.store.toggleGitWrap();
+            this.scheduler.renderNow();
+          },
+          onSetSidebarStyle: style => {
+            this.store.setGitSidebarStyle(style);
+            this.scheduler.renderNow();
+          },
+          onToggleSectionFold: area => {
+            this.store.toggleGitSectionFold(area);
+            this.scheduler.renderNow();
+          },
+          onToggleDirFold: dirKey => {
+            this.store.toggleGitDirFold(dirKey);
+            this.scheduler.renderNow();
+          },
+          onStageFile: file => {
+            void this.#runGitOverlayStage(file, 'stage');
+          },
+          onUnstageFile: file => {
+            void this.#runGitOverlayStage(file, 'unstage');
+          },
+          onStageAll: () => {
+            void this.#runGitOverlayStageAll('stage');
+          },
+          onUnstageAll: () => {
+            void this.#runGitOverlayStageAll('unstage');
+          },
+          onFocusField: field => {
+            this.store.setGitFocusedField(field);
+            this.scheduler.renderNow();
+            this.syncFocus();
+          },
+          onSummaryEdit: ev => {
+            const git = this.store.getState().gitOverlay;
+            if (!git) return;
+            const prev = git.commitSummary;
+            if (ev.len !== prev.length) return;
+            const next = prev.slice(0, ev.from) + ev.text.replace(/\r?\n/g, ' ') + prev.slice(ev.to);
+            this.store.setGitCommitSummary(next);
+            this.scheduler.renderNow();
+          },
+          onSummaryUndo: () => {},
+          onBodyEdit: ev => {
+            const git = this.store.getState().gitOverlay;
+            if (!git) return;
+            const prev = git.commitBody;
+            if (ev.len !== prev.length) return;
+            const next = prev.slice(0, ev.from) + ev.text + prev.slice(ev.to);
+            this.store.setGitCommitBody(next);
+            this.scheduler.renderNow();
+          },
+          onBodyUndo: () => {},
+          onToggleAmend: () => {
+            this.store.toggleGitAmend();
+            this.scheduler.renderNow();
+          },
+          onCommit: () => {
+            void this.#runGitOverlayCommit();
           },
         },
         settings: {

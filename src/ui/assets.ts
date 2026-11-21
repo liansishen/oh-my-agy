@@ -509,13 +509,15 @@ export const WELCOME_LOGO_STYLESHEET = [
   '  opacity: 0.72;',
   '  padding: 2px 4px;',
   '}',
-  // Compact centered Swarm Board dialog (matching background jobs overlay height, never full-screen)
-  // with single scrollbar per pane and zero bottom dead space.
+  // Centered Swarm Board dialog matching `omp.overlay.jobs` width (`min(960px, 100%)` with
+  // `.sf-overlay.sz-lg[data-role=...] .sf-ov-card` specificity so it overrides Tern's 720px default)
+  // and slightly taller height (`min(680px, 76vh)`) with single scrollbar per pane.
+  ".sf-overlay.sz-lg[data-role='oma.overlay.swarm'] .sf-ov-card,",
   "[data-role='oma.overlay.swarm'].sf-ov-card,",
   "[data-role='oma.overlay.swarm'] .sf-ov-card {",
-  '  width: min(960px, 92vw);',
-  '  height: min(600px, 70vh);',
-  '  max-height: 80vh;',
+  '  width: min(960px, 100%);',
+  '  height: min(680px, 76vh);',
+  '  max-height: 84vh;',
   '}',
   "[data-role='oma.overlay.swarm'] .sf-ov-body {",
   '  display: flex;',
@@ -579,6 +581,23 @@ export const WELCOME_LOGO_STYLESHEET = [
   '  min-height: 0;',
   '  overflow-y: auto;',
   '  scrollbar-width: thin;',
+  '}',
+  // Fullscreen `omp.app.git` host overlay so Tern's preloaded `omp-apps.css` fills 100% cleanly
+  "[data-role='oma.overlay.git'].sf-ov-card,",
+  "[data-role='oma.overlay.git'] .sf-ov-card {",
+  '  height: 100%;',
+  '}',
+  "[data-role='oma.overlay.git'] .sf-ov-body {",
+  '  display: flex;',
+  '  flex-direction: column;',
+  '  flex: 1 1 0px;',
+  '  min-height: 0;',
+  '  padding: 0;',
+  '  overflow: hidden;',
+  '}',
+  "[data-role='oma.overlay.git'] [data-role='omp.app.git'] {",
+  '  flex: 1 1 0px;',
+  '  min-height: 0;',
   '}',
   // Per-palette member name hues echoing each member's pixel bee sprite
   "[data-role='oma.swarm.name.gold'] { color: #E5B84B; font-weight: 600; }",

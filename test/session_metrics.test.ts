@@ -66,9 +66,10 @@ describe('getTranscriptPath & formatters', () => {
     expect(formatTpsText(0)).toBeNull();
     expect(formatTpsText(-5)).toBeNull();
     expect(formatTpsText(Number.NaN)).toBeNull();
-    expect(formatTpsText(86.44)).toBe('86.4/s');
-    expect(formatTpsText(4.2)).toBe('4.2/s');
-    expect(formatTpsText(125.6)).toBe('126/s');
+    expect(formatTpsText(86.44)).toBe('86.4 tok/s');
+    expect(formatTpsText(4.2)).toBe('4.2 tok/s');
+    expect(formatTpsText(24.5)).toBe('24.5 tok/s');
+    expect(formatTpsText(125.6)).toBe('126 tok/s');
 
     expect(formatTokenMetricsText(null)).toBeNull();
     expect(

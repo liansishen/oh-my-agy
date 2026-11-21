@@ -168,12 +168,19 @@ export interface ImplementationInfo {
   title?: string;
 }
 
+export interface ClientElicitationCapabilities {
+  form?: Record<string, unknown>;
+  url?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 export interface ClientCapabilities {
   fs?: {
     readTextFile?: boolean;
     writeTextFile?: boolean;
   };
   terminal?: boolean;
+  elicitation?: ClientElicitationCapabilities;
   [key: string]: unknown;
 }
 

@@ -10,9 +10,16 @@ import {
   runFallbackAgy,
   runPlainRepl,
 } from '../app/fallback';
+import { cleanupStaleWindowsBackup, runUpdateCommand } from '../app/updater';
 import { loadConfig } from '../config/config';
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+  cleanupStaleWindowsBackup();
+
+  if (argv[0] === 'update') {
+    return runUpdateCommand(argv.slice(1));
+  }
+
   let cli;
   try {
     cli = parseCliArgs(argv);

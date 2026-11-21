@@ -37,6 +37,7 @@ export type CommandAction =
   | { readonly type: 'open_context' }
   | { readonly type: 'open_usage' }
   | { readonly type: 'open_jobs' }
+  | { readonly type: 'open_git' }
   | { readonly type: 'open_mcp'; readonly args?: string }
   | { readonly type: 'open_plugins'; readonly args?: string }
   | { readonly type: 'open_skills'; readonly query?: string }
@@ -81,6 +82,7 @@ export interface CommandActionExecutor {
   openContext?(): void | Promise<void>;
   openUsage?(): void | Promise<void>;
   openJobs?(): void | Promise<void>;
+  openGit?(): void | Promise<void>;
   openMcp?(args?: string): void | Promise<void>;
   openPlugins?(args?: string): void | Promise<void>;
   openSkills?(query?: string): void | Promise<void>;
@@ -390,6 +392,8 @@ function buildBuiltinAction(
         : { type: 'export_transcript' };
     case 'jobs':
       return { type: 'open_jobs' };
+    case 'git':
+      return { type: 'open_git' };
   }
 }
 
@@ -421,6 +425,9 @@ export async function executeCommandAction(
       return;
     case 'open_jobs':
       await executor.openJobs?.();
+      return;
+    case 'open_git':
+      await executor.openGit?.();
       return;
     case 'open_mcp':
       await executor.openMcp?.(action.args);

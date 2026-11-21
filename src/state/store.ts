@@ -42,6 +42,17 @@ import {
 import type { SwarmBoardMessage, SwarmBoardSnapshot } from '../swarm/board';
 import { ApprovalQueue } from './approval';
 import { areGitStatusEqual, type GitStatusSnapshot } from './git_status';
+import {
+  getAllVisibleGitFiles,
+  gitFileKey,
+  type GitDiffViewMode,
+  type GitFileDiffResult,
+  type GitFocusedField,
+  type GitOverlayState,
+  type GitOverlayStatusMessage,
+  type GitRepoSnapshot,
+  type GitSidebarStyle,
+} from './git_tui';
 import { areSessionMetricsEqual, type SessionMetricsSnapshot } from './session_metrics';
 import { TrafficBuffer, type TrafficBufferOptions } from './traffic';
 import {
@@ -60,7 +71,18 @@ export type { SettingsPageId };
 // Focus State Machine
 // ---------------------------------------------------------------------------
 
-export type FocusMode = 'editor' | 'picker' | 'swarm' | 'questions' | 'help' | 'settings' | 'info';
+export type FocusMode =
+  | 'editor'
+  | 'picker'
+  | 'swarm'
+  | 'git'
+  | 'questions'
+  | 'help'
+  | 'settings'
+  | 'info';
+
+export const GIT_SUMMARY_NODE_ID = 'layer.git.app.side.commit.summary.input';
+export const GIT_BODY_NODE_ID = 'layer.git.app.side.commit.body';
 
 export interface BeeMemberBlobPair {
   readonly active: string;
@@ -450,6 +472,7 @@ export interface AppState {
   readonly settings: SettingsPanelState | null;
   readonly settingsFocused: boolean;
   readonly infoOverlay: InfoOverlayState | null;
+  readonly gitOverlay: GitOverlayState | null;
   readonly helpOpen: boolean;
   readonly activeQuestion: ActiveQuestionCard | null;
   readonly completion: CompletionPopupState;
@@ -592,6 +615,7 @@ export class AppStore {
   private _settings: SettingsPanelState | null = null;
   private _settingsFocused = false;
   private _infoOverlay: InfoOverlayState | null = null;
+  private _gitOverlay: GitOverlayState | null = null;
   private _helpOpen = false;
   private _activeQuestion: ActiveQuestionCard | null = null;
   private _completion: CompletionPopupState = EMPTY_COMPLETION;
@@ -797,6 +821,7 @@ export class AppStore {
   getFocusMode(): FocusMode {
     if (this._picker !== null) return 'picker';
     if (this._swarmBoardOpen) return 'swarm';
+    if (this._gitOverlay !== null) return 'git';
     if (this._infoOverlay !== null) return 'info';
     if (this._helpOpen) return 'help';
     if (this._settings !== null && (!this._supportsAside || this._settingsFocused)) {
@@ -809,12 +834,18 @@ export class AppStore {
   /**
    * Compute the target node ID for `surface.focus(...)` (DESIGN.md 4.3.2):
    * - `EDITOR_NODE_ID` (`'dock.composer.line.input'`) when editor owns focus
-   * - `null` while any modal overlay (`picker` / `swarm` / `info` / `help`) or focused `settings` owns focus
+   * - `GIT_SUMMARY_NODE_ID` / `GIT_BODY_NODE_ID` when editing the commit form inside `/git`
+   * - `null` while any modal overlay (`picker` / `swarm` / `git` / `info` / `help`) or focused `settings` owns focus
    * - `'<qId>.other'` input node id when focusing a `<questions>` Other input, else `null`
    */
   getDesiredSurfaceFocus(questionNodePrefix = 'main.questions'): string | null {
     const mode = this.getFocusMode();
     if (mode === 'editor') return EDITOR_NODE_ID;
+    if (mode === 'git') {
+      if (this._gitOverlay?.focusedField === 'summary') return GIT_SUMMARY_NODE_ID;
+      if (this._gitOverlay?.focusedField === 'description') return GIT_BODY_NODE_ID;
+      return null;
+    }
     if (
       mode === 'picker' ||
       mode === 'swarm' ||
@@ -838,6 +869,17 @@ export class AppStore {
    */
   handleSurfaceFocusEvent(nodeId: string): string | null {
     const mode = this.getFocusMode();
+    if (mode === 'git') {
+      if (nodeId === GIT_SUMMARY_NODE_ID) {
+        this.setGitFocusedField('summary');
+        return GIT_SUMMARY_NODE_ID;
+      }
+      if (nodeId === GIT_BODY_NODE_ID) {
+        this.setGitFocusedField('description');
+        return GIT_BODY_NODE_ID;
+      }
+      return null;
+    }
     if (mode === 'picker' || mode === 'swarm' || mode === 'help' || mode === 'info') {
       return null;
     }
@@ -940,6 +982,7 @@ export class AppStore {
       settings: this._settings,
       settingsFocused: this._settingsFocused,
       infoOverlay: this._infoOverlay,
+      gitOverlay: this._gitOverlay,
       helpOpen: this._helpOpen,
       activeQuestion: this._activeQuestion,
       completion: this._completion,
@@ -1195,6 +1238,7 @@ export class AppStore {
   } = {}): SettingsPanelState {
     this._picker = null;
     this._swarmBoardOpen = false;
+    this._gitOverlay = null;
     this._helpOpen = false;
     this._infoOverlay = null;
     this._completion = EMPTY_COMPLETION;
@@ -1281,6 +1325,7 @@ export class AppStore {
   ): InfoOverlayState {
     this._picker = null;
     this._swarmBoardOpen = false;
+    this._gitOverlay = null;
     this._helpOpen = false;
     this._completion = EMPTY_COMPLETION;
     const defaultJobId =
@@ -1361,6 +1406,7 @@ export class AppStore {
       this._controls.availableThoughtLevels[0]?.value;
 
     this._swarmBoardOpen = false;
+    this._gitOverlay = null;
     this._helpOpen = false;
     this._infoOverlay = null;
     this._completion = EMPTY_COMPLETION;
@@ -1642,6 +1688,7 @@ export class AppStore {
     snapshot?: SwarmBoardSnapshot | null;
   } = {}): void {
     this._picker = null;
+    this._gitOverlay = null;
     this._helpOpen = false;
     this._infoOverlay = null;
     this._completion = EMPTY_COMPLETION;
@@ -1883,9 +1930,192 @@ export class AppStore {
   openHelp(): void {
     this._picker = null;
     this._swarmBoardOpen = false;
+    this._gitOverlay = null;
     this._infoOverlay = null;
     this._completion = EMPTY_COMPLETION;
     this._helpOpen = true;
+    this.emit();
+  }
+
+  // -------------------------------------------------------------------------
+  // Fullscreen Git UI Overlay (`omp.app.git`)
+  // -------------------------------------------------------------------------
+
+  openGitOverlay(): void {
+    this._picker = null;
+    this._swarmBoardOpen = false;
+    this._infoOverlay = null;
+    this._helpOpen = false;
+    this._completion = EMPTY_COMPLETION;
+    this._gitOverlay = {
+      loading: true,
+      busy: false,
+      snapshot: null,
+      selectedFileKey: null,
+      diffLoading: false,
+      diff: null,
+      viewMode: 'split',
+      wrap: false,
+      sidebarStyle: 'path',
+      foldedSections: { unstaged: false, staged: false },
+      foldedDirs: {},
+      commitSummary: '',
+      commitBody: '',
+      commitAmend: false,
+      focusedField: null,
+      statusMessage: null,
+    };
+    this.emit();
+  }
+
+  closeGitOverlay(): boolean {
+    if (!this._gitOverlay) return false;
+    this._gitOverlay = null;
+    this.emit();
+    return true;
+  }
+
+  setGitOverlayLoading(loading: boolean, error?: string): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      loading,
+      ...(error !== undefined ? { error } : { error: undefined }),
+    };
+    this.emit();
+  }
+
+  setGitOverlayBusy(busy: boolean): void {
+    if (!this._gitOverlay || this._gitOverlay.busy === busy) return;
+    this._gitOverlay = { ...this._gitOverlay, busy };
+    this.emit();
+  }
+
+  setGitOverlaySnapshot(snapshot: GitRepoSnapshot): string | null {
+    if (!this._gitOverlay) return null;
+    const allFiles = getAllVisibleGitFiles(snapshot);
+    const prevKey = this._gitOverlay.selectedFileKey;
+    const keepKey =
+      prevKey && allFiles.some(f => gitFileKey(f.area, f.path) === prevKey) ? prevKey : null;
+    const nextKey =
+      keepKey ?? (allFiles[0] ? gitFileKey(allFiles[0].area, allFiles[0].path) : null);
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      loading: false,
+      error: undefined,
+      snapshot,
+      selectedFileKey: nextKey,
+      ...(nextKey === null ? { diff: null, diffLoading: false } : {}),
+    };
+    this.emit();
+    return nextKey;
+  }
+
+  selectGitFileKey(fileKey: string | null): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      selectedFileKey: fileKey,
+      diffLoading: fileKey !== null,
+      ...(fileKey === null ? { diff: null } : {}),
+    };
+    this.emit();
+  }
+
+  setGitFileDiff(diff: GitFileDiffResult | null): void {
+    if (!this._gitOverlay) return;
+    if (diff && this._gitOverlay.selectedFileKey !== diff.fileKey) {
+      return;
+    }
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      diffLoading: false,
+      diff,
+    };
+    this.emit();
+  }
+
+  setGitViewMode(viewMode: GitDiffViewMode): void {
+    if (!this._gitOverlay || this._gitOverlay.viewMode === viewMode) return;
+    this._gitOverlay = { ...this._gitOverlay, viewMode };
+    this.emit();
+  }
+
+  toggleGitWrap(): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = { ...this._gitOverlay, wrap: !this._gitOverlay.wrap };
+    this.emit();
+  }
+
+  setGitSidebarStyle(sidebarStyle: GitSidebarStyle): void {
+    if (!this._gitOverlay || this._gitOverlay.sidebarStyle === sidebarStyle) return;
+    this._gitOverlay = { ...this._gitOverlay, sidebarStyle };
+    this.emit();
+  }
+
+  toggleGitSectionFold(area: 'unstaged' | 'staged'): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      foldedSections: {
+        ...this._gitOverlay.foldedSections,
+        [area]: !this._gitOverlay.foldedSections[area],
+      },
+    };
+    this.emit();
+  }
+
+  toggleGitDirFold(dirKey: string): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      foldedDirs: {
+        ...this._gitOverlay.foldedDirs,
+        [dirKey]: !this._gitOverlay.foldedDirs[dirKey],
+      },
+    };
+    this.emit();
+  }
+
+  toggleGitAmend(): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = { ...this._gitOverlay, commitAmend: !this._gitOverlay.commitAmend };
+    this.emit();
+  }
+
+  setGitCommitSummary(summary: string): void {
+    if (!this._gitOverlay || this._gitOverlay.commitSummary === summary) return;
+    this._gitOverlay = { ...this._gitOverlay, commitSummary: summary };
+    this.emit();
+  }
+
+  setGitCommitBody(body: string): void {
+    if (!this._gitOverlay || this._gitOverlay.commitBody === body) return;
+    this._gitOverlay = { ...this._gitOverlay, commitBody: body };
+    this.emit();
+  }
+
+  clearGitCommitForm(): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = {
+      ...this._gitOverlay,
+      commitSummary: '',
+      commitBody: '',
+      commitAmend: false,
+      focusedField: null,
+    };
+    this.emit();
+  }
+
+  setGitFocusedField(field: GitFocusedField): void {
+    if (!this._gitOverlay || this._gitOverlay.focusedField === field) return;
+    this._gitOverlay = { ...this._gitOverlay, focusedField: field };
+    this.emit();
+  }
+
+  setGitOverlayStatus(statusMessage: GitOverlayStatusMessage | null): void {
+    if (!this._gitOverlay) return;
+    this._gitOverlay = { ...this._gitOverlay, statusMessage };
     this.emit();
   }
 
@@ -1922,13 +2152,46 @@ export class AppStore {
   setQuestionAnswer(questionId: string, answer: string | string[]): void {
     if (!this._activeQuestion) return;
     this._activeQuestion.answers[questionId] = answer;
+    const item = this._activeQuestion.items.find((q) => q.id === questionId);
+    if (item && !item.multi && typeof answer === 'string') {
+      const isPresetChoice = Boolean(item.choices?.some((c) => c.value === answer));
+      if (isPresetChoice) {
+        delete this._activeQuestion.otherDrafts[questionId];
+        if (this._activeQuestion.focusedOtherId === questionId) {
+          this._activeQuestion.focusedOtherId = null;
+        }
+      }
+    }
+    this.emit();
+  }
+
+  clearQuestionAnswer(questionId: string): void {
+    if (!this._activeQuestion) return;
+    delete this._activeQuestion.answers[questionId];
+    delete this._activeQuestion.otherDrafts[questionId];
+    if (this._activeQuestion.focusedOtherId === questionId) {
+      this._activeQuestion.focusedOtherId = null;
+    }
     this.emit();
   }
 
   setQuestionOtherDraft(questionId: string, text: string): void {
     if (!this._activeQuestion) return;
     this._activeQuestion.otherDrafts[questionId] = text;
-    this._activeQuestion.answers[questionId] = text;
+    const item = this._activeQuestion.items.find((q) => q.id === questionId);
+    if (item?.multi) {
+      // Preserve any preset multi-select choices; keep free-text in `otherDrafts`
+      if (text.length === 0 && typeof this._activeQuestion.answers[questionId] === 'string') {
+        delete this._activeQuestion.answers[questionId];
+      }
+    } else if (text.length > 0) {
+      this._activeQuestion.answers[questionId] = text;
+    } else if (
+      typeof this._activeQuestion.answers[questionId] === 'string' &&
+      !item?.choices?.some((c) => c.value === this._activeQuestion?.answers[questionId])
+    ) {
+      delete this._activeQuestion.answers[questionId];
+    }
     this.emit();
   }
 
@@ -2000,6 +2263,10 @@ export class AppStore {
       case 'jobs': {
         const running = this.transcript.getBackgroundJobsSnapshot().runningJobCount;
         return running > 0 ? `${running} running` : undefined;
+      }
+      case 'git': {
+        if (!this._gitStatus) return undefined;
+        return this._gitStatus.isDirty ? `${this._gitStatus.branch}*` : this._gitStatus.branch;
       }
       default:
         return undefined;
@@ -2121,11 +2388,12 @@ export class AppStore {
   refreshCompletion(
     searchFiles?: (query: string, limit: number) => readonly FileCompletionCandidate[],
   ): CompletionPopupState {
-    // Never show completion popup behind a modal picker, swarm board, info overlay, help, or focused modal settings
+    // Never show completion popup behind a modal picker, swarm board, git overlay, info overlay, help, or focused modal settings
     const mode = this.getFocusMode();
     if (
       mode === 'picker' ||
       mode === 'swarm' ||
+      mode === 'git' ||
       mode === 'help' ||
       mode === 'info' ||
       mode === 'settings'

@@ -27,6 +27,9 @@ export interface TranscriptCallbacks {
   readonly onQuestionChange: (questionId: string, value: string | string[]) => void;
   readonly onQuestionOtherEdit: (questionId: string, event: EditEvent) => void;
   readonly onQuestionOtherFocus: (questionId: string) => void;
+  readonly onQuestionBack?: () => void;
+  readonly onQuestionNext?: () => void;
+  readonly onQuestionSkip?: () => void;
   readonly onQuestionSubmit: (answers: Record<string, unknown>) => void;
   readonly onQuestionDecline: () => void;
   readonly onQuestionCancel: () => void;
@@ -696,9 +699,14 @@ function renderQuestionCard(
           const val =
             typeof ev.value === 'object' && ev.value !== null && !Array.isArray(ev.value)
               ? (ev.value as Record<string, unknown>)
-              : {};
+              : typeof ev.values === 'object' && ev.values !== null && !Array.isArray(ev.values)
+                ? (ev.values as Record<string, unknown>)
+                : {};
           callbacks.onQuestionSubmit(val);
         },
+        back: () => callbacks.onQuestionBack?.(),
+        next: () => callbacks.onQuestionNext?.(),
+        skip: () => callbacks.onQuestionSkip?.(),
         decline: () => callbacks.onQuestionDecline(),
         cancel: () => callbacks.onQuestionCancel(),
       }}

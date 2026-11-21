@@ -30,7 +30,8 @@ export type BuiltinCommandId =
   | 'login'
   | 'logout'
   | 'export'
-  | 'jobs';
+  | 'jobs'
+  | 'git';
 
 export interface AcpAvailableCommandLike {
   readonly name: string;
@@ -349,6 +350,17 @@ export const EXTRA_BUILTIN_COMMANDS: readonly SlashCommandDef[] = [
     takesArgs: true,
     autoExecuteOnEnter: true,
     builtinId: 'board',
+  },
+  {
+    name: 'git',
+    aliases: [],
+    description: 'Open Git UI (split diff viewer, staging, commit)',
+    source: 'oma',
+    icon: 'git-branch',
+    statusKey: 'git',
+    takesArgs: false,
+    autoExecuteOnEnter: true,
+    builtinId: 'git',
   },
   {
     name: 'jobs',

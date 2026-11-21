@@ -363,6 +363,10 @@ export function formatVersionText(): string {
 export function formatHelpText(): string {
   return [
     'Usage: oma [flags] [initial prompt...]',
+    '       oma update [--check] [--force] [--version <tag>]',
+    '',
+    'Commands:',
+    '  update                      Check for and install the latest oma release from GitHub',
     '',
     'Flags:',
     '  -c, --continue              Continue the most recent session in current directory',

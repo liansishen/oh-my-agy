@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck & Test
+        run: |
+          bun run typecheck
+          bun test
+
+      - name: Cross-compile release binaries
+        run: |
+          mkdir -p release-assets
+          bun build --compile --target=bun-windows-x64 src/bin/oma.ts --outfile release-assets/oma-windows-x64.exe
+          bun build --compile --target=bun-linux-x64   src/bin/oma.ts --outfile release-assets/oma-linux-x64
+          bun build --compile --target=bun-linux-arm64 src/bin/oma.ts --outfile release-assets/oma-linux-arm64
+          bun build --compile --target=bun-darwin-arm64 src/bin/oma.ts --outfile release-assets/oma-darwin-arm64
+          bun build --compile --target=bun-darwin-x64   src/bin/oma.ts --outfile release-assets/oma-darwin-x64
+          (cd release-assets && sha256sum oma-* > SHA256SUMS.txt)
+          ls -lh release-assets
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "Oh My Agy $RELEASE_TAG" \
+              --generate-notes
+          fi

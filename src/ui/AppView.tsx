@@ -6,6 +6,7 @@ import type { AppState } from '../state/store';
 import type { TrafficEntry } from '../state/traffic';
 import type { BackgroundJobsSnapshot, PlanState, TranscriptTurn } from '../state/transcript';
 import { ComposerView, type ComposerCallbacks } from './ComposerView';
+import { GitOverlayView, type GitOverlayCallbacks } from './GitOverlayView';
 import { InfoOverlayView, type InfoOverlayCallbacks } from './InfoOverlayView';
 import { HelpOverlayView, PickerView, type PickerCallbacks } from './PickerView';
 import { PopupView, type PopupCallbacks } from './PopupView';
@@ -19,6 +20,7 @@ export interface AppViewCallbacks {
   readonly popup: PopupCallbacks;
   readonly picker: PickerCallbacks;
   readonly swarm?: SwarmBoardCallbacks;
+  readonly git?: GitOverlayCallbacks;
   readonly settings?: SettingsCallbacks;
   readonly info?: InfoOverlayCallbacks;
 }
@@ -61,6 +63,29 @@ const NOOP_SWARM_CALLBACKS: SwarmBoardCallbacks = {
   onToggleFollow: () => {},
   onToggleAgentFilter: () => {},
   onSelectPost: () => {},
+};
+
+const NOOP_GIT_CALLBACKS: GitOverlayCallbacks = {
+  onClose: () => {},
+  onRefresh: () => {},
+  onSelectFile: () => {},
+  onStepFile: () => {},
+  onSetViewMode: () => {},
+  onToggleWrap: () => {},
+  onSetSidebarStyle: () => {},
+  onToggleSectionFold: () => {},
+  onToggleDirFold: () => {},
+  onStageFile: () => {},
+  onUnstageFile: () => {},
+  onStageAll: () => {},
+  onUnstageAll: () => {},
+  onFocusField: () => {},
+  onSummaryEdit: () => {},
+  onSummaryUndo: () => {},
+  onBodyEdit: () => {},
+  onBodyUndo: () => {},
+  onToggleAmend: () => {},
+  onCommit: () => {},
 };
 
 /**
@@ -129,7 +154,7 @@ export function buildAppView(props: AppViewProps): ViewInput {
 
   const layerChildren: Array<JSX.Element | null> = [];
   const hasBlockingModal = Boolean(
-    state.picker || state.swarmBoardOpen || state.infoOverlay || state.helpOpen
+    state.picker || state.swarmBoardOpen || state.gitOverlay || state.infoOverlay || state.helpOpen
   );
 
   if (state.picker) {
@@ -148,6 +173,13 @@ export function buildAppView(props: AppViewProps): ViewInput {
         state={state}
         now={now}
         callbacks={callbacks.swarm ?? NOOP_SWARM_CALLBACKS}
+      />
+    );
+  } else if (state.gitOverlay) {
+    layerChildren.push(
+      <GitOverlayView
+        git={state.gitOverlay}
+        callbacks={callbacks.git ?? NOOP_GIT_CALLBACKS}
       />
     );
   } else if (state.infoOverlay) {

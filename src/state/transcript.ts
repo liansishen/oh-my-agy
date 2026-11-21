@@ -191,6 +191,8 @@ export interface QuestionItem {
   readonly choices?: readonly QuestionChoiceItem[];
   readonly multi: boolean;
   readonly other: boolean | { readonly placeholder?: string };
+  /** Paired free-text schema property key (e.g. `q1_other` from `agy acp`) merged into this choice question's Other input. */
+  readonly writeInFieldId?: string;
   readonly required: boolean;
   readonly rawSchema?: JsonSchemaProperty;
 }
@@ -1008,7 +1010,30 @@ export function buildQuestionCardFromElicitation(
   const items: QuestionItem[] = [];
 
   if (mode === 'form' && schema?.properties) {
-    for (const [key, prop] of Object.entries(schema.properties)) {
+    const entries = Object.entries(schema.properties);
+    const propsMap = schema.properties;
+    const mergedWriteInKeys = new Set<string>();
+
+    const isFreeTextProp = (prop: JsonSchemaProperty | undefined): prop is JsonSchemaProperty => {
+      if (!prop) return false;
+      if (prop.enum && prop.enum.length > 0) return false;
+      if (prop.oneOf && prop.oneOf.length > 0) return false;
+      return prop.type === undefined || prop.type === 'string';
+    };
+
+    const findPairedWriteInKey = (baseKey: string): string | undefined => {
+      for (const suffix of ['_other', '_write_in']) {
+        const candidate = `${baseKey}${suffix}`;
+        if (isFreeTextProp(propsMap[candidate])) {
+          return candidate;
+        }
+      }
+      return undefined;
+    };
+
+    for (const [key, prop] of entries) {
+      if (mergedWriteInKeys.has(key)) continue;
+
       const prompt = prop.title?.trim() || key;
       const description = prop.description?.trim();
       const required = requiredSet.has(key);
@@ -1025,6 +1050,19 @@ export function buildQuestionCardFromElicitation(
               ...(prop.items?.enumNames?.[idx] ? { label: prop.items.enumNames[idx] } : {}),
             }));
 
+        const pairedWriteIn = findPairedWriteInKey(key);
+        let other: QuestionItem['other'] = false;
+        if (pairedWriteIn) {
+          mergedWriteInKeys.add(pairedWriteIn);
+          const otherProp = propsMap[pairedWriteIn];
+          other = {
+            placeholder:
+              otherProp?.description?.trim() ||
+              otherProp?.title?.trim() ||
+              'Other (type your own answer)...',
+          };
+        }
+
         items.push({
           id: key,
           prompt,
@@ -1032,7 +1070,8 @@ export function buildQuestionCardFromElicitation(
           fieldType: 'multi',
           choices,
           multi: true,
-          other: false,
+          other,
+          ...(pairedWriteIn ? { writeInFieldId: pairedWriteIn } : {}),
           required,
           rawSchema: prop,
         });
@@ -1045,6 +1084,18 @@ export function buildQuestionCardFromElicitation(
           ...(o.title ? { label: o.title } : {}),
           ...(o.description ? { detail: o.description } : {}),
         }));
+        const pairedWriteIn = findPairedWriteInKey(key);
+        let other: QuestionItem['other'] = false;
+        if (pairedWriteIn) {
+          mergedWriteInKeys.add(pairedWriteIn);
+          const otherProp = propsMap[pairedWriteIn];
+          other = {
+            placeholder:
+              otherProp?.description?.trim() ||
+              otherProp?.title?.trim() ||
+              'Other (type your own answer)...',
+          };
+        }
         items.push({
           id: key,
           prompt,
@@ -1052,7 +1103,8 @@ export function buildQuestionCardFromElicitation(
           fieldType: 'single',
           choices,
           multi: false,
-          other: false,
+          other,
+          ...(pairedWriteIn ? { writeInFieldId: pairedWriteIn } : {}),
           required,
           rawSchema: prop,
         });
@@ -1064,6 +1116,18 @@ export function buildQuestionCardFromElicitation(
           value: String(v),
           ...(prop.enumNames?.[idx] ? { label: prop.enumNames[idx] } : {}),
         }));
+        const pairedWriteIn = findPairedWriteInKey(key);
+        let other: QuestionItem['other'] = false;
+        if (pairedWriteIn) {
+          mergedWriteInKeys.add(pairedWriteIn);
+          const otherProp = propsMap[pairedWriteIn];
+          other = {
+            placeholder:
+              otherProp?.description?.trim() ||
+              otherProp?.title?.trim() ||
+              'Other (type your own answer)...',
+          };
+        }
         items.push({
           id: key,
           prompt,
@@ -1071,7 +1135,8 @@ export function buildQuestionCardFromElicitation(
           fieldType: 'single',
           choices,
           multi: false,
-          other: false,
+          other,
+          ...(pairedWriteIn ? { writeInFieldId: pairedWriteIn } : {}),
           required,
           rawSchema: prop,
         });
@@ -1134,20 +1199,59 @@ export function buildQuestionCardFromElicitation(
 export function buildElicitationContent(card: ActiveQuestionCard): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const item of card.items) {
-    const raw = card.answers[item.id] ?? card.otherDrafts[item.id];
-    if (raw === undefined) continue;
+    const raw = card.answers[item.id];
+    const otherDraft = (card.otherDrafts[item.id] ?? '').trim();
+
+    if (item.writeInFieldId) {
+      const choiceValues = new Set((item.choices ?? []).map(c => c.value));
+      if (item.fieldType === 'multi') {
+        const rawList = Array.isArray(raw)
+          ? raw
+          : typeof raw === 'string' && raw.length > 0
+            ? [raw]
+            : [];
+        const selected = rawList.filter(v => choiceValues.has(v));
+        const extraCustom = rawList
+          .filter(v => !choiceValues.has(v) && v.trim().length > 0)
+          .map(v => v.trim());
+        const writeIn = otherDraft || extraCustom.join(', ');
+        if (selected.length > 0) {
+          out[item.id] = selected;
+        }
+        if (writeIn.length > 0) {
+          out[item.writeInFieldId] = writeIn;
+        }
+      } else {
+        const strVal = Array.isArray(raw) ? raw[0] : raw;
+        if (strVal !== undefined && choiceValues.has(strVal) && otherDraft.length === 0) {
+          out[item.id] = strVal;
+        } else if (otherDraft.length > 0) {
+          out[item.writeInFieldId] = otherDraft;
+        } else if (typeof strVal === 'string' && strVal.trim().length > 0) {
+          if (choiceValues.has(strVal)) {
+            out[item.id] = strVal;
+          } else {
+            out[item.writeInFieldId] = strVal.trim();
+          }
+        }
+      }
+      continue;
+    }
+
+    const effective = raw ?? (otherDraft.length > 0 ? otherDraft : undefined);
+    if (effective === undefined) continue;
 
     if (item.fieldType === 'boolean') {
-      const strVal = Array.isArray(raw) ? raw[0] : raw;
+      const strVal = Array.isArray(effective) ? effective[0] : effective;
       out[item.id] = strVal === 'true';
     } else if (item.fieldType === 'number') {
-      const strVal = Array.isArray(raw) ? raw[0] : raw;
+      const strVal = Array.isArray(effective) ? effective[0] : effective;
       const parsed = Number(strVal);
       out[item.id] = Number.isFinite(parsed) ? parsed : strVal;
     } else if (item.fieldType === 'multi') {
-      out[item.id] = Array.isArray(raw) ? [...raw] : [raw];
+      out[item.id] = Array.isArray(effective) ? [...effective] : [effective];
     } else {
-      out[item.id] = Array.isArray(raw) ? (raw[0] ?? '') : raw;
+      out[item.id] = Array.isArray(effective) ? (effective[0] ?? '') : effective;
     }
   }
   return out;

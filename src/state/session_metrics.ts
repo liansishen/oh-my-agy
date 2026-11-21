@@ -138,7 +138,7 @@ function formatCompactCount(n: number): string {
 }
 
 /**
- * Format TPS value for compact status bar display (e.g. `86.4/s`, `125/s`).
+ * Format TPS value for compact status bar display (e.g. `24.5 tok/s`, `331 tok/s`).
  * Returns `null` when `tps` is null, non-finite, or `<= 0`.
  */
 export function formatTpsText(tps: number | null | undefined): string | null {
@@ -146,7 +146,7 @@ export function formatTpsText(tps: number | null | undefined): string | null {
     return null;
   }
   const value = tps >= 100 ? Math.round(tps).toString() : tps.toFixed(1);
-  return `${value}/s`;
+  return `${value} tok/s`;
 }
 
 /**

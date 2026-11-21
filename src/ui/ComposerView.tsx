@@ -82,6 +82,7 @@ export interface ComposerCallbacks {
   readonly onCycleThinking?: () => void;
   readonly onOpenSwarmBoard?: () => void;
   readonly onOpenJobs?: () => void;
+  readonly onOpenGit?: () => void;
 }
 
 export interface ComposerViewProps {
@@ -631,6 +632,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             isCtrlCArmed,
             onCycleMode: callbacks.onCycleMode,
             onOpenContext: callbacks.onOpenContext,
+            onOpenGit: callbacks.onOpenGit,
           })}
 
           {costText ? (
@@ -890,6 +892,7 @@ interface ComposerExtrasParams {
   readonly isCtrlCArmed: boolean;
   readonly onCycleMode: () => void;
   readonly onOpenContext: () => void;
+  readonly onOpenGit?: () => void;
 }
 
 function renderComposerExtras(params: ComposerExtrasParams): JSX.Element {
@@ -902,6 +905,7 @@ function renderComposerExtras(params: ComposerExtrasParams): JSX.Element {
     isCtrlCArmed,
     onCycleMode,
     onOpenContext,
+    onOpenGit,
   } = params;
 
   const modeTone = resolveModeTone(modeId);
@@ -934,8 +938,10 @@ function renderComposerExtras(params: ComposerExtrasParams): JSX.Element {
           tone={gitStatus.isDirty ? 'warning' : 'muted'}
           icon="git-branch"
           spans={buildGitSegSpans(gitStatus)}
-          title={buildGitTitle(gitStatus)}
+          title={`${buildGitTitle(gitStatus)} (click or /git to open)`}
           hovercard={buildGitHovercard(gitStatus)}
+          actions={{ click: 'status.git' }}
+          onClick={() => onOpenGit?.()}
         />
       ) : null}
       {tpsText !== null ? (
