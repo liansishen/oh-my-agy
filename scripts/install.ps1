@@ -102,7 +102,15 @@ try {
             }
         }
         if ($expected) {
-            $actual = (Get-FileHash -Path $binTmp -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $fs = [System.IO.File]::OpenRead($binTmp)
+            try {
+                $hashBytes = $sha.ComputeHash($fs)
+            } finally {
+                $fs.Dispose()
+                $sha.Dispose()
+            }
+            $actual = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
             if ($actual -ne $expected) {
                 throw "SHA256 checksum mismatch for $assetName (expected $expected, got $actual)."
             }
