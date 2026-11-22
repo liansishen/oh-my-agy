@@ -1145,13 +1145,51 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       { id: 'size', format: 'dim' },
     ]);
 
+    // Wait for remote `session/list` to finish, then inspect the current settled preview subtree
+    // (rather than the earliest progressive first-paint `add` op, which may show the newly created
+    // `sess-initial` cached entry before `session/list` resolves on fast tmpfs runners).
+    const currentPreviewNodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+    const addPreviewSubtree = (n: WireNode): void => {
+      currentPreviewNodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+      if (n.c) for (const c of n.c) addPreviewSubtree(c);
+    };
+    const delPreviewSubtree = (id: string): void => {
+      currentPreviewNodes.delete(id);
+      const prefix = `${id}.`;
+      for (const k of [...currentPreviewNodes.keys()]) {
+        if (k.startsWith(prefix)) currentPreviewNodes.delete(k);
+      }
+    };
+    for (const op of host.allOps) {
+      if (op[0] === 'add') addPreviewSubtree(op[4]);
+      else if (op[0] === 'del') delPreviewSubtree(op[1]);
+      else if (op[0] === 'text') {
+        const e = currentPreviewNodes.get(op[1]);
+        if (e) {
+          const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+          e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+        }
+      } else if (op[0] === 'set') {
+        const e = currentPreviewNodes.get(op[1]);
+        if (e) {
+          for (const [k, v] of Object.entries(op[2])) {
+            if (v === null) delete e.p[k];
+            else e.p[k] = v;
+          }
+        }
+      }
+    }
     const previewAddOp = host.allOps.find(
       (op): op is readonly ['add', string, string, string | null, WireNode] =>
         op[0] === 'add' && op[1] === 'layer.modal.preview'
     );
     expect(previewAddOp).toBeDefined();
     expect(previewAddOp![2]).toBe('layer.modal');
-    const serializedPreview = JSON.stringify(previewAddOp![4]);
+    const serializedPreview = JSON.stringify(
+      [...currentPreviewNodes.entries()].filter(
+        ([id]) => id === 'layer.modal.preview' || id.startsWith('layer.modal.preview.')
+      )
+    );
     expect(serializedPreview).toContain('omp.picker.title');
     expect(serializedPreview).toContain('Conversation');
     expect(serializedPreview).toContain('Design Discussion');
@@ -4758,6 +4796,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
 
     controller.store.setGitCommitSummary('feat: update greeting');
+    controller.scheduler.renderNow();
     await waitFor(
       () =>
         replayNodes().get('layer.git.app.side.commit.foot.commit-btn')?.p?.['disabled'] === false
