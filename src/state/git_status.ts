@@ -31,7 +31,11 @@ export interface GitExecResult {
 
 export type GitExecFn = (
   args: readonly string[],
-  options: { readonly cwd: string; readonly timeoutMs: number },
+  options: {
+    readonly cwd: string;
+    readonly timeoutMs: number;
+    readonly env?: Readonly<Record<string, string | undefined>>;
+  },
 ) => Promise<GitExecResult>;
 
 export interface ProbeGitStatusOptions {

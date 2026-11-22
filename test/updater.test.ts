@@ -11,9 +11,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   compareSemver,
+  detectHostArch,
+  IMAGE_FILE_MACHINE_AMD64,
+  IMAGE_FILE_MACHINE_ARM64,
+  IMAGE_FILE_MACHINE_I386,
   isRuntimeInterpreterPath,
+  mapWindowsMachineToNodeArch,
   parseSha256Sums,
   parseUpdateArgs,
+  queryWindowsNativeMachine,
   replaceExecutableSafely,
   resolveReleaseAssetName,
   runUpdateCommand,
@@ -62,6 +68,7 @@ describe('oma update — SemVer, asset mapping, SHA256 & argument parsing', () =
 
   test('resolveReleaseAssetName maps supported OS/arch pairs', () => {
     expect(resolveReleaseAssetName('win32', 'x64')).toBe('oma-windows-x64.exe');
+    expect(resolveReleaseAssetName('win32', 'arm64')).toBe('oma-windows-arm64.exe');
     expect(resolveReleaseAssetName('linux', 'x64')).toBe('oma-linux-x64');
     expect(resolveReleaseAssetName('linux', 'arm64')).toBe('oma-linux-arm64');
     expect(resolveReleaseAssetName('darwin', 'arm64')).toBe('oma-darwin-arm64');
@@ -250,6 +257,284 @@ describe('oma update — end-to-end download, SHA256 verification & binary repla
     expect(code).toBe(1);
     expect(stderr.text()).toContain('SHA256 checksum mismatch');
     expect(readFileSync(targetExe, 'utf8')).toBe('safe-original');
+  });
+
+  test('aborts update and preserves existing binary when SHA256SUMS.txt is missing, fails to download, or omits the asset', async () => {
+    const scenarios = [
+      {
+        name: 'missing SHA256SUMS.txt asset',
+        assets: [{ name: 'oma-linux-x64', browser_download_url: 'https://downloads.test/oma-linux-x64' }],
+        sumsResponse: null as Response | null,
+        expectedErr: 'missing required SHA256SUMS.txt',
+      },
+      {
+        name: 'SHA256SUMS.txt HTTP 500',
+        assets: [
+          { name: 'oma-linux-x64', browser_download_url: 'https://downloads.test/oma-linux-x64' },
+          { name: 'SHA256SUMS.txt', browser_download_url: 'https://downloads.test/SHA256SUMS.txt' },
+        ],
+        sumsResponse: new Response('server error', { status: 500 }),
+        expectedErr: 'failed to download SHA256SUMS.txt',
+      },
+      {
+        name: 'SHA256SUMS.txt missing entry for asset',
+        assets: [
+          { name: 'oma-linux-x64', browser_download_url: 'https://downloads.test/oma-linux-x64' },
+          { name: 'SHA256SUMS.txt', browser_download_url: 'https://downloads.test/SHA256SUMS.txt' },
+        ],
+        sumsResponse: new Response(`${'a'.repeat(64)}  oma-darwin-arm64\n`, { status: 200 }),
+        expectedErr: 'does not contain a checksum entry',
+      },
+    ];
+
+    for (const sc of scenarios) {
+      const tmp = makeTempDir();
+      const targetExe = join(tmp, 'oma');
+      writeFileSync(targetExe, 'safe-original');
+      const mockFetch = (async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes('/releases/latest')) {
+          return new Response(
+            JSON.stringify({
+              tag_name: 'v0.9.0',
+              html_url: 'https://github.com/liansishen/oh-my-agy/releases/tag/v0.9.0',
+              assets: sc.assets,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.endsWith('oma-linux-x64')) return new Response('new-binary', { status: 200 });
+        if (url.endsWith('SHA256SUMS.txt') && sc.sumsResponse) return sc.sumsResponse;
+        return new Response('not found', { status: 404 });
+      }) as unknown as typeof globalThis.fetch;
+
+      const stdout = createStreamCapture();
+      const stderr = createStreamCapture();
+      const code = await runUpdateCommand([], {
+        currentVersion: '0.1.0',
+        platform: 'linux',
+        arch: 'x64',
+        execPath: targetExe,
+        env: {},
+        fetch: mockFetch,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      expect(code, sc.name).toBe(1);
+      expect(stderr.text(), sc.name).toContain(sc.expectedErr);
+      expect(readFileSync(targetExe, 'utf8'), sc.name).toBe('safe-original');
+    }
+  });
+
+  test('win32 arm64 prefers native asset, refuses x64 fallback without Windows 11 emulation, and falls back to x64 even on HTTP 429 rate limit', async () => {
+    const x64Bytes = new TextEncoder().encode('verified-x64-payload');
+    const x64Hash = sha256Hex(x64Bytes);
+
+    // 1) Windows 10 ARM64 (build 19045 < 22000, no x64 emulation) MUST refuse x64 fallback and keep original binary
+    const tmpWin10 = makeTempDir();
+    const exeWin10 = join(tmpWin10, 'oma.exe');
+    writeFileSync(exeWin10, 'working-arm64-orig');
+    let downloadedX64OnWin10 = false;
+    const mockFetchWin10 = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.9.1',
+            html_url: 'https://github.com/liansishen/oh-my-agy/releases/tag/v0.9.1',
+            assets: [
+              { name: 'oma-windows-x64.exe', browser_download_url: 'https://downloads.test/oma-windows-x64.exe' },
+              { name: 'SHA256SUMS.txt', browser_download_url: 'https://downloads.test/SHA256SUMS.txt' },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.endsWith('SHA256SUMS.txt')) return new Response(`${x64Hash}  oma-windows-x64.exe\n`, { status: 200 });
+      if (url.endsWith('oma-windows-x64.exe')) {
+        downloadedX64OnWin10 = true;
+        return new Response(x64Bytes, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof globalThis.fetch;
+
+    const stdout10 = createStreamCapture();
+    const stderr10 = createStreamCapture();
+    const code10 = await runUpdateCommand([], {
+      currentVersion: '0.1.0',
+      platform: 'win32',
+      arch: 'arm64',
+      osRelease: '10.0.19045',
+      execPath: exeWin10,
+      env: {},
+      fetch: mockFetchWin10,
+      stdout: stdout10.stream,
+      stderr: stderr10.stream,
+    });
+    expect(code10).toBe(1);
+    expect(downloadedX64OnWin10).toBe(false);
+    expect(stderr10.text()).toContain('Windows 11');
+    expect(readFileSync(exeWin10, 'utf8')).toBe('working-arm64-orig');
+
+    // 2) Windows 11 ARM64 (build 22631) under GitHub REST API HTTP 429 rate limit:
+    // discovers actual published x64 asset from SHA256SUMS.txt without 404ing on missing ARM64 asset!
+    const tmpWin11 = makeTempDir();
+    const exeWin11 = join(tmpWin11, 'oma.exe');
+    writeFileSync(exeWin11, 'old-arm64');
+    let requestedMissingArm64 = false;
+    const mockFetch429 = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.startsWith('https://api.github.com/')) {
+        return new Response('too many requests', { status: 429 });
+      }
+      if (url === 'https://github.com/liansishen/oh-my-agy/releases/latest') {
+        const res = new Response('', { status: 200 });
+        Object.defineProperty(res, 'url', {
+          value: 'https://github.com/liansishen/oh-my-agy/releases/tag/v0.9.2',
+        });
+        return res;
+      }
+      if (url.endsWith('/v0.9.2/SHA256SUMS.txt')) {
+        return new Response(`${x64Hash}  oma-windows-x64.exe\n`, { status: 200 });
+      }
+      if (url.endsWith('/v0.9.2/oma-windows-arm64.exe')) {
+        requestedMissingArm64 = true;
+        return new Response('not found', { status: 404 });
+      }
+      if (url.endsWith('/v0.9.2/oma-windows-x64.exe')) {
+        return new Response(x64Bytes, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof globalThis.fetch;
+
+    const stdout11 = createStreamCapture();
+    const stderr11 = createStreamCapture();
+    const code11 = await runUpdateCommand([], {
+      currentVersion: '0.1.0',
+      platform: 'win32',
+      arch: 'arm64',
+      osRelease: '10.0.22631',
+      execPath: exeWin11,
+      env: {},
+      fetch: mockFetch429,
+      stdout: stdout11.stream,
+      stderr: stderr11.stream,
+    });
+
+    expect(code11).toBe(0);
+    expect(requestedMissingArm64).toBe(false);
+    expect(stdout11.text()).toContain('falling back to oma-windows-x64.exe');
+    expect(readFileSync(exeWin11, 'utf8')).toBe('verified-x64-payload');
+
+    // 3) Emulated x64 binary (`arch: 'x64'`) running on Windows ARM64 host (`PROCESSOR_ARCHITEW6432=ARM64`):
+    // automatically detects host ARM64 and upgrades cleanly back to native `oma-windows-arm64.exe`!
+    const tmpUpgrade = makeTempDir();
+    const exeEmulated = join(tmpUpgrade, 'oma.exe');
+    writeFileSync(exeEmulated, 'old-emulated-x64');
+    const arm64Bytes = new TextEncoder().encode('native-arm64-binary');
+    const arm64Hash = sha256Hex(arm64Bytes);
+    const mockFetchNativeArm64 = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v1.0.0',
+            html_url: 'https://github.com/liansishen/oh-my-agy/releases/tag/v1.0.0',
+            assets: [
+              { name: 'oma-windows-arm64.exe', browser_download_url: 'https://downloads.test/oma-windows-arm64.exe' },
+              { name: 'SHA256SUMS.txt', browser_download_url: 'https://downloads.test/SHA256SUMS.txt' },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.endsWith('SHA256SUMS.txt')) return new Response(`${arm64Hash}  oma-windows-arm64.exe\n`, { status: 200 });
+      if (url.endsWith('oma-windows-arm64.exe')) return new Response(arm64Bytes, { status: 200 });
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof globalThis.fetch;
+
+    // 3) Fallback when Win32 native probe is unavailable (`null`): `PROCESSOR_ARCHITEW6432=ARM64`
+    // detects host ARM64 and upgrades cleanly back to native `oma-windows-arm64.exe`.
+    const stdoutNative = createStreamCapture();
+    const stderrNative = createStreamCapture();
+    const codeNative = await runUpdateCommand([], {
+      currentVersion: '0.1.0',
+      platform: 'win32',
+      arch: 'x64',
+      env: { PROCESSOR_ARCHITEW6432: 'ARM64' },
+      probeWin32NativeMachine: () => null,
+      execPath: exeEmulated,
+      fetch: mockFetchNativeArm64,
+      stdout: stdoutNative.stream,
+      stderr: stderrNative.stream,
+    });
+    expect(codeNative).toBe(0);
+    expect(readFileSync(exeEmulated, 'utf8')).toBe('native-arm64-binary');
+
+    // 4) Windows 11 Prism x64 emulation on Snapdragon / ARM64 where `PROCESSOR_ARCHITEW6432`
+    // is UNSET: `IsWow64Process2` reports `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`), so the updater
+    // still selects and installs the native `oma-windows-arm64.exe` even when no x64 asset exists!
+    const tmpPrism = makeTempDir();
+    const exePrism = join(tmpPrism, 'oma.exe');
+    writeFileSync(exePrism, 'old-prism-x64');
+    const stdoutPrism = createStreamCapture();
+    const stderrPrism = createStreamCapture();
+    const codePrism = await runUpdateCommand([], {
+      currentVersion: '0.1.0',
+      platform: 'win32',
+      arch: 'x64',
+      env: { PROCESSOR_ARCHITECTURE: 'AMD64' },
+      probeWin32NativeMachine: () => IMAGE_FILE_MACHINE_ARM64,
+      execPath: exePrism,
+      fetch: mockFetchNativeArm64,
+      stdout: stdoutPrism.stream,
+      stderr: stderrPrism.stream,
+    });
+    expect(codePrism).toBe(0);
+    expect(readFileSync(exePrism, 'utf8')).toBe('native-arm64-binary');
+
+    // 5) Authoritative Win32 probe MUST NOT be overridden by a conflicting `PROCESSOR_ARCHITEW6432`:
+    // when `IsWow64Process2` reports `IMAGE_FILE_MACHINE_AMD64`, env spoofing `ARM64` must NOT
+    // download or install an ARM64 binary onto an x64 host!
+    const tmpAmd64 = makeTempDir();
+    const exeAmd64 = join(tmpAmd64, 'oma.exe');
+    writeFileSync(exeAmd64, 'real-x64-binary');
+    const stdoutAmd64 = createStreamCapture();
+    const stderrAmd64 = createStreamCapture();
+    const codeAmd64 = await runUpdateCommand([], {
+      currentVersion: '0.1.0',
+      platform: 'win32',
+      arch: 'x64',
+      env: { PROCESSOR_ARCHITEW6432: 'ARM64' },
+      probeWin32NativeMachine: () => IMAGE_FILE_MACHINE_AMD64,
+      execPath: exeAmd64,
+      fetch: mockFetchNativeArm64,
+      stdout: stdoutAmd64.stream,
+      stderr: stderrAmd64.stream,
+    });
+    expect(codeAmd64).toBe(1);
+    expect(stderrAmd64.text()).toContain('oma-windows-x64.exe');
+    expect(readFileSync(exeAmd64, 'utf8')).toBe('real-x64-binary');
+
+    // Direct helper verification + live Win32 FFI sanity check on Windows hosts
+    expect(mapWindowsMachineToNodeArch(IMAGE_FILE_MACHINE_ARM64)).toBe('arm64');
+    expect(mapWindowsMachineToNodeArch(IMAGE_FILE_MACHINE_AMD64)).toBe('x64');
+    expect(mapWindowsMachineToNodeArch(IMAGE_FILE_MACHINE_I386)).toBe('ia32');
+    expect(
+      detectHostArch('win32', 'x64', {}, () => IMAGE_FILE_MACHINE_ARM64),
+    ).toBe('arm64');
+    expect(
+      detectHostArch('win32', 'x64', { PROCESSOR_ARCHITEW6432: 'ARM64' }, () => IMAGE_FILE_MACHINE_AMD64),
+    ).toBe('x64');
+    expect(
+      detectHostArch('win32', 'ia32', {}, () => IMAGE_FILE_MACHINE_AMD64),
+    ).toBe('x64');
+    if (process.platform === 'win32') {
+      const liveMachine = queryWindowsNativeMachine();
+      expect(liveMachine).not.toBeNull();
+      expect(mapWindowsMachineToNodeArch(liveMachine!)).not.toBeNull();
+    }
   });
 
   test('falls back to github.com/releases/latest redirect when API returns 403 rate limit', async () => {

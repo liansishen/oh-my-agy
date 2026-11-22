@@ -51,7 +51,12 @@ function makeTempDir(): string {
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    if (!dir) continue;
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 30 });
+    } catch {
+      // Ignore transient Windows EBUSY lock on temp dir cleanup after test assertions passed
+    }
   }
 });
 
@@ -1136,7 +1141,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     // Press Enter to resume selected session -> closes picker, restores EDITOR_NODE_ID focus, loads & replays
     host.input.emit('\r');
-    await waitFor(() => controller.store.getState().sessionId === 'sess-history-42');
+    await waitFor(
+      () =>
+        controller.store.getState().sessionId === 'sess-history-42' &&
+        !controller.scheduler.suspended &&
+        host.allOps.some(op => op[0] === 'scroll' && op[1] === 'main' && op[2] === 'end')
+    );
 
     expect(controller.store.getState().picker).toBeNull();
     expect(controller.currentSurfaceFocus).toBe(EDITOR_NODE_ID);
@@ -6127,6 +6137,1289 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         n => n.k === 'section' && (n.p['role'] === 'omp.thinking' || n.p['role'] === 'omp.thinking.live')
       )
     );
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P1 regressions: concurrent submit guard, attachment removal cancels file send, stale session updates filtered, broken config preserved, and rapid toggles serialize cleanly', async () => {
+    const tmp = makeTempDir();
+    const secretFile = join(tmp, 'secret.txt');
+    writeFileSync(secretFile, 'SECRET_ATTACHMENT_BODY', 'utf8');
+    const brokenConfigPath = join(tmp, 'broken-config.toml');
+    const brokenToml = 'agy_bin = "/custom/agy"\n[ui\nbroken syntax ===\n';
+    writeFileSync(brokenConfigPath, brokenToml, 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptCalls: Array<{ sessionId: string; prompt: unknown[] }> = [];
+    let releaseFirstPrompt = Promise.withResolvers<void>();
+    let currentServer: { send: (msg: Record<string, unknown>) => void; crash: (code: number) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      currentServer = server;
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'agy', version: '2.0.0' },
+            agentCapabilities: {
+              loadSession: true,
+              promptCapabilities: { image: true, embeddedContext: true },
+            },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        const sid = promptCalls.length === 0 ? 'sess-old' : 'sess-new';
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: [] },
+        });
+      } else if (msg.method === 'session/close') {
+        // Simulate old session failing to close cleanly
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32000, message: 'close busy' },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const params = msg.params as { sessionId: string; prompt: unknown[] };
+        promptCalls.push(params);
+        if (promptCalls.length === 1) {
+          void releaseFirstPrompt.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'First reply.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Second reply.' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath: brokenConfigPath,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P1-5: Toggling tool display via Alt+O with a malformed config.toml must keep the change
+    // in memory ONLY and must NOT overwrite or lose the user's original file (e.g. `agy_bin`).
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'compact');
+    await new Promise(r => setTimeout(r, 30));
+    expect(readFileSync(brokenConfigPath, 'utf8')).toBe(brokenToml);
+
+    // P1-1: Two concurrent `submitInput` calls before the first awaits completes must only send ONE `session/prompt`
+    const c1 = controller.submitInput('first concurrent');
+    const c2 = controller.submitInput('second concurrent');
+    await Promise.all([c1, c2]);
+    await waitFor(() => promptCalls.length === 1);
+    await new Promise(r => setTimeout(r, 30));
+    expect(promptCalls).toHaveLength(1);
+    releaseFirstPrompt.resolve();
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // P1-3: Switch to a new session while old session fails to close; stale updates from `sess-old` must be ignored
+    await controller.submitInput('/new');
+    await waitFor(() => controller.store.getState().sessionId === 'sess-new');
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    currentServer!.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-old',
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'STALE_LEAK_FROM_OLD_SESSION' },
+        },
+      },
+    });
+    await new Promise(r => setTimeout(r, 30));
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+
+    // P1-4: Add file attachment + `@secret.txt` in draft, then remove attachment via TSP remove action ->
+    // outbound `session/prompt` must NOT include `resource` or `resource_link` for `secret.txt`.
+    controller.store.draft.setText('Inspect @secret.txt please');
+    controller.store.addAttachment({
+      id: 'file-rm-1',
+      kind: 'file',
+      name: 'secret.txt',
+      ext: 'txt',
+      mime: 'text/plain',
+      path: 'secret.txt',
+    });
+    controller.scheduler.renderNow();
+    const removeIconId = host.findWireNodes(
+      n => n.k === 'icon' && n.p?.['title'] === 'Remove attachment'
+    )[0]?.id;
+    expect(removeIconId).toBeDefined();
+    host.input.emitTspEvent({
+      ev: 'action',
+      sf: 'oma',
+      id: removeIconId!,
+      act: 'remove',
+    });
+    await waitFor(() => controller.store.getState().pendingAttachments.length === 0);
+    // Removing the file attachment also strips `@secret.txt` from the draft AND suppresses it
+    expect(controller.store.draft.text).not.toContain('@secret.txt');
+    // Even if `@secret.txt` is passed again, removing the attachment suppresses file inclusion
+    await controller.submitInput('Inspect @secret.txt please');
+    await waitFor(() => promptCalls.length === 2);
+    await waitFor(() => !controller.store.getState().isStreaming);
+    const secondBlocks = promptCalls[1]!.prompt as Array<Record<string, unknown>>;
+    expect(secondBlocks.some(b => b['type'] === 'resource' || b['type'] === 'resource_link')).toBe(false);
+    expect(JSON.stringify(secondBlocks)).not.toContain('SECRET_ATTACHMENT_BODY');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // P2-5: Rapid Alt+O toggles on a valid config.toml serialize writes and `shutdown()` flushes final state
+    const tmp2 = makeTempDir();
+    const validCfg = join(tmp2, 'config.toml');
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    acp2.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-ser', configOptions: [] } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+    const controller2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath: validCfg,
+      cwd: tmp2,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp2, 'sessions') }),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise2 = controller2.run();
+    await controller2.readyPromise;
+    // Rapidly toggle all -> compact -> hidden -> all -> compact (4 times) and immediately shut down
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    await waitFor(() => controller2.store.getState().toolDisplayMode === 'compact');
+    await controller2.shutdown({ cleanExit: true });
+    await runPromise2;
+    const saved = parseConfigToml(readFileSync(validCfg, 'utf8'));
+    expect(saved.parseError).toBeUndefined();
+    expect(saved.config.ui.tool_display).toBe('compact');
+  });
+
+  test('P1 regression: ACP process crash during session/load replay drain ends in crashed state (never ready)', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'agy', version: '2.0.0' },
+            agentCapabilities: { loadSession: true },
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-crash-replay',
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'old turn' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-crash-replay', configOptions: [] },
+        });
+        // Crash the ACP child while `#waitForReplayDrain()` is still waiting
+        setTimeout(() => {
+          server.crash(137);
+        }, 20);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', 'sess-crash-replay']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 120,
+    });
+
+    const runPromise = controller.run();
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    // Wait past the replay drain window to verify it NEVER transitions back to `ready`
+    await new Promise(r => setTimeout(r, 180));
+    const st = controller.store.getState();
+    expect(st.connectionStatus).toBe('crashed');
+    expect(st.isReady).toBe(false);
+    expect(st.crashError).not.toBeNull();
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P2 regressions: background handoff stays running, manual cancel marks tool+turn cancelled, ACP exit settles post-end_turn tool, and same-RPC swarm_wait reply emits OSC done', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let promptNum = 0;
+    let latestServer: { send: (msg: Record<string, unknown>) => void; crash: (code: number) => void } | null = null;
+    acp.setHandler((msg, server) => {
+      latestServer = server;
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-p2-bg', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        promptNum += 1;
+        if (promptNum === 1) {
+          // Turn 0: Same-RPC `swarm_wait` + coordinator final reply -> must settle & emit OSC done!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-sw-wait',
+                name: 'swarm_wait',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'swarm_wait',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-sw-wait',
+                status: 'completed',
+                content: [{ type: 'content', content: { type: 'text', text: 'woke up' } }],
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Coordinator final summary inside same RPC.' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 2) {
+          // Turn 1: `run_command` starts in_progress, returns end_turn while still running ->
+          // then completes with background task handoff (`task-handoff-1`) -> must stay running until manually cancelled!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-handoff',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'long build',
+                rawInput: { CommandLine: 'bun run build' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 3) {
+          // Turn 2: Leaves an in-flight background tool after end_turn, then ACP exits unexpectedly
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-crash-bg',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'crash build',
+                rawInput: { CommandLine: 'sleep 99' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      backgroundDoneGraceMs: 25,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P2-4: Same-RPC swarm_wait + reply emits OSC 7501 done
+    await controller.submitInput('coordinate swarm');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => host.rawWrites.join('').includes('7501;state=done'));
+
+    // P2-3: In-flight placeholder tool hands off to detached background task on `completed` -> stays running!
+    await controller.submitInput('start bg build');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    latestServer!.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-p2-bg',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-handoff',
+          status: 'completed',
+          content: [
+            {
+              type: 'content',
+              content: {
+                type: 'text',
+                text: 'Tool is running as a background task with task id: sess-p2-bg/task-999',
+              },
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(r => setTimeout(r, 30));
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    expect(
+      controller.store.transcript
+        .getDetachedBackgroundTasks()
+        .some(t => t.taskId === 'sess-p2-bg/task-999' && t.status === 'running')
+    ).toBe(true);
+
+    // P2-2 (manual stop): Manually cancel while background task + still-open tool exist ->
+    // task, tool card, and turn all transition consistently to `cancelled` (never `done`)!
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-handoff-child',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'still running step',
+    });
+    await controller.cancelPendingAndTurn();
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(false);
+    const turn1 = controller.store.transcript.getVisibleTurns()[1]!;
+    expect(turn1.status).toBe('cancelled');
+    expect(turn1.toolCalls.find(t => t.toolCallId === 'tc-handoff-child')?.status).toBe('cancelled');
+
+    // P2-2 (ACP exit): Turn 2 ends RPC with background tool still running, then ACP crashes ->
+    // active turn and running tool card must be finalized (not left running)!
+    await controller.submitInput('crash bg');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    latestServer!.crash(1);
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    const turn2 = controller.store.transcript.getVisibleTurns()[2]!;
+    expect(turn2.status).toBe('error');
+    expect(turn2.toolCalls.find(t => t.toolCallId === 'tc-crash-bg')?.status).not.toBe('running');
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(false);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P2 regressions: hidden mode keeps pending tool visible, Ctrl+O + manual Read group collapse sticks, and Ctrl+T preserves non-evicted prose after GoneEvent', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const releaseTurn = Promise.withResolvers<void>();
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-p2-ui', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Earlier prose block.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: 'Middle reasoning.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Surviving later prose block.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-r1',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'File /w/one.ts',
+              locations: [{ path: '/w/one.ts' }],
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-r2',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'File /w/two.ts',
+              locations: [{ path: '/w/two.ts' }],
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-pending-1',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'pending',
+              title: 'Queued command',
+            },
+          },
+        });
+        void releaseTurn.promise.then(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-ui',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-pending-1',
+                status: 'completed',
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, tool_display: 'hidden' } },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const p = controller.submitInput('check ui edge cases');
+    await waitFor(() => replayNodes().has('main.t0-tc-pending-1'));
+
+    // P2-6a: In `hidden` mode, a `pending` tool is still mounted directly under `main` (not inside hidden `omp.activity`)
+    const midNodes = replayNodes();
+    expect(midNodes.get('main.t0-tc-pending-1')?.k).toBe('tool');
+    expect(midNodes.get('main.t0-tc-pending-1')?.p['status']).toBe('pending');
+    expect(midNodes.get('main.t0-activity-tc-r1')?.p['hidden']).toBe(true);
+
+    releaseTurn.resolve();
+    await p;
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // Switch to `all`, expand all with Ctrl+O, then manually collapse the Read group -> must stick!
+    controller.store.setToolDisplayMode('all');
+    controller.scheduler.renderNow();
+    await waitFor(() => replayNodes().has('main.t0-read-group-tc-r1'));
+    host.input.emit('\x0f');
+    await waitFor(() => replayNodes().get('main.t0-read-group-tc-r1')?.p['collapsed'] === false);
+    host.input.emitTspEvent({
+      ev: 'toggle',
+      sf: 'oma',
+      id: 'main.t0-read-group-tc-r1',
+      collapsed: true,
+    });
+    await waitFor(() => replayNodes().get('main.t0-read-group-tc-r1')?.p['collapsed'] === true);
+    expect(controller.store.getState().expandedToolGroups['turn-0:read-group-tc-r1']).toBe(false);
+
+    // P2-6c: Evict the first prose node via Tern GoneEvent, then hide thoughts via Ctrl+T ->
+    // the second (non-evicted) prose block must keep its own stable node ID and remain visible!
+    const beforeEvict = replayNodes();
+    const firstMdEntry = [...beforeEvict.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Earlier prose block.'
+    );
+    const secondMdEntry = [...beforeEvict.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Surviving later prose block.'
+    );
+    expect(firstMdEntry).toBeDefined();
+    expect(secondMdEntry).toBeDefined();
+    const firstParentId = firstMdEntry![0].slice(0, firstMdEntry![0].lastIndexOf('.'));
+    const secondParentId = secondMdEntry![0].slice(0, secondMdEntry![0].lastIndexOf('.'));
+    expect(firstParentId).not.toBe(secondParentId);
+
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: [firstParentId] });
+    await waitFor(() => controller.scheduler.isEvicted(firstParentId));
+
+    host.input.emit('\x14'); // Ctrl+T hide thinking
+    await waitFor(() => controller.store.getState().showThinking === false);
+    const afterCtrlT = replayNodes();
+    expect(afterCtrlT.has(firstParentId)).toBe(false);
+    expect(afterCtrlT.has(secondParentId)).toBe(true);
+    expect(afterCtrlT.get(secondMdEntry![0])?.p['text']).toBe('Surviving later prose block.');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 2 P1/P2 regressions: /new session epoch & buffered early updates, non-destructive draft mention removal, permanent cancelled/completed task state, and swarm reply/worker separation', async () => {
+    const tmp = makeTempDir();
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Test Swarm',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-1': { role: 'worker', phase: 'RUNNING', wake_mode: 'working', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(join(swarmDir, 'board.jsonl'), '', 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let sessionNum = 0;
+    const releaseOldPrompt = Promise.withResolvers<void>();
+    const releaseNewSession = Promise.withResolvers<void>();
+    let serverRef: { send: (msg: Record<string, unknown>) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      serverRef = server;
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        sessionNum += 1;
+        if (sessionNum === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-r2-1', configOptions: [] } });
+        } else {
+          // While `session/new` for sess-r2-2 is in flight:
+          // - stale old-session chunk arrives (must be discarded!)
+          // - early new-session `available_commands_update` arrives (must be buffered & applied!)
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-1',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'STALE_INFLIGHT_LEAK' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'fresh-cmd', description: 'Early command for new session' }],
+              },
+            },
+          });
+          void releaseNewSession.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              id: msg.id,
+              result: { sessionId: 'sess-r2-2', configOptions: [] },
+            });
+          });
+        }
+      } else if (msg.method === 'session/prompt') {
+        const params = msg.params as { sessionId: string };
+        if (params.sessionId === 'sess-r2-1') {
+          // Stays open across `/new`, then resolves late AFTER we switched to sess-r2-2
+          void releaseOldPrompt.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          // On sess-r2-2: swarm_wait + empty whitespace chunk (must NOT clear wait) + visible reply
+          // while worker snapshot still lags as `working` at `end_turn`!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-sw-r2',
+                name: 'swarm_wait',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'swarm_wait',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-sw-r2',
+                status: 'completed',
+              },
+            },
+          });
+          // Empty/whitespace chunk must NOT clear waiting state
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: '   ' },
+              },
+            },
+          });
+          // Actual visible coordinator reply
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'All swarm tasks finished!' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      swarmDir,
+      swarmPollIntervalMs: 25,
+      backgroundDoneGraceMs: 30,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P2-1: Removing a file attachment preserves Python indentation, double spaces inside strings, and cursor position!
+    const pythonDraft = 'def f():\n    x = "a  b"\n    # ref @foo.py here\n    return x';
+    controller.store.draft.setText(pythonDraft, 12); // cursor inside `"a  b"` line
+    controller.store.addAttachment({
+      id: 'att-py-1',
+      kind: 'file',
+      name: 'foo.py',
+      ext: 'py',
+      mime: 'text/x-python',
+      path: 'foo.py',
+    });
+    controller.scheduler.renderNow();
+    const rmIcon = host.findWireNodes(n => n.k === 'icon' && n.p?.['title'] === 'Remove attachment')[0];
+    expect(rmIcon).toBeDefined();
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: rmIcon!.id, act: 'remove' });
+    await waitFor(() => controller.store.getState().pendingAttachments.length === 0);
+    expect(controller.store.draft.text).toBe('def f():\n    x = "a  b"\n    # ref here\n    return x');
+    expect(controller.store.draft.cursor).toBe(12);
+    controller.store.draft.reset();
+
+    // P1-1: Start a slow prompt on sess-r2-1, then run `/new` while prompt is still in flight
+    await controller.submitInput('long old turn');
+    await waitFor(() => controller.store.getState().isStreaming);
+    const newSessionPromise = controller.submitInput('/new');
+    // Before `session/new` resolves, verify `sessionId` is already cleared and stale leak did NOT enter transcript
+    await waitFor(() => controller.store.getState().sessionId === null);
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+
+    releaseNewSession.resolve();
+    await newSessionPromise;
+    await waitFor(() => controller.store.getState().sessionId === 'sess-r2-2');
+    // Stale old-session chunk was discarded, while early new-session command was buffered & applied!
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    expect(controller.store.commands.getAll().some(c => c.name === 'fresh-cmd')).toBe(true);
+
+    // Now let the old session's late prompt response arrive -> must NOT emit `state=done` or touch sess-r2-2!
+    const writesBeforeOldResolve = host.rawWrites.join('').length;
+    releaseOldPrompt.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    expect(host.rawWrites.join('').slice(writesBeforeOldResolve)).not.toContain('7501;state=done');
+
+    // P2-2: Cancelled tool card stays `cancelled` on late `completed`; completed handoff task stays `completed` on late title update
+    const tTool = controller.store.transcript.beginUserTurn('cancel & handoff test');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-cancel-persist',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'slow job',
+    });
+    controller.store.transcript.finalizeBackgroundTurn({
+      terminalToolStatus: 'cancelled',
+      terminalTurnStatus: 'cancelled',
+    });
+    expect(tTool.toolCalls[0]?.status).toBe('cancelled');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-cancel-persist',
+      status: 'completed',
+    });
+    expect(tTool.toolCalls[0]?.status).toBe('cancelled');
+
+    const tHandoff = controller.store.transcript.beginUserTurn('completed handoff stays terminal');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-bg-done',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'bg job',
+      content: [{ type: 'content', content: { type: 'text', text: 'Tool is running as a background task with task id: sess-r2-2/task-77' } }],
+    });
+    expect(controller.store.transcript.completeBackgroundTask('sess-r2-2/task-77', 'completed')).toBe(true);
+    expect(controller.store.transcript.hasActiveBackgroundTasks()).toBe(false);
+    // Late incremental title-only update on `tc-bg-done` must NOT resurrect the completed task back to `running`!
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-bg-done',
+      title: 'bg job (renamed)',
+    });
+    expect(controller.store.transcript.hasActiveBackgroundTasks()).toBe(false);
+    controller.store.transcript.finishActiveTurn('end_turn');
+    expect(tHandoff.status).toBe('done');
+
+    // P2-3: On sess-r2-2, swarm worker is still `working` when coordinator emits visible reply + `end_turn`.
+    // Once watcher sees worker transition to `waiting`, OSC 7501 `state=done` MUST fire!
+    await waitFor(() => controller.store.isSwarmWorking === true);
+    const writesBeforeSwarm = host.rawWrites.join('').length;
+    await controller.submitInput('finish swarm');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // While worker-1 is still `working`, `done` must not have fired yet
+    await new Promise(r => setTimeout(r, 40));
+    expect(host.rawWrites.join('').slice(writesBeforeSwarm)).not.toContain('7501;state=done');
+
+    // Transition swarm members to `waiting` (no second coordinator reply arrives!) -> deferred `done` must fire!
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Test Swarm',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-1': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    await waitFor(() => host.rawWrites.join('').slice(writesBeforeSwarm).includes('7501;state=done'));
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 3 P1/P2 regressions: rapid double /new preserves latest command buffer, late anchor save does not overwrite OSC anchor, and stale permission/elicitation requests are rejected cleanly', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let newCount = 0;
+    const releaseNew2 = Promise.withResolvers<void>();
+    const releaseNew3 = Promise.withResolvers<void>();
+    const releaseOldSave = Promise.withResolvers<void>();
+    const serverResponses: Array<{ id: unknown; result: unknown }> = [];
+    let serverRef: { send: (msg: Record<string, unknown>) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      serverRef = server;
+      if (msg.id !== undefined && msg.method === undefined) {
+        serverResponses.push({ id: msg.id, result: msg.result });
+        return;
+      }
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        newCount += 1;
+        if (newCount === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-kept', configOptions: [] } });
+        } else if (newCount === 2) {
+          void releaseNew2.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-superseded', configOptions: [] } });
+          });
+        } else {
+          // Third session (second `/new`) pushes an early slash command BEFORE resolving
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-current',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'final-cmd', description: 'Must survive superseded /new finally' }],
+              },
+            },
+          });
+          void releaseNew3.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-current', configOptions: [] } });
+          });
+        }
+      } else if (msg.method === 'session/prompt') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const basePreviewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    let holdKeptSave = false;
+    const delayedPreviewStore = Object.assign(Object.create(Object.getPrototypeOf(basePreviewStore)), basePreviewStore, {
+      async save(input: Parameters<PreviewStore['save']>[0]): Promise<string> {
+        const savedPath = await basePreviewStore.save(input);
+        if (input.sessionId === 'sess-kept' && holdKeptSave) {
+          await releaseOldSave.promise;
+        }
+        return savedPath;
+      },
+    }) as PreviewStore;
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: delayedPreviewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    expect(controller.store.getState().sessionId).toBe('sess-kept');
+
+    // Trigger a prompt on `sess-kept` whose post-turn anchor `save()` will resolve LATE after we switch sessions
+    holdKeptSave = true;
+    await controller.submitInput('trigger delayed anchor save');
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // P1-2: Trigger TWO consecutive `/new` calls while neither has resolved yet!
+    const firstNew = controller.submitInput('/new');
+    await waitFor(() => newCount === 2);
+    const secondNew = controller.submitInput('/new');
+    await waitFor(() => newCount === 3);
+
+    // First (superseded) `/new` resolves FIRST and runs its `finally` block -> must NOT wipe second `/new`'s command buffer!
+    releaseNew2.resolve();
+    await firstNew;
+    // Now second `/new` resolves -> must apply its buffered `final-cmd`!
+    releaseNew3.resolve();
+    await secondNew;
+    await waitFor(() => controller.store.getState().sessionId === 'sess-current');
+    expect(controller.store.commands.getAll().some(c => c.name === 'final-cmd')).toBe(true);
+
+    // P2-1a: Now let `sess-kept`'s delayed anchor `save()` resolve -> OSC 1337 SetUserVar must NOT revert to `sess-kept.json`!
+    const writesBeforeLateAnchor = host.rawWrites.join('').length;
+    releaseOldSave.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    const lateOsc = host.rawWrites.join('').slice(writesBeforeLateAnchor);
+    expect(lateOsc).not.toContain('SetUserVar=omp_session_file=');
+
+    // P2-1b: Stale reverse server requests (`session/request_permission` & `elicitation/create`) carrying old sessionId
+    // must be automatically cancelled without mounting into `sess-current` UI!
+    serverRef!.send({
+      jsonrpc: '2.0',
+      id: 9001,
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'sess-kept',
+        toolCall: { toolCallId: 'tc-stale-perm', title: 'stale rm' },
+        options: [
+          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      },
+    });
+    serverRef!.send({
+      jsonrpc: '2.0',
+      id: 9002,
+      method: 'elicitation/create',
+      params: {
+        sessionId: 'sess-kept',
+        mode: 'form',
+        message: 'Stale question',
+        requestedSchema: { type: 'object', properties: { q1: { type: 'string' } } },
+      },
+    });
+    await waitFor(
+      () =>
+        serverResponses.some(r => r.id === 9001) &&
+        serverResponses.some(r => r.id === 9002)
+    );
+    expect(controller.store.approvals.hasPending()).toBe(false);
+    expect(controller.store.getState().activeQuestion).toBeNull();
+    expect(serverResponses.find(r => r.id === 9001)?.result).toEqual({
+      outcome: { outcome: 'cancelled' },
+    });
+    expect(serverResponses.find(r => r.id === 9002)?.result).toEqual({ action: 'cancel' });
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 4 P1 regression: interleaved /resume and /new in BOTH directions preserve latest session, discard old replay, keep early commands, and leave scheduler unsuspended', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let newCount = 0;
+    let loadCount = 0;
+    let closeStarted = 0;
+    let holdFirstClose = true;
+    const releaseFirstClose = Promise.withResolvers<void>();
+    const releaseReplay2 = Promise.withResolvers<void>();
+    const releaseNewAfterReplay = Promise.withResolvers<void>();
+    const loadedSessionIds: string[] = [];
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/list') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: 'sess-hist-1',
+                cwd: tmp,
+                title: 'Historical Session 1',
+                updatedAt: '2026-11-22T10:00:00Z',
+              },
+              {
+                sessionId: 'sess-hist-2',
+                cwd: tmp,
+                title: 'Historical Session 2',
+                updatedAt: '2026-11-22T11:00:00Z',
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        newCount += 1;
+        if (newCount === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-init', configOptions: [] } });
+        } else if (newCount === 2) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-new-wins', configOptions: [] } });
+        } else {
+          // Third `/new` (started WHILE `sess-hist-2` is mid-replay):
+          // Old replay emits a trailing message, while new session emits its early slash command!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-hist-2',
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: 'STALE_REPLAY_MESSAGE_MUST_NOT_LEAK' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-after-replay',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'after-replay-cmd', description: 'Early command after replay' }],
+              },
+            },
+          });
+          void releaseNewAfterReplay.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-after-replay', configOptions: [] } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        closeStarted += 1;
+        if (holdFirstClose) {
+          holdFirstClose = false;
+          void releaseFirstClose.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+          });
+        } else {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        loadedSessionIds.push(sid);
+        loadCount += 1;
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: `History turn of ${sid}` },
+            },
+          },
+        });
+        void releaseReplay2.promise.then(() => {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: sid, configOptions: [] } });
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 80,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    expect(controller.store.getState().sessionId).toBe('sess-init');
+
+    // Direction 1: Activate `/resume` for `sess-hist-1` -> blocks on `session/close` ->
+    // `/new` completes -> release old `/resume`'s `closeSession` -> MUST NOT load `sess-hist-1` or revert UI!
+    await controller.submitInput('/resume sess-hist-1');
+    await waitFor(() => controller.store.getState().picker?.selectedId === 'sess-hist-1');
+    host.input.emit('\r');
+    await waitFor(() => closeStarted === 1);
+
+    await controller.submitInput('/new');
+    await waitFor(() => controller.store.getState().sessionId === 'sess-new-wins');
+    releaseFirstClose.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    expect(controller.store.getState().sessionId).toBe('sess-new-wins');
+    expect(loadedSessionIds).not.toContain('sess-hist-1');
+    expect(controller.scheduler.suspended).toBe(false);
+
+    // Direction 2: Activate `/resume` for `sess-hist-2` -> actively replaying -> trigger `/new` mid-replay ->
+    // new session must NOT inherit old replay message, MUST keep its own early command,
+    // and scheduler MUST NOT remain suspended!
+    await controller.submitInput('/resume sess-hist-2');
+    await waitFor(() => controller.store.getState().picker?.selectedId === 'sess-hist-2');
+    host.input.emit('\r');
+    await waitFor(() => loadCount === 1 && controller.store.getState().isReplaying === true);
+    expect(controller.scheduler.suspended).toBe(true);
+
+    const newDuringReplay = controller.submitInput('/new');
+    await waitFor(() => newCount === 3);
+    releaseReplay2.resolve();
+    await new Promise(r => setTimeout(r, 30));
+    releaseNewAfterReplay.resolve();
+    await newDuringReplay;
+
+    await waitFor(() => controller.store.getState().sessionId === 'sess-after-replay');
+    expect(controller.store.getState().isReplaying).toBe(false);
+    expect(controller.scheduler.suspended).toBe(false);
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    expect(controller.store.commands.getAll().some(c => c.name === 'after-replay-cmd')).toBe(true);
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

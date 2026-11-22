@@ -41,7 +41,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return 0;
   }
 
-  const { config, warnings } = await loadConfig();
+  const { config, warnings, parseError } = await loadConfig();
   const cwd = process.cwd();
 
   if (cli.plain) {
@@ -82,6 +82,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   const controller = new AppController({
     cli,
     config,
+    ...(parseError ? { configParseError: parseError } : {}),
     cwd,
     session: connected.session,
     output: connected.output,

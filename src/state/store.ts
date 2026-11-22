@@ -795,9 +795,10 @@ export class AppStore {
   }
 
   toggleToolGroup(groupId: string, expanded?: boolean): boolean {
-    const cur = Boolean(this._expandedToolGroups[groupId]);
+    const hasExplicit = Object.prototype.hasOwnProperty.call(this._expandedToolGroups, groupId);
+    const cur = hasExplicit ? Boolean(this._expandedToolGroups[groupId]) : this._expandAllTools;
     const next = expanded !== undefined ? expanded : !cur;
-    if (cur === next) return next;
+    if (hasExplicit && cur === next) return next;
     this._expandedToolGroups = {
       ...this._expandedToolGroups,
       [groupId]: next,
@@ -1257,6 +1258,7 @@ export class AppStore {
    * Reset session-scoped state for `/new` or switching to another session.
    */
   resetSessionState(options: { keepCommands?: boolean } = {}): void {
+    this._sessionId = null;
     this.approvals.cancelAll();
     this.cancelActiveQuestion();
     this.transcript.clear();

@@ -444,6 +444,74 @@ export class DraftEngine {
   }
 
   /**
+   * Remove one or more non-overlapping UTF-16 ranges while preserving all unrelated
+   * text (indentation, inner spacing, quotes) and remapping cursor + selection anchor.
+   */
+  removeRangesPreservingSelection(
+    ranges: ReadonlyArray<readonly [number, number]>,
+    recordUndo = true,
+  ): boolean {
+    if (ranges.length === 0) return false;
+    const normalized: Array<[number, number]> = [];
+    for (const [rawStart, rawEnd] of ranges) {
+      const start = clampUtf16Offset(this._text, Math.min(rawStart, rawEnd), 'left');
+      const end = clampUtf16Offset(this._text, Math.max(rawStart, rawEnd), 'right');
+      if (end > start) {
+        normalized.push([start, end]);
+      }
+    }
+    if (normalized.length === 0) return false;
+
+    normalized.sort((a, b) => a[0] - b[0]);
+    const merged: Array<[number, number]> = [];
+    for (const [start, end] of normalized) {
+      const last = merged[merged.length - 1];
+      if (last && start <= last[1]) {
+        if (end > last[1]) last[1] = end;
+      } else {
+        merged.push([start, end]);
+      }
+    }
+
+    const remapOffset = (offset: number): number => {
+      let delta = 0;
+      for (const [start, end] of merged) {
+        if (offset <= start) break;
+        if (offset < end) {
+          return start - delta;
+        }
+        delta += end - start;
+      }
+      return offset - delta;
+    };
+
+    let out = '';
+    let pos = 0;
+    for (const [start, end] of merged) {
+      out += this._text.slice(pos, start);
+      pos = end;
+    }
+    out += this._text.slice(pos);
+
+    if (out === this._text) return false;
+    if (recordUndo) {
+      this.pushSnapshot('other');
+    }
+
+    const nextCursor = clampUtf16Offset(out, remapOffset(this._cursor), 'left');
+    const nextAnchor =
+      this._anchor !== undefined
+        ? clampUtf16Offset(out, remapOffset(this._anchor), 'left')
+        : undefined;
+
+    this._text = out;
+    this._cursor = nextCursor;
+    this._anchor = nextAnchor !== undefined && nextAnchor !== nextCursor ? nextAnchor : undefined;
+    this.breakTypingGroup();
+    return true;
+  }
+
+  /**
    * Insert text at the current cursor (or replace active selection).
    */
   insertText(raw: string, options: { coalesce?: boolean; recordUndo?: boolean } = {}): boolean {

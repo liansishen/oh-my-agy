@@ -19,6 +19,22 @@ function extractMainChildIds(view: Renderable): string[] {
   return ids;
 }
 
+function indexMainChildIdsByTurn(ids: readonly string[]): Map<number, string[]> {
+  const byTurn = new Map<number, string[]>();
+  for (const id of ids) {
+    const match = /^main\.t(\d+)-/.exec(id);
+    if (!match) continue;
+    const turnIdx = Number(match[1]);
+    let bucket = byTurn.get(turnIdx);
+    if (!bucket) {
+      bucket = [];
+      byTurn.set(turnIdx, bucket);
+    }
+    bucket.push(id);
+  }
+  return byTurn;
+}
+
 export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'>;
 
 export interface RenderSchedulerOptions {
@@ -49,6 +65,7 @@ export class RenderScheduler {
   #settledIds = new Set<string>();
   #evictedIds = new Set<string>();
   #lastMainChildIds: string[] = [];
+  #lastMainChildIdsByTurn = new Map<number, string[]>();
 
   constructor(
     surface: SchedulerSurface,
@@ -95,6 +112,7 @@ export class RenderScheduler {
     this.#dirty = false;
     const view = this.#buildView();
     this.#lastMainChildIds = extractMainChildIds(view);
+    this.#lastMainChildIdsByTurn = indexMainChildIdsByTurn(this.#lastMainChildIds);
     this.#surface.render(view);
   }
 
@@ -118,9 +136,8 @@ export class RenderScheduler {
    * so Tern can reduce diff overhead and consider them for scrollback memory eviction.
    */
   settleTurn(turnIndex: number): boolean {
-    const prefix = `main.t${turnIndex}-`;
-    const matching = this.#lastMainChildIds.filter(id => id.startsWith(prefix));
-    if (matching.length > 0) {
+    const matching = this.#lastMainChildIdsByTurn.get(turnIndex);
+    if (matching && matching.length > 0) {
       let settledAny = false;
       for (const id of matching) {
         if (this.settleNode(id)) {
@@ -178,6 +195,7 @@ export class RenderScheduler {
     this.#settledIds.clear();
     this.#evictedIds.clear();
     this.#lastMainChildIds = [];
+    this.#lastMainChildIdsByTurn.clear();
   }
 
   dispose(): void {

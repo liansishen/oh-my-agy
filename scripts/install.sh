@@ -72,6 +72,8 @@ sha256_file() {
     sha256sum "$1" | awk '{print tolower($1)}'
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
   else
     printf ''
   fi
@@ -103,18 +105,36 @@ main() {
   curl -fL --progress-bar "$base_url/$asset" -o "$bin_tmp" || err "failed to download $base_url/$asset"
 
   sums_tmp="$tmp_dir/SHA256SUMS.txt"
-  if curl -fsSL "$base_url/SHA256SUMS.txt" -o "$sums_tmp" 2>/dev/null; then
-    expected="$(awk -v f="$asset" '{gsub(/^\*/, "", $2); gsub(/^\.\//, "", $2); if ($2 == f) {print tolower($1); exit}}' "$sums_tmp")"
-    if [ -n "$expected" ]; then
-      actual="$(sha256_file "$bin_tmp")"
-      if [ -n "$actual" ]; then
-        if [ "$actual" != "$expected" ]; then
-          err "SHA256 mismatch for $asset (expected $expected, got $actual)"
-        fi
-        say "Verified SHA256 ($actual)"
-      fi
-    fi
+  curl -fsSL "$base_url/SHA256SUMS.txt" -o "$sums_tmp" || err "failed to download required $base_url/SHA256SUMS.txt"
+  # Portable across GNU awk, BSD awk, and older mawk (no `{64}` interval regex, exact full filename match)
+  expected="$(awk -v f="$asset" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      hash = line
+      sub(/[ \t].*$/, "", hash)
+      hash = tolower(hash)
+      if (length(hash) != 64 || hash !~ /^[0-9a-f]+$/) next
+      name = substr(line, 65)
+      if (name !~ /^[ \t]+/) next
+      sub(/^[ \t]+/, "", name)
+      sub(/^\*/, "", name)
+      sub(/^\.\//, "", name)
+      if (name == f) {
+        print hash
+        exit
+      }
+    }
+  ' "$sums_tmp")"
+  [ -n "$expected" ] || err "SHA256SUMS.txt does not contain a valid checksum entry for $asset"
+  actual="$(sha256_file "$bin_tmp")"
+  [ -n "$actual" ] || err "no SHA256 utility found (need sha256sum, shasum, or openssl)"
+  if [ "$actual" != "$expected" ]; then
+    err "SHA256 mismatch for $asset (expected $expected, got $actual)"
   fi
+  say "Verified SHA256 ($actual)"
 
   mkdir -p "$INSTALL_DIR"
   chmod +x "$bin_tmp"

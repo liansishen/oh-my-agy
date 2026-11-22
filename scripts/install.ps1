@@ -70,14 +70,12 @@ function Resolve-ReleaseTag {
     throw "No published GitHub Releases found in https://github.com/$TargetRepo"
 }
 
-$arch = if ([Environment]::Is64BitOperatingSystem) {
-    $procArch = $env:PROCESSOR_ARCHITECTURE
-    if ($procArch -eq 'ARM64') { 'arm64' } else { 'x64' }
-} else {
+if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'Only 64-bit Windows is supported.'
 }
 
-$assetName = "oma-windows-$arch.exe"
+$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64')
+$preferredAsset = if ($isArm64) { 'oma-windows-arm64.exe' } else { 'oma-windows-x64.exe' }
 $tag = Resolve-ReleaseTag -TargetRepo $Repo -Requested $Version
 $baseUrl = "https://github.com/$Repo/releases/download/$tag"
 
@@ -85,40 +83,50 @@ $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("oma-install-" + [Guid]::
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
 try {
+    # Download required SHA256SUMS.txt first so we know which assets exist for this tag
+    # (preferring native ARM64 if published, falling back to x64 on Windows 11 ARM64 emulation).
+    $sumsTmp = Join-Path $tmpDir 'SHA256SUMS.txt'
+    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS.txt" -OutFile $sumsTmp -Headers (Get-RequestHeaders) -UseBasicParsing
+    $checksums = @{}
+    foreach ($line in (Get-Content -Path $sumsTmp)) {
+        if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(\./)?(.+?)\s*$') {
+            $checksums[$Matches[3]] = $Matches[1].ToLowerInvariant()
+        }
+    }
+
+    $assetName = $preferredAsset
+    if ($isArm64 -and (-not $checksums.ContainsKey($assetName))) {
+        if ($checksums.ContainsKey('oma-windows-x64.exe')) {
+            $osBuild = [Environment]::OSVersion.Version.Build
+            if ($osBuild -lt 22000) {
+                throw "Release $tag does not publish native $preferredAsset, and Windows x64 emulation on ARM64 requires Windows 11 (build >= 22000, detected $osBuild)."
+            }
+            Write-Host "Native $preferredAsset not published for $tag; using oma-windows-x64.exe under Windows 11 x64 emulation." -ForegroundColor DarkGray
+            $assetName = 'oma-windows-x64.exe'
+        }
+    }
+    if (-not $checksums.ContainsKey($assetName)) {
+        throw "SHA256SUMS.txt does not contain a valid checksum entry for $assetName."
+    }
+    $expected = $checksums[$assetName]
+
     $binTmp = Join-Path $tmpDir $assetName
     Write-Host "Installing oma $tag ($assetName) from https://github.com/$Repo ..." -ForegroundColor Cyan
     Invoke-WebRequest -Uri "$baseUrl/$assetName" -OutFile $binTmp -Headers (Get-RequestHeaders) -UseBasicParsing
 
-    $sumsTmp = Join-Path $tmpDir 'SHA256SUMS.txt'
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::OpenRead($binTmp)
     try {
-        Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS.txt" -OutFile $sumsTmp -Headers (Get-RequestHeaders) -UseBasicParsing
-        $expected = $null
-        foreach ($line in (Get-Content -Path $sumsTmp)) {
-            if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(\./)?(.+?)\s*$') {
-                if ($Matches[3] -eq $assetName) {
-                    $expected = $Matches[1].ToLowerInvariant()
-                    break
-                }
-            }
-        }
-        if ($expected) {
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            $fs = [System.IO.File]::OpenRead($binTmp)
-            try {
-                $hashBytes = $sha.ComputeHash($fs)
-            } finally {
-                $fs.Dispose()
-                $sha.Dispose()
-            }
-            $actual = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
-            if ($actual -ne $expected) {
-                throw "SHA256 checksum mismatch for $assetName (expected $expected, got $actual)."
-            }
-            Write-Host "Verified SHA256 ($($actual.Substring(0, 12))...)" -ForegroundColor DarkGray
-        }
-    } catch {
-        if ($_.Exception.Message -like 'SHA256 checksum mismatch*') { throw }
+        $hashBytes = $sha.ComputeHash($fs)
+    } finally {
+        $fs.Dispose()
+        $sha.Dispose()
     }
+    $actual = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "SHA256 checksum mismatch for $assetName (expected $expected, got $actual)."
+    }
+    Write-Host "Verified SHA256 ($($actual.Substring(0, 12))...)" -ForegroundColor DarkGray
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $destExe = Join-Path $InstallDir 'oma.exe'

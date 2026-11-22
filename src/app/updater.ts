@@ -10,6 +10,8 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
+import { release as getOsRelease } from 'node:os';
 import { dirname, join } from 'node:path';
 import { OMA_VERSION } from './fallback';
 
@@ -39,17 +41,150 @@ export interface ReleaseInfo {
   readonly version: string;
   readonly htmlUrl: string;
   readonly assets: readonly ReleaseAsset[];
+  /** Base download URL used when API metadata was unavailable (HTTP 403/429 fallback). */
+  readonly baseDownloadUrl?: string;
+  /** True when `assets` were synthesized without GitHub REST API asset listing. */
+  readonly assetsSynthesized?: boolean;
 }
 
 export interface RunUpdateDeps {
   readonly currentVersion?: string;
   readonly platform?: NodeJS.Platform;
   readonly arch?: string;
+  /** Override OS kernel release string (e.g. `10.0.22631` vs `10.0.19045`) for deterministic tests. */
+  readonly osRelease?: string;
+  /** Override Win32 `IsWow64Process2` native machine query (e.g. `0xAA64` for ARM64) in tests. */
+  readonly probeWin32NativeMachine?: () => number | null;
   readonly execPath?: string;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly fetch?: typeof globalThis.fetch;
   readonly stdout?: Pick<NodeJS.WriteStream, 'write'>;
   readonly stderr?: Pick<NodeJS.WriteStream, 'write'>;
+}
+
+export const IMAGE_FILE_MACHINE_I386 = 0x014c;
+export const IMAGE_FILE_MACHINE_ARMNT = 0x01c4;
+export const IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+export const IMAGE_FILE_MACHINE_ARM64 = 0xaa64;
+
+/**
+ * Map a Win32 `IMAGE_FILE_MACHINE_*` value (from `IsWow64Process2`) to a Node/Bun arch string.
+ */
+export function mapWindowsMachineToNodeArch(machine: number): string | null {
+  switch (machine) {
+    case IMAGE_FILE_MACHINE_ARM64:
+      return 'arm64';
+    case IMAGE_FILE_MACHINE_AMD64:
+      return 'x64';
+    case IMAGE_FILE_MACHINE_I386:
+      return 'ia32';
+    case IMAGE_FILE_MACHINE_ARMNT:
+      return 'arm';
+    default:
+      return null;
+  }
+}
+
+let cachedWin32NativeMachine: number | null | undefined;
+
+/**
+ * Query the true native Windows host machine architecture via `kernel32.dll!IsWow64Process2`.
+ * Unlike `PROCESSOR_ARCHITEW6432` (which can be unset under Windows 11 Prism x64 emulation
+ * on ARM64 hardware), `IsWow64Process2` always returns the host's native `IMAGE_FILE_MACHINE_*`
+ * code (e.g. `0xAA64` on Windows ARM64).
+ */
+export function queryWindowsNativeMachine(): number | null {
+  if (process.platform !== 'win32') return null;
+  if (cachedWin32NativeMachine !== undefined) {
+    return cachedWin32NativeMachine;
+  }
+  try {
+    const req = createRequire(import.meta.url);
+    const ffi = req('bun:ffi') as {
+      dlopen: (
+        path: string,
+        symbols: Record<string, { args: readonly unknown[]; returns: unknown }>,
+      ) => {
+        symbols: {
+          GetCurrentProcess: () => unknown;
+          IsWow64Process2: (hProcess: unknown, pProcessMachine: unknown, pNativeMachine: unknown) => boolean;
+        };
+        close: () => void;
+      };
+      FFIType: { ptr: unknown; bool: unknown };
+      ptr: (buf: ArrayBufferView) => unknown;
+    };
+    const kernel32 = ffi.dlopen('kernel32.dll', {
+      GetCurrentProcess: { args: [], returns: ffi.FFIType.ptr },
+      IsWow64Process2: {
+        args: [ffi.FFIType.ptr, ffi.FFIType.ptr, ffi.FFIType.ptr],
+        returns: ffi.FFIType.bool,
+      },
+    });
+    try {
+      const hProcess = kernel32.symbols.GetCurrentProcess();
+      const processMachine = new Uint16Array(1);
+      const nativeMachine = new Uint16Array(1);
+      const ok = kernel32.symbols.IsWow64Process2(
+        hProcess,
+        ffi.ptr(processMachine),
+        ffi.ptr(nativeMachine),
+      );
+      cachedWin32NativeMachine = ok && nativeMachine[0] ? nativeMachine[0] : null;
+    } finally {
+      kernel32.close();
+    }
+  } catch {
+    cachedWin32NativeMachine = null;
+  }
+  return cachedWin32NativeMachine;
+}
+
+/**
+ * Detect the underlying host CPU architecture (distinct from `process.arch` when
+ * an emulated x64 binary runs on a Windows ARM64 host). Uses Win32 `IsWow64Process2`
+ * first so Prism x64 emulation on Snapdragon / ARM64 is detected accurately even when
+ * `PROCESSOR_ARCHITEW6432` is unset, then falls back to Windows architecture env vars.
+ */
+export function detectHostArch(
+  platform: NodeJS.Platform = process.platform,
+  processArch: string = process.arch,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  probeWin32NativeMachine?: () => number | null,
+): string {
+  if (platform === 'win32') {
+    const nativeMachine = probeWin32NativeMachine
+      ? probeWin32NativeMachine()
+      : process.platform === 'win32' && processArch !== 'arm64'
+        ? queryWindowsNativeMachine()
+        : null;
+    const mappedNative = nativeMachine !== null ? mapWindowsMachineToNodeArch(nativeMachine) : null;
+    if (mappedNative !== null) {
+      return mappedNative;
+    }
+
+    const wow64Host = env['PROCESSOR_ARCHITEW6432']?.trim().toUpperCase();
+    if (wow64Host === 'ARM64') return 'arm64';
+    const procArch = env['PROCESSOR_ARCHITECTURE']?.trim().toUpperCase();
+    if (procArch === 'ARM64') return 'arm64';
+    if (wow64Host === 'AMD64' && processArch === 'ia32') {
+      return 'x64';
+    }
+  }
+  return processArch;
+}
+
+/**
+ * Determine whether a Windows ARM64 host supports x64 user-mode emulation
+ * (introduced in Windows 11, NT build >= 22000).
+ */
+export function supportsWindowsArm64X64Emulation(osRelease: string = getOsRelease()): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(osRelease.trim());
+  if (!match) return false;
+  const major = Number(match[1]);
+  const build = Number(match[3]);
+  if (major > 10) return true;
+  return major === 10 && build >= 22000;
 }
 
 export interface ParsedSemver {
@@ -336,6 +471,8 @@ async function resolveLatestTagViaRedirect(
     tagName,
     version: stripVersionPrefix(tagName),
     htmlUrl: finalUrl,
+    baseDownloadUrl: baseDownload,
+    assetsSynthesized: true,
     assets: [
       { name: assetName, downloadUrl: `${baseDownload}/${assetName}` },
       { name: SHA256SUMS_ASSET_NAME, downloadUrl: `${baseDownload}/${SHA256SUMS_ASSET_NAME}` },
@@ -383,6 +520,8 @@ export async function fetchReleaseInfo(options: {
         tagName: tag,
         version: stripVersionPrefix(tag),
         htmlUrl: `https://github.com/${repo}/releases/tag/${encodeURIComponent(tag)}`,
+        baseDownloadUrl: baseDownload,
+        assetsSynthesized: true,
         assets: [
           { name: assetName, downloadUrl: `${baseDownload}/${assetName}` },
           { name: SHA256SUMS_ASSET_NAME, downloadUrl: `${baseDownload}/${SHA256SUMS_ASSET_NAME}` },
@@ -543,7 +682,12 @@ export async function runUpdateCommand(
   const env = deps.env ?? process.env;
   const currentVersion = deps.currentVersion ?? OMA_VERSION;
   const platform = deps.platform ?? process.platform;
-  const arch = deps.arch ?? process.arch;
+  const arch = detectHostArch(
+    platform,
+    deps.arch ?? process.arch,
+    env,
+    deps.probeWin32NativeMachine,
+  );
   const execPath = deps.execPath ?? process.execPath;
   const fetchFn = deps.fetch ?? globalThis.fetch;
 
@@ -628,11 +772,90 @@ export async function runUpdateCommand(
     return 0;
   }
 
-  const binaryAsset = release.assets.find(a => a.name === assetName);
+  // Fetch and parse required SHA256SUMS.txt BEFORE selecting/downloading the binary so that:
+  // 1) Even under GitHub REST API 403/429 fallback, we know the exact published asset set.
+  // 2) We never download or replace the binary without an authoritative checksum entry.
+  const sumsAsset = release.assets.find(a => a.name === SHA256SUMS_ASSET_NAME);
+  if (!sumsAsset) {
+    stderr.write(
+      `oma update: release ${release.tagName} is missing required ${SHA256SUMS_ASSET_NAME}.\n` +
+        'Aborting update for safety.\n',
+    );
+    return 1;
+  }
+
+  let sumsText: string;
+  try {
+    const sumsRes = await fetchFn(sumsAsset.downloadUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: buildGithubHeaders(currentVersion, env),
+    });
+    if (!sumsRes.ok) {
+      throw new Error(`HTTP ${sumsRes.status} ${sumsRes.statusText}`);
+    }
+    sumsText = await sumsRes.text();
+  } catch (err) {
+    stderr.write(
+      `oma update: failed to download ${SHA256SUMS_ASSET_NAME}: ${err instanceof Error ? err.message : String(err)}\n` +
+        'Aborting update for safety.\n',
+    );
+    return 1;
+  }
+
+  const sumsMap = parseSha256Sums(sumsText);
+
+  const resolveAssetEntry = (name: string): ReleaseAsset | undefined => {
+    const listed = release.assets.find(a => a.name === name);
+    if (listed) return listed;
+    if (release.assetsSynthesized && release.baseDownloadUrl && sumsMap.has(name)) {
+      return { name, downloadUrl: `${release.baseDownloadUrl}/${name}` };
+    }
+    return undefined;
+  };
+
+  let resolvedAssetName = assetName;
+  let binaryAsset =
+    (!release.assetsSynthesized || sumsMap.has(assetName))
+      ? resolveAssetEntry(assetName)
+      : undefined;
+
+  if (!binaryAsset && platform === 'win32' && arch === 'arm64') {
+    const x64AssetName = 'oma-windows-x64.exe';
+    const x64Candidate =
+      (!release.assetsSynthesized || sumsMap.has(x64AssetName))
+        ? resolveAssetEntry(x64AssetName)
+        : undefined;
+    if (x64Candidate && sumsMap.has(x64AssetName)) {
+      const osRel = deps.osRelease ?? getOsRelease();
+      if (!supportsWindowsArm64X64Emulation(osRel)) {
+        stderr.write(
+          `oma update: release ${release.tagName} does not publish native "${assetName}", and Windows x64 emulation on ARM64 requires Windows 11 (build >= 22000, detected "${osRel}").\n` +
+            'Aborting update to keep the existing binary intact.\n',
+        );
+        return 1;
+      }
+      resolvedAssetName = x64Candidate.name;
+      binaryAsset = x64Candidate;
+      stdout.write(
+        `Native ${assetName} not published for ${release.tagName}; falling back to ${resolvedAssetName} (Windows 11 x64 emulation).\n`,
+      );
+    }
+  }
+
   if (!binaryAsset) {
     stderr.write(
       `oma update: release ${release.tagName} does not contain asset "${assetName}".\n` +
         `Check ${release.htmlUrl}\n`,
+    );
+    return 1;
+  }
+
+  const expected = sumsMap.get(resolvedAssetName);
+  if (!expected) {
+    stderr.write(
+      `oma update: ${SHA256SUMS_ASSET_NAME} does not contain a checksum entry for "${resolvedAssetName}".\n` +
+        'Aborting update for safety.\n',
     );
     return 1;
   }
@@ -659,38 +882,17 @@ export async function runUpdateCommand(
     return 1;
   }
 
-  // Verify SHA256 if SHA256SUMS.txt is published with the release
-  const sumsAsset = release.assets.find(a => a.name === SHA256SUMS_ASSET_NAME);
-  if (sumsAsset) {
-    try {
-      const sumsRes = await fetchFn(sumsAsset.downloadUrl, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: buildGithubHeaders(currentVersion, env),
-      });
-      if (sumsRes.ok) {
-        const sumsMap = parseSha256Sums(await sumsRes.text());
-        const expected = sumsMap.get(assetName);
-        if (expected) {
-          const actual = sha256Hex(binaryBytes);
-          if (actual !== expected) {
-            stderr.write(
-              `oma update: SHA256 checksum mismatch for ${assetName}!\n` +
-                `  expected: ${expected}\n` +
-                `  actual:   ${actual}\n` +
-                'Aborting update for safety.\n',
-            );
-            return 1;
-          }
-          stdout.write(`Verified SHA256 (${actual.slice(0, 12)}...).\n`);
-        }
-      }
-    } catch (err) {
-      stderr.write(
-        `oma update: warning: could not verify ${SHA256SUMS_ASSET_NAME}: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    }
+  const actual = sha256Hex(binaryBytes);
+  if (actual !== expected) {
+    stderr.write(
+      `oma update: SHA256 checksum mismatch for ${resolvedAssetName}!\n` +
+        `  expected: ${expected}\n` +
+        `  actual:   ${actual}\n` +
+        'Aborting update for safety.\n',
+    );
+    return 1;
   }
+  stdout.write(`Verified SHA256 (${actual.slice(0, 12)}...).\n`);
 
   try {
     const installedPath = replaceExecutableSafely(destination, binaryBytes, platform);

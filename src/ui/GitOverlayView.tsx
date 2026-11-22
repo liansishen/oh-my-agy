@@ -52,6 +52,7 @@ const KIND_LETTER: Readonly<Record<GitChangeKind, string>> = {
   added: 'A',
   deleted: 'D',
   renamed: 'R',
+  copied: 'C',
   untracked: '?',
   conflicted: '!',
 };
@@ -61,6 +62,7 @@ const KIND_TONE: Readonly<Record<GitChangeKind, Tone>> = {
   added: 'success',
   deleted: 'error',
   renamed: 'info',
+  copied: 'info',
   untracked: 'muted',
   conflicted: 'error',
 };

@@ -1529,12 +1529,16 @@ export class TranscriptStore {
     options: {
       readonly autoCollapseThought?: boolean;
       readonly expandAllTools?: boolean;
+      readonly terminalToolStatus?: 'done' | 'cancelled' | 'error';
+      readonly terminalTurnStatus?: 'done' | 'cancelled' | 'error';
     } = {},
   ): TranscriptTurn | undefined {
     const turn = this.activeTurn;
     if (!turn) return undefined;
 
     const now = this._now();
+    const terminalToolStatus = options.terminalToolStatus ?? 'done';
+    const terminalTurnStatus = options.terminalTurnStatus ?? 'done';
     this.finalizeRunningThoughts(turn, {
       autoCollapseThought: options.autoCollapseThought ?? true,
       expandAllTools: options.expandAllTools ?? false,
@@ -1543,7 +1547,10 @@ export class TranscriptStore {
     for (const tool of turn.toolCalls) {
       if (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') {
         tool.awaitingPermission = false;
-        tool.status = 'done';
+        if (terminalToolStatus === 'cancelled') {
+          tool.cancelled = true;
+        }
+        tool.status = terminalToolStatus;
         tool.endedAt = tool.endedAt ?? now;
         if (!tool.replayed) {
           tool.tookMs = tool.tookMs ?? Math.max(0, tool.endedAt - tool.startedAt);
@@ -1551,8 +1558,8 @@ export class TranscriptStore {
         this.syncSubagentsForTool(turn, tool);
       }
     }
-    if (turn.status === 'streaming') {
-      turn.status = 'done';
+    if (turn.status === 'streaming' || terminalTurnStatus !== 'done') {
+      turn.status = terminalTurnStatus;
       turn.endedAt = turn.endedAt ?? now;
     }
     this._activeTurnIndex = null;
@@ -2919,17 +2926,35 @@ export class TranscriptStore {
       return;
     }
 
-    // 2. If a previously tracked detached tool later gets updated to a terminal status, settle it
+    // 2. If a previously tracked detached tool later gets updated to a terminal status,
+    // first check whether a completed tool handed off a genuinely detached background task
+    // (e.g., run_command/run_workflow/invoke_subagent returning a task/conversation ID) before
+    // marking an in-flight placeholder as completed.
     const existingDetached = this._detachedBgTasks.get(tool.toolCallId);
     if (existingDetached) {
+      // Never resurrect an already-terminal detached background task on late incremental updates.
+      if (existingDetached.status !== 'running') {
+        if (tool.outputText) {
+          existingDetached.outputText = tool.outputText;
+        }
+        return;
+      }
       if (tool.status === 'error' || tool.status === 'cancelled') {
         existingDetached.status = tool.status === 'error' ? 'failed' : 'cancelled';
         existingDetached.endedAt = this._now();
         existingDetached.outputText = tool.outputText;
       } else if (tool.status === 'done' && existingDetached.awaitingToolCompletion) {
-        existingDetached.status = 'completed';
-        existingDetached.endedAt = this._now();
-        existingDetached.outputText = tool.outputText;
+        const handoff = detectDetachedBackgroundTask(tool, turnIndex);
+        if (handoff) {
+          this._detachedBgTasks.set(tool.toolCallId, {
+            ...handoff,
+            startedAt: existingDetached.startedAt,
+          });
+        } else {
+          existingDetached.status = 'completed';
+          existingDetached.endedAt = this._now();
+          existingDetached.outputText = tool.outputText;
+        }
       } else if (tool.outputText) {
         existingDetached.outputText = tool.outputText;
       }

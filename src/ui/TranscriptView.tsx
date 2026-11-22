@@ -809,7 +809,11 @@ function isRoutineCollapsibleTool(
 ): boolean {
   if (relatedAgents.length > 0) return false;
   if (tool.status === 'ask') return false;
-  if (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming') {
+  if (
+    (tool.status === 'pending' || tool.status === 'running') &&
+    tool.endedAt === undefined &&
+    turnStatus === 'streaming'
+  ) {
     return false;
   }
   return true;
@@ -863,6 +867,9 @@ function groupTurnTimeline(
   },
 ): TimelineGroup[] {
   const groups: TimelineGroup[] = [];
+  // Track hidden thought barriers so toggling `showThinking` off never re-merges
+  // a surviving assistant prose block into an earlier (potentially evicted) prose group's key.
+  let hiddenThoughtBarrier = false;
 
   for (const ref of turn.timeline) {
     if (ref.kind === 'thought') {
@@ -873,29 +880,36 @@ function groupTurnTimeline(
           thought.endedAt === undefined &&
           turn.status === 'streaming'
       );
-      if (!options.showThinking && !isLiveThought) continue;
+      if (!options.showThinking && !isLiveThought) {
+        hiddenThoughtBarrier = true;
+        continue;
+      }
       // Keep thought-only `<col role="omp.assistant">` nodes separate from assistant prose
       // so Tern's native `Worked for ...` work-collapsing engine absorbs a trailing thought
       // right after tool calls into the collapsed work summary instead of leaving a lone
       // `Thought >` stranded above the final reply.
       const prev = groups[groups.length - 1];
-      if (prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'thought')) {
+      if (!hiddenThoughtBarrier && prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'thought')) {
         prev.refs.push(ref);
       } else {
         groups.push({ kind: 'assistant', key: `assistant-${ref.id}`, refs: [ref] });
       }
+      hiddenThoughtBarrier = false;
       continue;
     }
 
     if (ref.kind === 'assistant') {
       const prev = groups[groups.length - 1];
-      if (prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'assistant')) {
+      if (!hiddenThoughtBarrier && prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'assistant')) {
         prev.refs.push(ref);
       } else {
         groups.push({ kind: 'assistant', key: `assistant-${ref.id}`, refs: [ref] });
       }
+      hiddenThoughtBarrier = false;
       continue;
     }
+
+    hiddenThoughtBarrier = false;
 
     if (ref.kind === 'tool') {
       const tool = turn.toolCalls.find(t => t.toolCallId === ref.id);

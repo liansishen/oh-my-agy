@@ -61,6 +61,8 @@ export interface LoadConfigOptions extends ConfigPathOptions {
 export interface ParseConfigResult {
   readonly config: OmaConfig;
   readonly warnings: readonly string[];
+  /** Non-empty when config.toml failed to parse or read (used to prevent overwriting broken user config). */
+  readonly parseError?: string;
 }
 
 export interface LoadConfigResult extends ParseConfigResult {
@@ -281,13 +283,15 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
     parsed = Bun.TOML.parse(tomlText);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    warnings.push(`Failed to parse config.toml: ${message}`);
-    return { config: DEFAULT_CONFIG, warnings };
+    const parseError = `Failed to parse config.toml: ${message}`;
+    warnings.push(parseError);
+    return { config: DEFAULT_CONFIG, warnings, parseError };
   }
 
   if (!isRecord(parsed)) {
-    warnings.push('config.toml root must be a table, using defaults');
-    return { config: DEFAULT_CONFIG, warnings };
+    const parseError = 'config.toml root must be a table, using defaults';
+    warnings.push(parseError);
+    return { config: DEFAULT_CONFIG, warnings, parseError };
   }
 
   for (const key of Object.keys(parsed)) {
@@ -436,6 +440,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
       exists: true,
       config: parsed.config,
       warnings: parsed.warnings,
+      ...(parsed.parseError ? { parseError: parsed.parseError } : {}),
     };
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
@@ -448,11 +453,13 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
       };
     }
     const message = err instanceof Error ? err.message : String(err);
+    const parseError = `Failed to read ${filePath}: ${message}`;
     return {
       path: filePath,
       exists: existsSync(filePath),
       config: DEFAULT_CONFIG,
-      warnings: [`Failed to read ${filePath}: ${message}`],
+      warnings: [parseError],
+      parseError,
     };
   }
 }
@@ -478,14 +485,17 @@ export function loadConfigSync(options: LoadConfigOptions = {}): LoadConfigResul
       exists: true,
       config: parsed.config,
       warnings: parsed.warnings,
+      ...(parsed.parseError ? { parseError: parsed.parseError } : {}),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const parseError = `Failed to read ${filePath}: ${message}`;
     return {
       path: filePath,
       exists: true,
       config: DEFAULT_CONFIG,
-      warnings: [`Failed to read ${filePath}: ${message}`],
+      warnings: [parseError],
+      parseError,
     };
   }
 }

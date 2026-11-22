@@ -1,3 +1,4 @@
+import pkg from '../../package.json';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { AcpClient, type AcpClientOptions } from '../acp/client';
@@ -17,7 +18,7 @@ import {
   type SessionUpdateParams,
 } from '../acp/protocol';
 
-export const OMA_VERSION = '0.1.0';
+export const OMA_VERSION: string = pkg.version;
 
 export type ResumeKind = 'resume' | 'restore' | 'fork';
 
