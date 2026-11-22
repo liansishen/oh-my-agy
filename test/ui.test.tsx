@@ -5160,7 +5160,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       for (const op of host.allOps) {
         if (op[0] === 'add') addSubtree(op[4]);
         else if (op[0] === 'del') delSubtree(op[1]);
-        else if (op[0] === 'set') {
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
           const entry = nodes.get(op[1]);
           if (entry) {
             for (const [k, v] of Object.entries(op[2])) {
@@ -5462,7 +5468,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       for (const op of host.allOps) {
         if (op[0] === 'add') addSubtree(op[4]);
         else if (op[0] === 'del') delSubtree(op[1]);
-        else if (op[0] === 'set') {
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
           const e = nodes.get(op[1]);
           if (e) {
             for (const [k, v] of Object.entries(op[2])) {
@@ -6009,7 +6021,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       for (const op of host.allOps) {
         if (op[0] === 'add') addSubtree(op[4]);
         else if (op[0] === 'del') delSubtree(op[1]);
-        else if (op[0] === 'set') {
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
           const e = nodes.get(op[1]);
           if (e) {
             for (const [k, v] of Object.entries(op[2])) {
@@ -6786,7 +6804,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       for (const op of host.allOps) {
         if (op[0] === 'add') addSubtree(op[4]);
         else if (op[0] === 'del') delSubtree(op[1]);
-        else if (op[0] === 'set') {
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
           const e = nodes.get(op[1]);
           if (e) {
             for (const [k, v] of Object.entries(op[2])) {
@@ -8338,6 +8362,439 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const serializedMetaOps = JSON.stringify(metaUpdateOps);
     expect(serializedMetaOps).toContain('"name":"search"');
     expect(serializedMetaOps).toContain('"took":1150');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('agy 1.5.14 parity: real per-model thought levels (4 vs 3 vs 0), Orchestrator Plan capsule, /thinking stream, and Swarm Overview height guard', async () => {
+    const tmp = makeTempDir();
+    const agySettingsPath = join(tmp, 'agy-settings.json');
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify(
+        {
+          orchestrator: {
+            planner: 'Gemini 4 Carbon (High)',
+            executor: 'Gemini 4 Hydrogen (High)',
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'swarm.json'),
+      JSON.stringify({ version: 1, backend: 'acp', swarm_id: 'sw-1514', created_at: '2026-11-23T00:00:00Z' }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Swarm 1.5.14',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-a': { role: 'worker', phase: 'RUNNING', wake_mode: 'none', killed: false },
+          'worker-b': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      `${JSON.stringify({ seq: 1, agent: 'worker-b', text: '[done] Completed task B', time: '2026-11-23 00:01:00' })}\n`,
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'plan.json'),
+      JSON.stringify({
+        goal: {
+          title: 'Ship Swarm Overview',
+          line: 'Track goal progress and up to 6 threads in real time.',
+        },
+        tasks: {
+          'worker-a': 'Implement core',
+          'worker-b': 'Verify tests',
+        },
+        threads: [
+          { id: 'core', title: 'Core', goal: 'Build', tasks: ['worker-a'] },
+          { id: 'verify', title: 'Verify', goal: 'Test', tasks: ['worker-b'] },
+        ],
+      }),
+      'utf8',
+    );
+
+    const host = new FakeTernHost({ features: ['edit', 'undo', 'send', 'styles', 'blobs', 'aside'] });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const MODEL_CHOICES = [
+      { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+      { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+      { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+      { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+      { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+      { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+      { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+      { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+      { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+      { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+    ];
+    const FOUR_LEVELS = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+      { value: 'xhigh', name: 'Extra' },
+    ];
+    const THREE_LEVELS = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+    ];
+    let activeModel = 'gemini-4-neon';
+    let activeThought = 'xhigh';
+
+    const buildConfigOptions = () => {
+      const opts: Array<Record<string, unknown>> = [
+        {
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          type: 'select',
+          currentValue: activeModel,
+          options: MODEL_CHOICES,
+        },
+      ];
+      if (activeModel === 'gemini-4-neon' || activeModel === 'gemini-4-hydrogen') {
+        opts.push({
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: activeThought,
+          options: FOUR_LEVELS,
+        });
+      } else if (activeModel === 'gemini-4-carbon' || activeModel === 'claude-opus-5-5') {
+        opts.push({
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: activeThought === 'xhigh' ? 'high' : activeThought,
+          options: THREE_LEVELS,
+        });
+      }
+      return opts;
+    };
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-1514', configOptions: buildConfigOptions() },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { configId: string; value: string };
+        if (p.configId === 'model') {
+          activeModel = p.value;
+          if (activeModel !== 'gemini-4-neon' && activeModel !== 'gemini-4-hydrogen' && activeThought === 'xhigh') {
+            activeThought = 'high';
+          }
+        } else if (p.configId === 'thought_level') {
+          activeThought = p.value;
+        }
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { configOptions: buildConfigOptions() },
+        });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1514',
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: 'Full real-time reasoning trace.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1514',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Final answer.' },
+            },
+          },
+        });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      agySettingsPath,
+      swarmDir,
+      swarmPollIntervalMs: 40,
+      terminalRows: 34,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(() => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (High)');
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // 1) `/model` merges all Orchestrator variants into ONE `orchestrator` entry with NO thinking level,
+    // while dynamically showing 4 / 3 / 0 thought levels for regular models
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    const neonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(neonData.items.filter(i => i.id.includes('orchestrator')).map(i => i.id)).toEqual([
+      'orchestrator',
+    ]);
+    expect(neonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+    expect(neonData.level?.value).toBe('xhigh');
+
+    // Highlight `gemini-4-carbon`: drops to 3 steps and clamps value from `xhigh` -> `high`
+    controller.store.setPickerSelected('gemini-4-carbon');
+    const carbonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(carbonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high']);
+    expect(carbonData.level?.value).toBe('high');
+    expect(controller.store.stepModelPickerThinking(1)).toBe('high');
+
+    // Highlight `claude-opus-5-5`: 3 steps
+    controller.store.setPickerSelected('claude-opus-5-5');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.steps.map(s => s.id),
+    ).toEqual(['low', 'medium', 'high']);
+
+    // Highlight `gemini-4-hydrogen`: 4 steps
+    controller.store.setPickerSelected('gemini-4-hydrogen');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.steps.map(s => s.id),
+    ).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Highlight merged `orchestrator` & `gpt-oss-120b-medium`: disabled (0 steps)
+    controller.store.setPickerSelected('orchestrator');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.disabled,
+    ).toBe('Configure effort in Plan / Exec pills');
+    controller.store.setPickerSelected('gpt-oss-120b-medium');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.disabled,
+    ).toBe('Not supported by this model');
+
+    // Select merged `orchestrator` and press Enter -> activates Orchestrator matching Planner (`Carbon` -> `gemini-pro-orchestrator`)
+    controller.store.setPickerSelected('orchestrator');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(() => controller.store.getState().controls.currentModelId === 'gemini-pro-orchestrator');
+
+    // 2) Bottom bar shows glowing `Orchestrator` pill (no effort) + compact `Plan` (short name) + compact `Exec` (short name)
+    await waitFor(
+      () => replayNodes().has('dock.composer.bar.planner') && replayNodes().has('dock.composer.bar.executor'),
+    );
+    const orchNodes = replayNodes();
+    expect(orchNodes.get('dock.composer.bar.model')?.p['role']).toBe('oma.composer.model.orchestrator');
+    expect(orchNodes.has('dock.composer.bar.model.effort')).toBe(false);
+    expect(orchNodes.get('dock.composer.bar.planner')?.p['role']).toBe('oma.composer.planner');
+    expect(orchNodes.get('dock.composer.bar.planner.tag')?.p['text']).toBe('Plan');
+    expect(orchNodes.get('dock.composer.bar.planner.name')?.p['text']).toBe('Carbon');
+    expect(orchNodes.get('dock.composer.bar.planner.effort')?.p['level']).toBe('high');
+    expect(orchNodes.get('dock.composer.bar.executor')?.p['role']).toBe('oma.composer.executor');
+    expect(orchNodes.get('dock.composer.bar.executor.tag')?.p['text']).toBe('Exec');
+    expect(orchNodes.get('dock.composer.bar.executor.name')?.p['text']).toBe('Hydrogen');
+    expect(orchNodes.get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (Low)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.effort')?.p['level'] === 'low');
+
+    await controller.submitInput('/thought high');
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (High)',
+    );
+
+    // Clicking `Exec` effort icon cycles Executor thinking (Hydrogen: high -> xhigh)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor.effort', act: 'executor.thinking.cycle' });
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.executor === 'Gemini 4 Hydrogen (Extra)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.executor.effort')?.p['level'] === 'xhigh');
+
+    // Click `Plan` capsule -> strictly restricted to 4 Planner models (Neon, Carbon, Argon, Opus 5.5)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const plannerData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(plannerData.items.map(i => i.id)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-carbon',
+      'gemini-4-argon',
+      'claude-opus-5-5',
+    ]);
+    expect(plannerData.selectedId).toBe('gemini-4-carbon');
+    expect(plannerData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high']);
+
+    // Pressing Esc in planner picker cancels without modifying settings.json
+    controller.store.setPickerSelected('claude-opus-5-5');
+    controller.store.stepModelPickerThinking(-1);
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+    expect(controller.store.getState().orchestratorSettings.planner).toBe('Gemini 4 Carbon (High)');
+
+    // Re-open `Plan` capsule, choose `claude-opus-5-5` (medium) -> persists & shows short name `Opus 5.5`
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    controller.store.setPickerSelected('claude-opus-5-5');
+    controller.store.stepModelPickerThinking(-1); // high -> medium
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Claude Opus 5.5 (Medium)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.name')?.p['text'] === 'Opus 5.5');
+    expect(replayNodes().get('dock.composer.bar.planner.effort')?.p['level']).toBe('medium');
+
+    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'executor');
+    const execData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(execData.items.map(i => i.id)).toEqual(['gemini-4-hydrogen', 'claude-sonnet-5-5']);
+    expect(execData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Select `claude-sonnet-5-5` (clamps xhigh -> high) and press Enter -> persists & shows short name `Sonnet 5.5`
+    controller.store.setPickerSelected('claude-sonnet-5-5');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.executor === 'Claude Sonnet 5.5 (High)',
+    );
+    const savedAgyAfterOrch = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect(savedAgyAfterOrch['orchestrator']).toEqual({
+      planner: 'Claude Opus 5.5 (Medium)',
+      executor: 'Claude Sonnet 5.5 (High)',
+    });
+    await waitFor(() => replayNodes().get('dock.composer.bar.executor.name')?.p['text'] === 'Sonnet 5.5');
+    expect(replayNodes().get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // 3) `/thinking on` enables live thinking stream, persists `showThinking: true`, and keeps completed thoughts expanded
+    await controller.submitInput('/thinking on');
+    await waitFor(() => !controller.store.autoCollapseThought && controller.store.getState().showThinking);
+    const savedAgyThinkingOn = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect(savedAgyThinkingOn['showThinking']).toBe(true);
+
+    await controller.submitInput('Explain with expanded thought');
+    await waitFor(() => !controller.store.getState().isStreaming && controller.store.transcript.turns.length === 1);
+    const nodesAfterThink = replayNodes();
+    const completedThought = [...nodesAfterThink.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking',
+    );
+    expect(completedThought).toBeDefined();
+    expect(completedThought?.p['collapsed']).toBe(false);
+
+    // `/thinking off` disables and removes default false key from settings.json
+    await controller.submitInput('/thinking off');
+    await waitFor(() => !controller.store.getState().showThinking);
+    const savedAgyThinkingOff = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect('showThinking' in savedAgyThinkingOff).toBe(false);
+
+    // 4) `/swarm board` renders Overview when `terminalRows >= 28` and hides it when `< 28`
+    await controller.submitInput('/swarm board');
+    await waitFor(() => controller.store.getState().swarmBoardOpen);
+    await waitFor(() => replayNodes().has('layer.swarm.body.overview'));
+    const ovNodes = replayNodes();
+    expect(ovNodes.get('layer.swarm.body.overview')?.p['role']).toBe('oma.swarm.overview');
+    expect(JSON.stringify(ovNodes.get('layer.swarm.body.overview.overview-head.goal')?.p['spans'] ?? '')).toContain(
+      'Ship Swarm Overview',
+    );
+    expect(ovNodes.get('layer.swarm.body.overview.overview-head.progress.done')?.p['text']).toBe('1/2 done');
+    expect(ovNodes.has('layer.swarm.body.overview.threads.thread-core')).toBe(true);
+    expect(ovNodes.has('layer.swarm.body.overview.threads.thread-verify')).toBe(true);
+
+    // Resize below 28 rows -> Overview hides gracefully while Roster stays visible
+    controller.store.setTerminalRows(24);
+    controller.scheduler.renderNow();
+    await waitFor(() => !replayNodes().has('layer.swarm.body.overview'));
+    expect(replayNodes().has('layer.swarm.body.roster')).toBe(true);
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

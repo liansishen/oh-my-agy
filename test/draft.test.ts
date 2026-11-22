@@ -541,7 +541,7 @@ describe('CommandRegistry & Handlers', () => {
     expect(registry.resolve('sessions')?.name).toBe('resume');
     expect(registry.resolve('/clear')?.name).toBe('new');
     expect(registry.resolve('m')?.name).toBe('model');
-    expect(registry.resolve('thinking')?.name).toBe('thought');
+    expect(registry.resolve('thinking')?.name).toBe('thinking');
     expect(registry.resolve('t')?.name).toBe('thought');
     expect(registry.resolve('?')?.name).toBe('help');
     expect(registry.resolve('exit')?.name).toBe('quit');
@@ -668,6 +668,45 @@ describe('CommandRegistry & Handlers', () => {
       'quit',
       'pass:agy:plan:/plan build feature',
       'unknown:nonexistent',
+    ]);
+  });
+
+  test('routes /thinking [on|off] to set_thinking_display while keeping /thinking <level> backward compatible', async () => {
+    const registry = new CommandRegistry();
+    const events: string[] = [];
+    const executor: CommandActionExecutor = {
+      openPicker: () => {},
+      newSession: () => {},
+      setModel: () => {},
+      setThought: (l) => {
+        events.push(`thought:${l}`);
+      },
+      setThinkingDisplay: (m) => {
+        events.push(`thinking:${m}`);
+      },
+      setMode: () => {},
+      copyLastReply: () => {},
+      openHelp: () => {},
+      quit: () => {},
+      passthroughPrompt: () => {},
+      unknownCommand: () => {},
+    };
+
+    for (const input of ['/thinking', '/thinking on', '/thinking off', '/thinking true', '/thinking false', '/thinking high']) {
+      const res = dispatchSlashCommand(input, registry);
+      expect(res.isCommand).toBe(true);
+      if (res.isCommand) {
+        await executeCommandAction(res.action, executor);
+      }
+    }
+
+    expect(events).toEqual([
+      'thinking:toggle',
+      'thinking:on',
+      'thinking:off',
+      'thinking:on',
+      'thinking:off',
+      'thought:high',
     ]);
   });
 });

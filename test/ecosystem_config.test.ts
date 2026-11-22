@@ -25,8 +25,10 @@ import {
 import {
   AGY_SAFE_SETTING_KEYS,
   DEFAULT_AGY_SAFE_SETTINGS,
+  formatOrchestratorModelSpec,
   getAgySettingsPath,
   loadAgySettings,
+  parseOrchestratorModelSpec,
   saveAgySettings,
   updateAgySetting,
 } from '../src/config/agy_settings.ts';
@@ -470,6 +472,8 @@ describe('src/config/agy_settings.ts strict safe allowlist persistence', () => {
       'allowNonWorkspaceAccess',
       'artifactReviewPolicy',
       'useG1Credits',
+      'showThinking',
+      'orchestrator',
     ]);
   });
 
@@ -505,6 +509,8 @@ describe('src/config/agy_settings.ts strict safe allowlist persistence', () => {
       allowNonWorkspaceAccess: false,
       artifactReviewPolicy: 'asks-for-review',
       useG1Credits: true,
+      showThinking: false,
+      orchestrator: {},
     });
     expect(loaded.presentKeys).toEqual(['toolPermission', 'useG1Credits']);
 
@@ -567,6 +573,71 @@ describe('src/config/agy_settings.ts strict safe allowlist persistence', () => {
 
     // Original file remains untouched
     expect(await readFile(settingsPath, 'utf8')).toBe('{ broken json');
+  });
+
+  test('persists showThinking and orchestrator planner/executor specs without touching unknown keys', async () => {
+    expect(parseOrchestratorModelSpec('Gemini 4 Carbon (High)')).toEqual({
+      modelName: 'Gemini 4 Carbon',
+      thoughtLevel: 'high',
+    });
+    expect(parseOrchestratorModelSpec('Gemini 4 Neon (Extra)')).toEqual({
+      modelName: 'Gemini 4 Neon',
+      thoughtLevel: 'xhigh',
+    });
+    expect(parseOrchestratorModelSpec('GPT-OSS 120B (Medium)')).toEqual({
+      modelName: 'GPT-OSS 120B',
+      thoughtLevel: 'medium',
+    });
+    expect(parseOrchestratorModelSpec('Custom Model')).toEqual({
+      modelName: 'Custom Model',
+    });
+    expect(formatOrchestratorModelSpec('Gemini 4 Carbon', 'high')).toBe('Gemini 4 Carbon (High)');
+    expect(formatOrchestratorModelSpec('Gemini 4 Hydrogen', 'xhigh')).toBe('Gemini 4 Hydrogen (Extra)');
+    expect(formatOrchestratorModelSpec('GPT-OSS 120B (Medium)', undefined)).toBe('GPT-OSS 120B (Medium)');
+
+    const dir = await makeTempDir('oma-agy-orch-');
+    const settingsPath = join(dir, 'settings.json');
+    await writeFile(settingsPath, JSON.stringify({ model: 'gemini-4-neon', theme: 'dark' }, null, 2), 'utf8');
+
+    const saved = await saveAgySettings(
+      {
+        showThinking: true,
+        orchestrator: {
+          planner: 'Gemini 4 Carbon (High)',
+          executor: 'Gemini 4 Hydrogen (Extra)',
+        },
+      },
+      { path: settingsPath },
+    );
+    expect(saved.updatedKeys).toEqual(['showThinking', 'orchestrator']);
+
+    const raw = JSON.parse(await readFile(settingsPath, 'utf8')) as Record<string, unknown>;
+    expect(raw['model']).toBe('gemini-4-neon');
+    expect(raw['theme']).toBe('dark');
+    expect(raw['showThinking']).toBe(true);
+    expect(raw['orchestrator']).toEqual({
+      planner: 'Gemini 4 Carbon (High)',
+      executor: 'Gemini 4 Hydrogen (Extra)',
+    });
+
+    const reloaded = await loadAgySettings({ path: settingsPath });
+    expect(reloaded.presentKeys).toEqual(['showThinking', 'orchestrator']);
+    expect(reloaded.settings.showThinking).toBe(true);
+    expect(reloaded.settings.orchestrator).toEqual({
+      planner: 'Gemini 4 Carbon (High)',
+      executor: 'Gemini 4 Hydrogen (Extra)',
+    });
+
+    // Resetting showThinking to default false & orchestrator to empty removes keys cleanly
+    const reset = await saveAgySettings(
+      { showThinking: false, orchestrator: {} },
+      { path: settingsPath },
+    );
+    expect(reset.deletedKeys).toEqual(['showThinking', 'orchestrator']);
+    const rawAfterReset = JSON.parse(await readFile(settingsPath, 'utf8')) as Record<string, unknown>;
+    expect('showThinking' in rawAfterReset).toBe(false);
+    expect('orchestrator' in rawAfterReset).toBe(false);
+    expect(rawAfterReset['theme']).toBe('dark');
   });
 });
 

@@ -49,6 +49,7 @@ export type CommandAction =
   | { readonly type: 'new_session' }
   | { readonly type: 'set_model'; readonly query: string }
   | { readonly type: 'set_thought'; readonly level: string }
+  | { readonly type: 'set_thinking_display'; readonly mode: 'on' | 'off' | 'toggle' }
   | { readonly type: 'set_mode'; readonly mode: string }
   | { readonly type: 'open_help' }
   | { readonly type: 'quit' }
@@ -96,6 +97,7 @@ export interface CommandActionExecutor {
   newSession(): void | Promise<void>;
   setModel(query: string): void | Promise<void>;
   setThought(level: string): void | Promise<void>;
+  setThinkingDisplay?(mode: 'on' | 'off' | 'toggle'): void | Promise<void>;
   setMode(mode: string): void | Promise<void>;
   openHelp(): void | Promise<void>;
   quit(): void | Promise<void>;
@@ -328,6 +330,20 @@ function buildBuiltinAction(
       return parsed.argsText.length > 0
         ? { type: 'set_thought', level: parsed.argsText }
         : { type: 'open_picker', picker: 'thought', initialQuery: '' };
+    case 'thinking': {
+      const arg = (parsed.args[0] ?? parsed.argsText).trim().toLowerCase();
+      if (!arg || arg === 'toggle') {
+        return { type: 'set_thinking_display', mode: 'toggle' };
+      }
+      if (arg === 'on' || arg === 'true' || arg === '1' || arg === 'show') {
+        return { type: 'set_thinking_display', mode: 'on' };
+      }
+      if (arg === 'off' || arg === 'false' || arg === '0' || arg === 'hide') {
+        return { type: 'set_thinking_display', mode: 'off' };
+      }
+      // Backward compatibility: `/thinking high` routes cleanly to thought_level selection
+      return { type: 'set_thought', level: parsed.argsText };
+    }
     case 'mode':
       return parsed.argsText.length > 0
         ? { type: 'set_mode', mode: parsed.argsText }
@@ -465,6 +481,9 @@ export async function executeCommandAction(
       return;
     case 'set_thought':
       await executor.setThought(action.level);
+      return;
+    case 'set_thinking_display':
+      await executor.setThinkingDisplay?.(action.mode);
       return;
     case 'set_mode':
       await executor.setMode(action.mode);

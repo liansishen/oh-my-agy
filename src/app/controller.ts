@@ -21,10 +21,19 @@ import {
 } from '../acp/client';
 import {
   applyModelSelection,
+  clampThoughtLevelForChoices,
+  filterOrchestratorRoleModels,
   getNextModeSelection,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
+  isOrchestratorModelId,
+  ORCHESTRATOR_PICKER_ID,
+  resolveAcpOrchestratorModelIdForPlanner,
   resolveModeSelection,
   resolveModelSelection,
+  resolveOrchestratorRoleThoughtLevels,
   resolveThoughtLevel,
+  resolveThoughtLevelsForModel,
 } from '../acp/model';
 import { normalizeDisplayPath, sameDir, toFileUri } from '../acp/path';
 import {
@@ -45,9 +54,11 @@ import {
   type SettingsPageId,
 } from '../commands/handlers';
 import {
+  formatOrchestratorModelSpec,
   getAgySettingsPath,
   isAgySafeSettingKey,
   loadAgySettings,
+  parseOrchestratorModelSpec,
   saveAgySettings,
 } from '../config/agy_settings';
 import {
@@ -243,6 +254,8 @@ export interface AppControllerOptions {
   readonly backgroundDoneGraceMs?: number;
   /** Quiet drain window (ms) after `session/load` resolves to capture trailing async replay updates. */
   readonly replayDrainQuietMs?: number;
+  /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
+  readonly terminalRows?: number;
 }
 
 function cloneConfig(config: OmaConfig): OmaConfig {
@@ -498,6 +511,7 @@ export class AppController {
       supportsPrefs:
         this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
+      ...(options.terminalRows !== undefined ? { terminalRows: options.terminalRows } : {}),
       now: this.#now,
     });
     if (initialBeeBlobs) {
@@ -685,6 +699,7 @@ export class AppController {
     void this.store.history.load().catch(() => {});
     void this.#fileIndexer.start().catch(() => {});
     void this.#refreshGitStatus({ force: true });
+    void this.#loadInitialAgySettings();
 
     // Bootstrap ACP asynchronously so input events & Ctrl+C remain responsive during startup
     const bootstrapTask = this.#bootstrapAcp().finally(() => {
@@ -1728,6 +1743,12 @@ export class AppController {
       return;
     }
     if (event.ev === 'resize') {
+      const eventRows = (event as { rows?: unknown }).rows;
+      if (typeof eventRows === 'number' && Number.isFinite(eventRows) && eventRows > 0) {
+        this.store.setTerminalRows(eventRows);
+      } else if (typeof process.stdout?.rows === 'number' && process.stdout.rows > 0) {
+        this.store.setTerminalRows(process.stdout.rows);
+      }
       this.scheduler.renderNow();
       this.osc.reassertCursorHidden();
       return;
@@ -2302,10 +2323,13 @@ export class AppController {
       return;
     }
 
-    // In compact `/model` picker (Figure 1):
+    // In compact `/model` (and Orchestrator `planner` / `executor`) picker:
     // - Unmodified Left/Right steps the inline Thinking effort `level` slider
     // - Alt/Ctrl + Left/Right moves the search query cursor
-    if (picker.kind === 'model' && (name === 'left' || name === 'right')) {
+    if (
+      (picker.kind === 'model' || picker.kind === 'planner' || picker.kind === 'executor') &&
+      (name === 'left' || name === 'right')
+    ) {
       if (!key.ctrl && !key.alt && !key.meta) {
         this.store.stepModelPickerThinking(name === 'left' ? -1 : 1);
         this.scheduler.renderNow();
@@ -3147,6 +3171,9 @@ export class AppController {
       setThought: async (level: string) => {
         await this.#applyThoughtLevel(level, false);
       },
+      setThinkingDisplay: async (mode: 'on' | 'off' | 'toggle') => {
+        await this.#handleThinkingDisplay(mode);
+      },
       setMode: async (mode: string) => {
         await this.#applyMode(mode, false);
       },
@@ -3361,8 +3388,7 @@ export class AppController {
         // Authoritatively calibrate post-turn TPS + cumulative tokens from transcript.jsonl and refresh git
         void this.#syncSessionMetricsFromTranscript();
         void this.#refreshGitStatus();
-
-        await this.#persistSessionAnchorAndOsc();
+        void this.#persistSessionAnchorAndOsc().catch(() => {});
       } catch (err) {
         if (
           this.#shuttingDown ||
@@ -3753,6 +3779,7 @@ export class AppController {
     // currently active model.
     const highlightedIsCurrentModel =
       Boolean(prevState.controls.currentModelId) &&
+      !isOrchestratorModelId(prevState.controls.currentModelId) &&
       prevPicker?.selectedId === prevState.controls.currentModelId;
     const pendingThinking =
       options.commitModelThinking &&
@@ -3881,7 +3908,11 @@ export class AppController {
       await this.#openSwarmBoard(initialQuery);
       return;
     }
-    if (kind === 'thought' && !this.store.getState().controls.supportsThoughtLevel) {
+    if (
+      kind === 'thought' &&
+      !this.store.getState().controls.supportsThoughtLevel &&
+      !isOrchestratorModelId(this.store.getState().controls.currentModelId)
+    ) {
       this.store.pushToast(
         'Current model does not support thought_level adjustment',
         'info'
@@ -3897,9 +3928,41 @@ export class AppController {
       kind === 'plugins' ||
       kind === 'skills' ||
       kind === 'agents';
+
+    let initialSelectedId: string | null | undefined;
+    let initialModelThinking: string | undefined;
+    if (kind === 'model') {
+      const curId = this.store.getState().controls.currentModelId;
+      if (isOrchestratorModelId(curId)) {
+        initialSelectedId = ORCHESTRATOR_PICKER_ID;
+      }
+    } else if (kind === 'planner' || kind === 'executor') {
+      const curState = this.store.getState();
+      const candidates = filterOrchestratorRoleModels(kind, curState.controls.availableModels);
+      const parsedRole = parseOrchestratorModelSpec(curState.orchestratorSettings[kind]);
+      const fallbackRole =
+        kind === 'planner'
+          ? inferOrchestratorDefaultPlannerModel(curState.controls.currentModelId)
+          : inferOrchestratorDefaultExecutorModel(curState.controls.currentModelId);
+      const targetName = parsedRole?.modelName ?? fallbackRole?.modelName;
+      if (targetName) {
+        const matched = candidates.find(
+          c =>
+            c.name.toLowerCase() === targetName.toLowerCase() ||
+            c.value.toLowerCase() === targetName.toLowerCase()
+        );
+        if (matched) {
+          initialSelectedId = matched.value;
+        }
+      }
+      initialModelThinking = parsedRole?.thoughtLevel ?? 'high';
+    }
+
     this.store.openPicker(kind, {
       initialQuery,
       loading: isAsyncKind,
+      ...(initialSelectedId !== undefined ? { selectedId: initialSelectedId } : {}),
+      ...(initialModelThinking !== undefined ? { modelPickerThinking: initialModelThinking } : {}),
     });
 
     // Render modal picker first, then release editor focus to null (consistent with openHelp)
@@ -4357,13 +4420,30 @@ export class AppController {
       kind === 'model' && picker?.modelPickerThinkingDirty
         ? picker.modelPickerThinking
         : undefined;
+    const selectedRoleThinking =
+      kind === 'planner' || kind === 'executor' ? picker?.modelPickerThinking : undefined;
 
     await this.#closePicker({ commitModelThinking: false });
 
     if (kind === 'resume') {
       await this.#switchToSession(itemId, selectedSession);
     } else if (kind === 'model') {
-      await this.#applyModelQuery(itemId, desiredModelThinking);
+      if (itemId === ORCHESTRATOR_PICKER_ID) {
+        const curState = this.store.getState();
+        const parsedPlan = parseOrchestratorModelSpec(curState.orchestratorSettings.planner);
+        const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
+          parsedPlan?.modelName,
+          curState.controls.availableModels,
+          curState.controls.currentModelId
+        );
+        if (targetOrchId) {
+          await this.#applyModelQuery(targetOrchId);
+        }
+      } else {
+        await this.#applyModelQuery(itemId, desiredModelThinking);
+      }
+    } else if (kind === 'planner' || kind === 'executor') {
+      await this.#applyOrchestratorRoleModel(kind, itemId, selectedRoleThinking);
     } else if (kind === 'thought') {
       await this.#applyThoughtLevel(itemId, false);
     } else if (kind === 'mode') {
@@ -4636,7 +4716,9 @@ export class AppController {
 
       const label = applied.appliedThoughtLevel
         ? `${applied.appliedModelId} (${applied.appliedThoughtLevel})`
-        : applied.appliedModelId;
+        : isOrchestratorModelId(applied.appliedModelId)
+          ? 'Orchestrator'
+          : applied.appliedModelId;
       this.store.pushToast(`Switched model to ${label}`, 'success', { ttl: 2500 });
       await this.#persistSessionAnchorAndOsc();
       this.scheduler.renderNow();
@@ -4649,10 +4731,259 @@ export class AppController {
     }
   }
 
+  async #loadInitialAgySettings(): Promise<void> {
+    try {
+      const loaded = await loadAgySettings({ path: this.#agySettingsPath });
+      if (this.#shuttingDown) return;
+      this.store.setOrchestratorSettings(loaded.settings.orchestrator);
+      if (loaded.presentKeys.includes('showThinking')) {
+        const show = loaded.settings.showThinking;
+        this.store.setShowThinking(show);
+        if (show) {
+          this.store.setAutoCollapseThought(false);
+        }
+      }
+      this.scheduler.markDirty();
+    } catch {
+      // Non-fatal: keep defaults if settings.json is unreadable
+    }
+  }
+
+  async #handleThinkingDisplay(mode: 'on' | 'off' | 'toggle'): Promise<void> {
+    const state = this.store.getState();
+    const currentlyLiveExpanded = state.showThinking && !state.autoCollapseThought;
+    const enabled = mode === 'on' ? true : mode === 'off' ? false : !currentlyLiveExpanded;
+
+    this.store.setShowThinking(enabled);
+    this.store.setAutoCollapseThought(enabled ? false : this.#config.ui.auto_collapse_thought);
+    this.store.transcript.setAllThoughtsOpen(enabled);
+
+    try {
+      const saved = await saveAgySettings(
+        { showThinking: enabled },
+        { path: this.#agySettingsPath }
+      );
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+    } catch (err) {
+      this.store.pushToast(
+        `Thinking ${enabled ? 'enabled' : 'disabled'} in session (failed to save settings.json: ${
+          err instanceof Error ? err.message : String(err)
+        })`,
+        'warning',
+        { ttl: 2800 }
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
+    this.store.pushToast(
+      enabled
+        ? 'Live thinking stream enabled (stays expanded)'
+        : 'Live thinking stream disabled',
+      'info',
+      { ttl: 2200 }
+    );
+    this.scheduler.renderNow();
+  }
+
+  async #applyOrchestratorRoleModel(
+    role: 'planner' | 'executor',
+    modelId: string,
+    selectedThought?: string
+  ): Promise<void> {
+    const state = this.store.getState();
+    const choice = state.controls.availableModels.find(c => c.value === modelId);
+    const modelName = choice?.name || modelId;
+    const thoughtChoices = resolveThoughtLevelsForModel(
+      modelId,
+      state.controls,
+      state.modelThoughtLevels
+    );
+    const clampedThought =
+      thoughtChoices.length > 0
+        ? clampThoughtLevelForChoices(selectedThought ?? 'high', thoughtChoices)
+        : undefined;
+    const spec = formatOrchestratorModelSpec(modelName, clampedThought);
+    if (!spec) return;
+
+    const nextOrchestrator = {
+      ...state.orchestratorSettings,
+      [role]: spec,
+    };
+
+    try {
+      const saved = await saveAgySettings(
+        { orchestrator: nextOrchestrator },
+        { path: this.#agySettingsPath }
+      );
+      this.store.setOrchestratorSettings(saved.settings.orchestrator);
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+
+      // When updating Planner while currently in Orchestrator mode, keep the active ACP
+      // Orchestrator variant aligned (Neon / Carbon / Argon) whenever a matching variant exists.
+      if (
+        role === 'planner' &&
+        isOrchestratorModelId(state.controls.currentModelId) &&
+        this.#acpClient &&
+        state.sessionId
+      ) {
+        const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
+          modelId,
+          state.controls.availableModels,
+          state.controls.currentModelId
+        );
+        if (targetOrchId && targetOrchId !== state.controls.currentModelId) {
+          try {
+            const res = await this.#acpClient.setConfigOption({
+              sessionId: state.sessionId,
+              configId: 'model',
+              value: targetOrchId,
+            });
+            this.store.updateConfigOptions(res.configOptions);
+          } catch {
+            // Non-fatal: settings.json is already updated
+          }
+        }
+      }
+
+      const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+      this.store.pushToast(
+        `Orchestrator ${roleLabel} set to ${spec}`,
+        'success',
+        { ttl: 2500 }
+      );
+    } catch (err) {
+      this.store.pushToast(
+        `Failed to save Orchestrator ${role}: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+    }
+    this.scheduler.renderNow();
+  }
+
+  async #applyOrchestratorRoleThoughtLevel(
+    role: 'planner' | 'executor',
+    level: string,
+    silent: boolean
+  ): Promise<string | null> {
+    const state = this.store.getState();
+    if (!isOrchestratorModelId(state.controls.currentModelId)) return null;
+
+    const parsedRole = parseOrchestratorModelSpec(state.orchestratorSettings[role]);
+    const fallbackRole =
+      role === 'planner'
+        ? inferOrchestratorDefaultPlannerModel(state.controls.currentModelId)
+        : inferOrchestratorDefaultExecutorModel(state.controls.currentModelId);
+    const modelName =
+      parsedRole?.modelName ??
+      fallbackRole?.modelName ??
+      (role === 'planner' ? 'Gemini 4 Carbon' : 'Gemini 4 Hydrogen');
+    const choices = resolveOrchestratorRoleThoughtLevels(
+      role,
+      state.controls,
+      state.modelThoughtLevels,
+      parsedRole?.modelName
+    );
+    if (choices.length === 0) return null;
+
+    const trimmed = level.trim().toLowerCase();
+    const normalizedInput = trimmed === 'extra' ? 'xhigh' : trimmed;
+    const matched =
+      choices.find(
+        c =>
+          c.value.toLowerCase() === normalizedInput ||
+          c.name.toLowerCase() === trimmed
+      ) ??
+      choices.find(c => c.value.toLowerCase().startsWith(normalizedInput));
+
+    const targetChoice =
+      matched ??
+      (silent
+        ? choices.find(c => c.value === clampThoughtLevelForChoices(normalizedInput, choices))
+        : undefined);
+    if (!targetChoice) {
+      if (!silent) {
+        this.store.pushToast(
+          `Invalid thought level "${level}". Available: ${choices.map(c => c.value).join(', ')}`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+      }
+      return null;
+    }
+
+    const spec = formatOrchestratorModelSpec(modelName, targetChoice.value);
+    const nextOrchestrator = {
+      ...state.orchestratorSettings,
+      [role]: spec,
+    };
+
+    try {
+      const saved = await saveAgySettings(
+        { orchestrator: nextOrchestrator },
+        { path: this.#agySettingsPath }
+      );
+      this.store.setOrchestratorSettings(saved.settings.orchestrator);
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+      if (!silent) {
+        const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+        this.store.pushToast(
+          `${roleLabel} thinking set to ${targetChoice.name} (${modelName})`,
+          'success',
+          { ttl: 2200 }
+        );
+      }
+      this.scheduler.renderNow();
+      return targetChoice.value;
+    } catch (err) {
+      if (!silent) {
+        this.store.pushToast(
+          `Failed to save Orchestrator ${role} thinking level: ${err instanceof Error ? err.message : String(err)}`,
+          'error'
+        );
+        this.scheduler.renderNow();
+      }
+      return null;
+    }
+  }
+
+  async #cycleOrchestratorRoleThinking(role: 'planner' | 'executor'): Promise<void> {
+    const state = this.store.getState();
+    const { controls } = state;
+    if (!isOrchestratorModelId(controls.currentModelId)) return;
+    const parsedRole = parseOrchestratorModelSpec(state.orchestratorSettings[role]);
+    const choices = resolveOrchestratorRoleThoughtLevels(
+      role,
+      controls,
+      state.modelThoughtLevels,
+      parsedRole?.modelName
+    );
+    if (choices.length === 0) return;
+    const curVal = clampThoughtLevelForChoices(parsedRole?.thoughtLevel ?? 'high', choices);
+    const curIdx = choices.findIndex(c => c.value === curVal);
+    const next = choices[(curIdx + 1 + choices.length) % choices.length];
+    if (!next) return;
+    await this.#applyOrchestratorRoleThoughtLevel(role, next.value, false);
+  }
+
   async #applyThoughtLevel(level: string, silent: boolean): Promise<void> {
     const client = this.#acpClient;
     const state = this.store.getState();
     if (!client || !state.sessionId) return;
+
+    if (
+      !state.controls.supportsThoughtLevel &&
+      isOrchestratorModelId(state.controls.currentModelId)
+    ) {
+      await this.#applyOrchestratorRoleThoughtLevel('planner', level, silent);
+      return;
+    }
 
     const resolved = resolveThoughtLevel(level, [...state.configOptions]);
     if (!resolved.ok) {
@@ -4695,7 +5026,12 @@ export class AppController {
   }
 
   async cycleThinkingLevel(): Promise<void> {
-    const { controls } = this.store.getState();
+    const state = this.store.getState();
+    const { controls } = state;
+    if (!controls.supportsThoughtLevel && isOrchestratorModelId(controls.currentModelId)) {
+      await this.#cycleOrchestratorRoleThinking('planner');
+      return;
+    }
     if (!controls.supportsThoughtLevel || controls.availableThoughtLevels.length === 0) {
       return;
     }
@@ -4775,6 +5111,7 @@ export class AppController {
     try {
       const loaded = await loadAgySettings({ path: this.#agySettingsPath });
       agySnapshot = loaded.settings;
+      this.store.setOrchestratorSettings(loaded.settings.orchestrator);
     } catch {
       agySnapshot = {};
     }
@@ -5066,6 +5403,14 @@ export class AppController {
         });
         this.scheduler.renderNow();
       }
+      return;
+    }
+    if (act === 'pick-planner') {
+      await this.#openPicker('planner', '');
+      return;
+    }
+    if (act === 'pick-executor') {
+      await this.#openPicker('executor', '');
       return;
     }
     if (act === 'save-defaults') {
@@ -6051,8 +6396,20 @@ export class AppController {
           onOpenPicker: kind => {
             void this.#openPicker(kind, '');
           },
+          onOpenPlannerPicker: () => {
+            void this.#openPicker('planner', '');
+          },
+          onOpenExecutorPicker: () => {
+            void this.#openPicker('executor', '');
+          },
           onCycleThinking: () => {
             void this.cycleThinkingLevel();
+          },
+          onCyclePlannerThinking: () => {
+            void this.#cycleOrchestratorRoleThinking('planner');
+          },
+          onCycleExecutorThinking: () => {
+            void this.#cycleOrchestratorRoleThinking('executor');
           },
           onOpenSwarmBoard: () => {
             void this.#openSwarmBoard('');
@@ -6092,9 +6449,13 @@ export class AppController {
           },
           onScopeChange: scope => {
             const prevPicker = this.store.getState().picker;
+            const isModelLike =
+              prevPicker?.kind === 'model' ||
+              prevPicker?.kind === 'planner' ||
+              prevPicker?.kind === 'executor';
             const nextScope =
-              prevPicker?.kind === 'model' &&
-              scope === prevPicker.scope &&
+              isModelLike &&
+              scope === prevPicker?.scope &&
               scope !== 'all'
                 ? 'all'
                 : scope;

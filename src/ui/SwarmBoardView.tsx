@@ -6,10 +6,13 @@ import type {
   SwarmMember,
   SwarmMemberStatus,
   SwarmMessageBadgeTone,
+  SwarmOverviewThread,
 } from '../swarm/board';
 import { BEE_CARD_SIZE, getBeePaletteIdForMember } from './assets';
 
 export const SWARM_POSTS_LIST_PREFIX = 'layer.swarm.body.split.posts-pane.posts.';
+/** Minimum terminal row height required to display the Swarm Overview header pane. */
+export const SWARM_OVERVIEW_MIN_ROWS = 28;
 
 export interface SwarmBoardCallbacks {
   readonly onClose: () => void;
@@ -307,6 +310,22 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
     ? resolveMemberBeeBlob(state, selectedSender, false)
     : undefined;
 
+  const overview = snapshot.overview ?? null;
+  const showOverview = Boolean(overview && state.terminalRows >= SWARM_OVERVIEW_MIN_ROWS);
+
+  const threadStatusGlyph = (status: SwarmOverviewThread['status']): { text: string; style: string; role: string } => {
+    switch (status) {
+      case 'done':
+        return { text: '✓', style: 'success strong', role: 'oma.swarm.overview.thread.done' };
+      case 'working':
+        return { text: '●', style: 'info strong', role: 'oma.swarm.overview.thread.working' };
+      case 'blocked':
+        return { text: '▲', style: 'error strong', role: 'oma.swarm.overview.thread.blocked' };
+      default:
+        return { text: '○', style: 'muted', role: 'oma.swarm.overview.thread' };
+    }
+  };
+
   return (
     <overlay
       key="swarm"
@@ -320,6 +339,107 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
       end={headerControls}
     >
       <col key="body" role="oma.swarm.body" gap="sm" grow={1}>
+        {/* -----------------------------------------------------------------
+            0. Real-Time Swarm Overview (shown when terminal height >= 28 rows & plan.json present)
+            ----------------------------------------------------------------- */}
+        {showOverview && overview ? (
+          <col key="overview" role="oma.swarm.overview" gap="xs">
+            <row key="overview-head" justify="between" align="center" gap="sm">
+              <text
+                key="goal"
+                spans={[
+                  { t: 'Overview', s: 'strong' },
+                  { t: ` · ${overview.goalTitle}`, s: 'accent' },
+                ]}
+                wrap="none"
+                truncate="end"
+              />
+              <row key="progress" gap="xs" align="center">
+                <badge
+                  key="done"
+                  text={`${overview.doneCount}/${overview.totalTasks} done`}
+                  tone={
+                    overview.totalTasks > 0 && overview.doneCount >= overview.totalTasks
+                      ? 'success'
+                      : 'accent'
+                  }
+                />
+                {overview.workingCount > 0 ? (
+                  <badge key="working" text={`${overview.workingCount} active`} tone="info" />
+                ) : null}
+                {overview.blockedCount > 0 ? (
+                  <badge key="blocked" text={`${overview.blockedCount} blocked`} tone="error" />
+                ) : null}
+              </row>
+            </row>
+
+            {overview.goalLine ? (
+              <text
+                key="goal-line"
+                spans={[{ t: overview.goalLine, s: 'muted' }]}
+                wrap="word"
+                lines={2}
+              />
+            ) : null}
+
+            {overview.threads.length > 0 ? (
+              <row
+                key="threads"
+                role="oma.swarm.overview.threads"
+                wrap
+                gap="xs"
+                align="center"
+              >
+                {overview.threads.slice(0, 6).map((thread, idx) => {
+                  const glyph = threadStatusGlyph(thread.status);
+                  const firstMember = thread.tasks.find(name => Boolean(snapshot.memberByName[name])) ?? thread.tasks[0];
+                  const threadTitle = [
+                    thread.title,
+                    thread.goal || undefined,
+                    `${thread.doneCount}/${thread.totalCount} done`,
+                    thread.blockedCount > 0 ? `${thread.blockedCount} blocked` : undefined,
+                    thread.tasks.length > 0 ? `workers: ${thread.tasks.join(', ')}` : undefined,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ');
+
+                  return (
+                    <row
+                      key={sanitizeNodeKey(`thread-${thread.id}`, `thread-${idx}`)}
+                      role={glyph.role}
+                      gap="xs"
+                      align="center"
+                      title={threadTitle}
+                      aria={`${thread.title}, ${thread.status}, ${thread.doneCount} of ${thread.totalCount} done`}
+                      actions={firstMember ? { click: `swarm.thread=${thread.id}` } : undefined}
+                      onClick={
+                        firstMember
+                          ? () => callbacks.onToggleAgentFilter(firstMember)
+                          : undefined
+                      }
+                    >
+                      <text key="st" spans={[{ t: glyph.text, s: glyph.style }]} wrap="none" />
+                      <text
+                        key="lbl"
+                        spans={[{ t: thread.title, s: 'strong' }]}
+                        wrap="none"
+                        truncate="end"
+                      />
+                      <text
+                        key="cnt"
+                        spans={[{ t: `${thread.doneCount}/${thread.totalCount}`, s: 'mono dim' }]}
+                        wrap="none"
+                      />
+                    </row>
+                  );
+                })}
+              </row>
+            ) : null}
+          </col>
+        ) : null}
+
+        {showOverview && overview ? <rule key="overview-sep" /> : null}
+
         {/* -----------------------------------------------------------------
             1. Top Roster Section (1:1 aligned with native `agy` Roster)
             ----------------------------------------------------------------- */}

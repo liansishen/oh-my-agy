@@ -13,8 +13,20 @@ import type {
   TableRow,
   Tone,
 } from '@stencil-hq/tern';
+import {
+  clampThoughtLevelForChoices,
+  filterOrchestratorRoleModels,
+  formatShortOrchestratorModelName,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
+  isOrchestratorModelId,
+  ORCHESTRATOR_PICKER_ID,
+  resolveOrchestratorRoleThoughtLevels,
+  resolveThoughtLevelsForModel,
+} from '../acp/model';
 import { sameDir } from '../acp/path';
 import { fuzzyMatchText, type SlashCommandDef } from '../commands/registry';
+import { parseOrchestratorModelSpec } from '../config/agy_settings';
 import {
   inferModelProvider,
   MODEL_PROVIDER_META,
@@ -450,10 +462,68 @@ export function computePickerData(
   }
 
   // -------------------------------------------------------------------------
-  // 2. `/model` — Figure 1 compact composer-anchored sheet + inline level slider
+  // 2. `/model` (and Orchestrator `planner` / `executor`) — compact composer sheet + real per-model thinking slider
   // -------------------------------------------------------------------------
-  if (picker.kind === 'model') {
-    const choices = state.controls.availableModels;
+  if (picker.kind === 'model' || picker.kind === 'planner' || picker.kind === 'executor') {
+    const isOrchestratorRole = picker.kind === 'planner' || picker.kind === 'executor';
+    const rawChoices = state.controls.availableModels;
+
+    // Build Orchestrator summary detail (e.g. `Carbon (High) → Hydrogen (High)`) for the single merged entry
+    const formatRoleBrief = (role: 'planner' | 'executor'): string => {
+      const parsed = parseOrchestratorModelSpec(state.orchestratorSettings[role]);
+      const fullName =
+        parsed?.modelName ??
+        (role === 'planner'
+          ? (inferOrchestratorDefaultPlannerModel(state.controls.currentModelId)?.modelName ??
+              'Gemini 4 Carbon')
+          : (inferOrchestratorDefaultExecutorModel(state.controls.currentModelId)?.modelName ??
+              'Gemini 4 Hydrogen'));
+      const short = formatShortOrchestratorModelName(fullName) || fullName;
+      const lvl = parsed?.thoughtLevel ?? 'high';
+      const lvlLabel = lvl === 'xhigh' ? 'Extra' : lvl.charAt(0).toUpperCase() + lvl.slice(1);
+      return `${short} (${lvlLabel})`;
+    };
+    const orchestratorSummaryDetail = `${formatRoleBrief('planner')} → ${formatRoleBrief('executor')}`;
+
+    let choices: typeof rawChoices;
+    if (picker.kind === 'planner' || picker.kind === 'executor') {
+      choices = [...filterOrchestratorRoleModels(picker.kind, rawChoices)];
+    } else {
+      // Collapse all `gemini-pro-orchestrator-*` variants into a single `Orchestrator` entry
+      const merged: typeof rawChoices = [];
+      let addedOrch = false;
+      for (const c of rawChoices) {
+        if (isOrchestratorModelId(c.value)) {
+          if (!addedOrch) {
+            addedOrch = true;
+            merged.push({
+              value: ORCHESTRATOR_PICKER_ID,
+              name: 'Orchestrator',
+              description: orchestratorSummaryDetail,
+            });
+          }
+          continue;
+        }
+        merged.push(c);
+      }
+      choices = merged;
+    }
+
+    const currentRoleSpec = isOrchestratorRole
+      ? parseOrchestratorModelSpec(state.orchestratorSettings[picker.kind])
+      : null;
+    const currentRoleChoice = currentRoleSpec
+      ? choices.find(
+          c =>
+            c.name.toLowerCase() === currentRoleSpec.modelName.toLowerCase() ||
+            c.value.toLowerCase() === currentRoleSpec.modelName.toLowerCase()
+        )
+      : undefined;
+    const activeCurrentModelId = isOrchestratorRole
+      ? (currentRoleChoice?.value ?? null)
+      : isOrchestratorModelId(state.controls.currentModelId)
+        ? ORCHESTRATOR_PICKER_ID
+        : state.controls.currentModelId;
 
     // Count models per provider for the left icon rail (`scopeStyle="rail"`)
     const providerCounts = new Map<ModelProviderId, number>();
@@ -529,12 +599,18 @@ export function computePickerData(
       const meta = MODEL_PROVIDER_META[providerId];
       byId.set(choice.value, choice);
       providerById.set(choice.value, providerId);
+      const itemDetail =
+        choice.value === ORCHESTRATOR_PICKER_ID
+          ? orchestratorSummaryDetail
+          : choice.value !== choice.name
+            ? choice.value
+            : undefined;
       items.push({
         id: choice.value,
         label: choice.name,
         mono: true,
         mark: { text: meta.abbr, seed: providerId, icon: meta.icon },
-        ...(choice.value !== choice.name ? { detail: choice.value } : {}),
+        ...(itemDetail ? { detail: itemDetail } : {}),
         ...(hits.length > 0 ? { hits } : {}),
       });
       if (hits.length > 0) hitsMap[choice.value] = hits;
@@ -554,7 +630,11 @@ export function computePickerData(
     } else {
       const recentSet = new Set<string>();
       const recentIds: string[] = [];
-      for (const recentId of state.recentModels) {
+      for (const rawRecentId of state.recentModels) {
+        const recentId =
+          picker.kind === 'model' && isOrchestratorModelId(rawRecentId)
+            ? ORCHESTRATOR_PICKER_ID
+            : rawRecentId;
         if (byId.has(recentId) && !recentSet.has(recentId)) {
           recentSet.add(recentId);
           recentIds.push(recentId);
@@ -584,22 +664,35 @@ export function computePickerData(
       }
     }
 
+    const normalizedRequested =
+      picker.kind === 'model' && isOrchestratorModelId(picker.selectedId)
+        ? ORCHESTRATOR_PICKER_ID
+        : picker.selectedId;
     const selectedId = resolveSelectedId(
-      picker.selectedId ?? state.controls.currentModelId,
+      normalizedRequested ?? activeCurrentModelId,
       visibleIds
     );
 
     const activeProviderId =
       (selectedId ? providerById.get(selectedId) : undefined) ??
-      (state.controls.currentModelId ? inferModelProvider(state.controls.currentModelId) : 'antigravity');
+      (activeCurrentModelId ? inferModelProvider(activeCurrentModelId) : 'antigravity');
     const activeProviderLabel = MODEL_PROVIDER_META[activeProviderId].label;
 
-    const thoughtChoices = state.controls.availableThoughtLevels;
-    const supportsThought = state.controls.supportsThoughtLevel && thoughtChoices.length > 0;
-    const selectedThought =
+    const isSelectedOrchestrator =
+      picker.kind === 'model' && isOrchestratorModelId(selectedId);
+    const thoughtChoices = isSelectedOrchestrator
+      ? []
+      : resolveThoughtLevelsForModel(selectedId, state.controls, state.modelThoughtLevels);
+    const supportsThought = thoughtChoices.length > 0;
+    const rawSelectedThought =
       picker.modelPickerThinking ??
-      state.controls.currentThoughtLevel ??
+      (isOrchestratorRole
+        ? currentRoleSpec?.thoughtLevel
+        : selectedId === state.controls.currentModelId
+          ? state.controls.currentThoughtLevel
+          : undefined) ??
       thoughtChoices[0]?.value;
+    const selectedThought = clampThoughtLevelForChoices(rawSelectedThought, thoughtChoices);
 
     const level: PickerLevel = supportsThought
       ? {
@@ -617,11 +710,21 @@ export function computePickerData(
           steps: [{ id: 'off', label: 'Off' }],
           value: 'off',
           keys: ['left', 'right'],
-          disabled: 'Not supported by this model',
+          disabled: isSelectedOrchestrator
+            ? 'Configure effort in Plan / Exec pills'
+            : 'Not supported by this model',
         };
 
     return {
-      icon: 'cpu',
+      ...(isOrchestratorRole
+        ? {
+            title:
+              picker.kind === 'planner'
+                ? 'Orchestrator · Planner'
+                : 'Orchestrator · Executor',
+          }
+        : {}),
+      icon: isOrchestratorRole ? 'plan' : 'cpu',
       size: 'md',
       layout: 'rows',
       preview: 'none',
@@ -631,12 +734,17 @@ export function computePickerData(
       scopeStyle: 'rail',
       level,
       noun: 'models',
-      placeholder: 'Search, @ for roles…',
+      placeholder:
+        picker.kind === 'planner'
+          ? 'Search planner models…'
+          : picker.kind === 'executor'
+            ? 'Search executor models…'
+            : 'Search, @ for roles…',
       items,
       order,
       visibleIds,
       selectedId,
-      current: state.controls.currentModelId ? [state.controls.currentModelId] : undefined,
+      current: activeCurrentModelId ? [activeCurrentModelId] : undefined,
       hits: Object.keys(hitsMap).length > 0 ? hitsMap : undefined,
       scopes: scopes.length > 0 ? scopes : undefined,
       actions: [],
@@ -649,7 +757,21 @@ export function computePickerData(
   // 3. `/thought`
   // -------------------------------------------------------------------------
   if (picker.kind === 'thought') {
-    const choices = state.controls.availableThoughtLevels;
+    const isOrch = isOrchestratorModelId(state.controls.currentModelId);
+    const parsedPlan = isOrch
+      ? parseOrchestratorModelSpec(state.orchestratorSettings.planner)
+      : null;
+    const choices = isOrch
+      ? resolveOrchestratorRoleThoughtLevels(
+          'planner',
+          state.controls,
+          state.modelThoughtLevels,
+          parsedPlan?.modelName
+        )
+      : state.controls.availableThoughtLevels;
+    const currentThoughtVal = isOrch
+      ? (parsedPlan?.thoughtLevel ?? 'high')
+      : state.controls.currentThoughtLevel;
     const hitsMap: Record<string, readonly (readonly [number, number])[]> = {};
     const items: PickerItem[] = [];
     const visibleIds: string[] = [];
@@ -674,12 +796,12 @@ export function computePickerData(
     }
 
     const selectedId = resolveSelectedId(
-      picker.selectedId ?? state.controls.currentThoughtLevel,
+      picker.selectedId ?? currentThoughtVal,
       visibleIds
     );
 
     return {
-      title: 'Thinking level',
+      title: isOrch ? 'Thinking level · Planner' : 'Thinking level',
       icon: 'brain',
       size: 'md',
       layout: 'rows',
@@ -690,17 +812,16 @@ export function computePickerData(
       items,
       visibleIds,
       selectedId,
-      current: state.controls.currentThoughtLevel
-        ? [state.controls.currentThoughtLevel]
-        : undefined,
+      current: currentThoughtVal ? [currentThoughtVal] : undefined,
       hits: Object.keys(hitsMap).length > 0 ? hitsMap : undefined,
       actions: [
         { id: 'select', label: 'Apply', keys: ['enter'], primary: true },
         { id: 'close', label: 'Close', keys: ['esc'], end: true },
       ],
-      empty: state.controls.supportsThoughtLevel
-        ? 'No matching thinking levels'
-        : 'Current model does not support thought_level',
+      empty:
+        state.controls.supportsThoughtLevel || isOrch
+          ? 'No matching thinking levels'
+          : 'Current model does not support thought_level',
     };
   }
 
@@ -1982,6 +2103,7 @@ const SHORT_BUILTIN_COMMAND_DESC: Readonly<Record<string, string>> = {
   new: 'Start a new session',
   model: 'Switch model & thinking',
   thought: 'Switch thinking level',
+  thinking: 'Toggle live thinking stream',
   mode: 'Switch permission mode',
   context: 'Inspect context tokens',
   usage: 'Show tier & usage summary',

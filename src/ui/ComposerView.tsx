@@ -10,7 +10,14 @@ import {
   type SpanData,
   type UndoEvent,
 } from '@stencil-hq/tern';
+import {
+  formatShortOrchestratorModelName,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
+  isOrchestratorModelId,
+} from '../acp/model';
 import type { SlashCommandDef } from '../commands/registry';
+import { parseOrchestratorModelSpec } from '../config/agy_settings';
 import type { DraftState } from '../editor/draft';
 import type { GitStatusSnapshot } from '../state/git_status';
 import {
@@ -77,9 +84,13 @@ export interface ComposerCallbacks {
   readonly onStop: () => void;
   readonly onRemoveAttachment: (id: string) => void;
   readonly onOpenPicker: (kind: ModalPickerKind) => void;
+  readonly onOpenPlannerPicker?: () => void;
+  readonly onOpenExecutorPicker?: () => void;
   readonly onOpenContext: () => void;
   readonly onCycleMode: () => void;
   readonly onCycleThinking?: () => void;
+  readonly onCyclePlannerThinking?: () => void;
+  readonly onCycleExecutorThinking?: () => void;
   readonly onOpenSwarmBoard?: () => void;
   readonly onOpenJobs?: () => void;
   readonly onOpenGit?: () => void;
@@ -113,6 +124,49 @@ function normalizeEffortLevel(raw: string | null | undefined): string {
     return value;
   }
   return value;
+}
+
+function formatEffortDisplayName(level: string): string {
+  const lower = level.trim().toLowerCase();
+  if (lower === 'xhigh' || lower === 'extra') return 'Extra';
+  return lower ? lower.charAt(0).toUpperCase() + lower.slice(1) : 'High';
+}
+
+function resolveOrchestratorRoleCapsuleDisplay(
+  role: 'planner' | 'executor',
+  state: AppState
+): {
+  readonly shortName: string;
+  readonly fullName: string;
+  readonly thoughtLevel: string;
+  readonly thoughtDisplay: string;
+  readonly title: string;
+  readonly effortTitle: string;
+} | null {
+  if (!isOrchestratorModelId(state.controls.currentModelId)) {
+    return null;
+  }
+  const rawSpec = state.orchestratorSettings[role]?.trim();
+  const parsed = parseOrchestratorModelSpec(rawSpec);
+  const fallback =
+    role === 'planner'
+      ? (inferOrchestratorDefaultPlannerModel(state.controls.currentModelId)?.modelName ??
+          'Gemini 4 Carbon')
+      : (inferOrchestratorDefaultExecutorModel(state.controls.currentModelId)?.modelName ??
+          'Gemini 4 Hydrogen');
+  const fullName = parsed?.modelName || fallback;
+  const shortName = formatShortOrchestratorModelName(fullName) || fullName;
+  const thoughtLevel = normalizeEffortLevel(parsed?.thoughtLevel ?? 'high');
+  const thoughtDisplay = formatEffortDisplayName(thoughtLevel);
+  const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+  return {
+    shortName,
+    fullName,
+    thoughtLevel,
+    thoughtDisplay,
+    title: `Orchestrator ${roleLabel}: ${fullName} (${thoughtDisplay}) — click to switch`,
+    effortTitle: `${roleLabel} thinking: ${thoughtDisplay} (click to cycle)`,
+  };
 }
 
 function formatSessionCost(cost: { readonly amount: number; readonly currency: string }): string {
@@ -331,6 +385,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const modeId = controls.currentModeId ?? 'default';
   const modeLabel = controls.currentModeName || modeId;
   const showModeChip = modeId !== 'default';
+  const isOrchestratorActive = isOrchestratorModelId(controls.currentModelId);
   const effortLevel = normalizeEffortLevel(controls.currentThoughtLevel);
   const effortDisplay =
     controls.currentThoughtLevelName || controls.currentThoughtLevel || effortLevel;
@@ -346,6 +401,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
 
   // Dynamic perimeter bees matching the real active (non-retired) member count while in swarm mode
   const orbitBees = resolveOrbitSwarmBees(state);
+  const plannerCapsule = resolveOrchestratorRoleCapsuleDisplay('planner', state);
+  const executorCapsule = resolveOrchestratorRoleCapsuleDisplay('executor', state);
 
   return (
     <col>
@@ -589,14 +646,14 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
         <row key="bar" role="omp.composer.bar" gap="sm" align="center">
           <row
             key="model"
-            role="omp.composer.model"
+            role={isOrchestratorActive ? 'oma.composer.model.orchestrator' : 'omp.composer.model'}
             gap="xs"
             align="center"
             title="Switch model  ⌥P"
             actions={{ click: 'status.model' }}
             onClick={() => callbacks.onOpenPicker('model')}
           >
-            {controls.supportsThoughtLevel ? (
+            {!isOrchestratorActive && controls.supportsThoughtLevel ? (
               <effort
                 key="effort"
                 level={effortLevel}
@@ -612,9 +669,12 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             ) : null}
             <text
               key="name"
+              role={isOrchestratorActive ? 'oma.composer.model.orchestrator.name' : undefined}
               spans={[
                 {
-                  t: controls.currentModelName || (state.isReady ? 'model' : 'connecting…'),
+                  t: isOrchestratorActive
+                    ? 'Orchestrator'
+                    : controls.currentModelName || (state.isReady ? 'model' : 'connecting…'),
                   ...(state.isReady ? {} : { s: 'muted' }),
                 },
               ]}
@@ -622,6 +682,84 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             />
             <icon key="chev" name="chev" />
           </row>
+
+          {plannerCapsule ? (
+            <row
+              key="planner"
+              role="oma.composer.planner"
+              gap="xs"
+              align="center"
+              tone="info"
+              title={plannerCapsule.title}
+              aria={plannerCapsule.title}
+              actions={{ click: 'status.planner' }}
+              onClick={() =>
+                callbacks.onOpenPlannerPicker
+                  ? callbacks.onOpenPlannerPicker()
+                  : callbacks.onOpenPicker('planner')
+              }
+            >
+              <text
+                key="tag"
+                role="oma.composer.planner.tag"
+                text="Plan"
+                wrap="none"
+              />
+              <effort
+                key="effort"
+                level={plannerCapsule.thoughtLevel}
+                role="oma.composer.planner.effort"
+                title={plannerCapsule.effortTitle}
+                actions={{ click: 'planner.thinking.cycle' }}
+                onClick={() => callbacks.onCyclePlannerThinking?.()}
+              />
+              <text
+                key="name"
+                text={plannerCapsule.shortName}
+                wrap="none"
+              />
+              <icon key="chev" name="chev" />
+            </row>
+          ) : null}
+
+          {executorCapsule ? (
+            <row
+              key="executor"
+              role="oma.composer.executor"
+              gap="xs"
+              align="center"
+              tone="success"
+              title={executorCapsule.title}
+              aria={executorCapsule.title}
+              actions={{ click: 'status.executor' }}
+              onClick={() =>
+                callbacks.onOpenExecutorPicker
+                  ? callbacks.onOpenExecutorPicker()
+                  : callbacks.onOpenPicker('executor')
+              }
+            >
+              <text
+                key="tag"
+                role="oma.composer.executor.tag"
+                text="Exec"
+                wrap="none"
+              />
+              <effort
+                key="effort"
+                level={executorCapsule.thoughtLevel}
+                role="oma.composer.executor.effort"
+                title={executorCapsule.effortTitle}
+                actions={{ click: 'executor.thinking.cycle' }}
+                onClick={() => callbacks.onCycleExecutorThinking?.()}
+              />
+              <text
+                key="name"
+                text={executorCapsule.shortName}
+                wrap="none"
+              />
+              <icon key="chev" name="chev" />
+            </row>
+          ) : null}
 
           {renderComposerExtras({
             modeId,
