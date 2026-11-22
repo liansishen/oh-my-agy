@@ -453,6 +453,7 @@ export interface AppState {
   readonly recentModels: readonly string[];
   readonly hour12: boolean;
   readonly supportsAside: boolean;
+  readonly supportsPrefs: boolean;
   readonly welcomeLogoBlobId?: string;
   /** Pixel bee SVG blob IDs for HUD pill, swarm animation, and member cards. */
   readonly beeHudBlobId?: string;
@@ -494,6 +495,7 @@ export interface AppStoreOptions {
   readonly recentModels?: readonly string[];
   readonly hour12?: boolean;
   readonly supportsAside?: boolean;
+  readonly supportsPrefs?: boolean;
   readonly welcomeLogoBlobId?: string;
   readonly showThinking?: boolean;
   readonly expandAllTools?: boolean;
@@ -598,6 +600,7 @@ export class AppStore {
   private _recentModels: string[];
   private _hour12: boolean;
   private _supportsAside: boolean;
+  private _supportsPrefs: boolean;
   private _welcomeLogoBlobId: string | undefined;
   private _beeHudBlobId: string | undefined;
   private _beeActiveBlobId: string | undefined;
@@ -642,6 +645,7 @@ export class AppStore {
     this._recentModels = normalizeRecentModels(options.recentModels);
     this._hour12 = options.hour12 ?? false;
     this._supportsAside = options.supportsAside ?? false;
+    this._supportsPrefs = options.supportsPrefs ?? true;
     this._welcomeLogoBlobId = options.welcomeLogoBlobId;
     this._showThinking = options.showThinking ?? true;
     this._expandAllTools = options.expandAllTools ?? false;
@@ -695,6 +699,15 @@ export class AppStore {
     if (this._supportsAside === supportsAside) return;
     this._supportsAside = supportsAside;
     if (!supportsAside && this._settings !== null) {
+      this._settingsFocused = true;
+    }
+    this.emit();
+  }
+
+  setSupportsPrefs(supportsPrefs: boolean): void {
+    if (this._supportsPrefs === supportsPrefs) return;
+    this._supportsPrefs = supportsPrefs;
+    if (!supportsPrefs && this._settings !== null) {
       this._settingsFocused = true;
     }
     this.emit();
@@ -1023,6 +1036,7 @@ export class AppStore {
       recentModels: this._recentModels,
       hour12: this._hour12,
       supportsAside: this._supportsAside,
+      supportsPrefs: this._supportsPrefs,
       ...(this._welcomeLogoBlobId ? { welcomeLogoBlobId: this._welcomeLogoBlobId } : {}),
       ...(this._beeHudBlobId ? { beeHudBlobId: this._beeHudBlobId } : {}),
       ...(this._beeActiveBlobId ? { beeActiveBlobId: this._beeActiveBlobId } : {}),
@@ -1920,10 +1934,13 @@ export class AppStore {
     this.emit();
   }
 
-  setResumeSessions(sessions: ResumeSessionEntry[]): void {
+  setResumeSessions(
+    sessions: ResumeSessionEntry[],
+    options: { readonly loading?: boolean } = {},
+  ): void {
     if (!this._picker || this._picker.kind !== 'resume') return;
     this._picker.sessions = sessions;
-    this._picker.loading = false;
+    this._picker.loading = options.loading ?? false;
     this._picker.error = undefined;
     if (
       !this._picker.selectedId ||

@@ -115,13 +115,27 @@ class FakeTernHost {
   readonly allOps: Op[] = [];
 
   #decoder = new TextDecoder();
-  #autoAck = true;
+  #autoAck: boolean;
   readonly #features: readonly string[];
+  readonly #kinds?: readonly string[];
+  readonly #credits: number;
   readonly #hour12: boolean;
   readonly #dark: boolean;
 
-  constructor(options: { features?: readonly string[]; hour12?: boolean; dark?: boolean } = {}) {
+  constructor(
+    options: {
+      features?: readonly string[];
+      kinds?: readonly string[];
+      credits?: number;
+      autoAck?: boolean;
+      hour12?: boolean;
+      dark?: boolean;
+    } = {}
+  ) {
     this.#features = options.features ?? ['blobs', 'settle', 'dock', 'scroll', 'font', 'aside'];
+    this.#kinds = options.kinds;
+    this.#credits = options.credits ?? 8;
+    this.#autoAck = options.autoAck ?? true;
     this.#hour12 = options.hour12 ?? false;
     this.#dark = options.dark ?? true;
     this.safeOutput = new SafeTermOutput({
@@ -133,6 +147,14 @@ class FakeTernHost {
         this.#parseOutput(text);
       },
     });
+  }
+
+  setAutoAck(enabled: boolean): void {
+    this.#autoAck = enabled;
+  }
+
+  ackFrame(sf: string, s: number): void {
+    this.input.emitTspEvent({ ev: 'ack', sf, s });
   }
 
   get rawStream(): string {
@@ -179,12 +201,13 @@ class FakeTernHost {
             term: 'tern-fake',
             ver: '0.9.29',
             apc: 65536,
-            credits: 8,
+            credits: this.#credits,
             cols: 120,
             cell: { w: 8, h: 16 },
             dark: this.#dark,
             reduceMotion: false,
             hour12: this.#hour12,
+            ...(this.#kinds ? { kinds: [...this.#kinds] } : {}),
             features: [...this.#features],
           });
         });
@@ -6819,13 +6842,22 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const secondParentId = secondMdEntry![0].slice(0, secondMdEntry![0].lastIndexOf('.'));
     expect(firstParentId).not.toBe(secondParentId);
 
+    const opsBeforeGone = host.allOps.length;
     host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: [firstParentId] });
     await waitFor(() => controller.scheduler.isEvicted(firstParentId));
 
     host.input.emit('\x14'); // Ctrl+T hide thinking
     await waitFor(() => controller.store.getState().showThinking === false);
+    const opsAfterGone = host.allOps.slice(opsBeforeGone);
+    // Protocol-level Gone handling must emit zero ops (including no redundant `del`) targeting the evicted node
+    expect(
+      opsAfterGone.some(
+        op =>
+          typeof op[1] === 'string' &&
+          (op[1] === firstParentId || op[1].startsWith(`${firstParentId}.`))
+      )
+    ).toBe(false);
     const afterCtrlT = replayNodes();
-    expect(afterCtrlT.has(firstParentId)).toBe(false);
     expect(afterCtrlT.has(secondParentId)).toBe(true);
     expect(afterCtrlT.get(secondMdEntry![0])?.p['text']).toBe('Surviving later prose block.');
 
@@ -7420,6 +7452,892 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.scheduler.suspended).toBe(false);
     expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
     expect(controller.store.commands.getAll().some(c => c.name === 'after-replay-cmd')).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('OMP parity P1/P2 regressions: isolated SendEvent, /resume crash recovery + Retry, 1-credit Gone filtering, model Esc guard, quoted @mentions, Git wrap, progressive /resume search, and no-prefs /settings fallback', async () => {
+    const tmp = makeTempDir();
+    const spacedDir = join(tmp, 'my folder');
+    mkdirSync(spacedDir, { recursive: true });
+    const spacedFile = join(spacedDir, 'space note.txt');
+    writeFileSync(spacedFile, 'SPACED_FILE_CONTENT_OK\n', 'utf8');
+
+    // -----------------------------------------------------------------------
+    // Part A: Isolated SendEvent, Model Picker Esc guard, quoted @mention +
+    //         completion refresh, Git wrap prop, and progressive /resume search
+    // -----------------------------------------------------------------------
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    await previewStore.save({
+      sessionId: 'sess-cached-preview',
+      cwd: tmp,
+      title: 'Cached Title',
+      updatedAt: '2026-11-22T12:00:00Z',
+      turnCount: 2,
+      preview: [
+        { role: 'user', text: 'Investigate quantum_flux_capacitor timeout' },
+      ],
+    });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    const configOptionCalls: Array<{ configId: string; value: string }> = [];
+    const releaseRemoteList = Promise.withResolvers<void>();
+    let crashOnNextClose = false;
+    const loadedSessionsOnRetry: string[] = [];
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'sess-main-1',
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                name: 'Model',
+                type: 'select',
+                currentValue: 'model-a',
+                options: [
+                  { value: 'model-a', name: 'Model A' },
+                  { value: 'model-b', name: 'Model B' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                name: 'Thinking',
+                type: 'select',
+                currentValue: 'low',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { configId: string; value: string };
+        configOptionCalls.push(p);
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                name: 'Model',
+                type: 'select',
+                currentValue: p.configId === 'model' ? p.value : 'model-a',
+                options: [
+                  { value: 'model-a', name: 'Model A' },
+                  { value: 'model-b', name: 'Model B' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                name: 'Thinking',
+                type: 'select',
+                currentValue: p.configId === 'thought_level' ? p.value : 'low',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.method === 'session/list') {
+        void releaseRemoteList.promise.then(() => {
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              sessions: [
+                {
+                  sessionId: 'sess-cached-preview',
+                  cwd: tmp,
+                  title: 'Cached Title',
+                  updatedAt: '2026-11-22T12:00:00Z',
+                },
+              ],
+            },
+          });
+        });
+      } else if (msg.method === 'session/close') {
+        if (crashOnNextClose) {
+          crashOnNextClose = false;
+          server.crash(1);
+          return;
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        loadedSessionsOnRetry.push(sid);
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: [] },
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async args => {
+        if (args[0] === 'rev-parse') return { exitCode: 0, stdout: `${tmp}\n` };
+        if (args[0] === 'status') return { exitCode: 0, stdout: ' M a.ts\0' };
+        if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'main\n' };
+        if (args.includes('--numstat')) return { exitCode: 0, stdout: '1\t0\ta.ts\n' };
+        if (args.includes('diff')) return { exitCode: 0, stdout: '@@ -1,1 +1,2 @@\n a\n+b\n' };
+        return { exitCode: 0, stdout: '' };
+      },
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 20,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1-1: Native `send` event isolation — draft text + image attachment stay untouched!
+    controller.store.draft.setText('my unfinished draft');
+    controller.store.addAttachment({
+      id: 'img-draft-1',
+      kind: 'image',
+      name: 'draft.png',
+      mime: 'image/png',
+      base64Data: 'AAAA',
+    });
+    // Blank native send must be rejected without touching draft or attachments
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: '   ' });
+    await new Promise(r => setTimeout(r, 30));
+    expect(promptsReceived).toHaveLength(0);
+    expect(controller.store.draft.text).toBe('my unfinished draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+
+    // Standalone non-blank send must NOT include draft image and must preserve draft + attachment
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: 'standalone prompt' });
+    await waitFor(() => promptsReceived.length === 1);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'image')).toBe(false);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'text' && b['text'] === 'standalone prompt')).toBe(true);
+    expect(controller.store.draft.text).toBe('my unfinished draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+    controller.store.draft.reset();
+    controller.store.clearAttachments();
+
+    // 2) Quoted @mention with spaces resolves standalone (e.g. recalled from history) without attachment sidecar
+    await controller.submitInput('Check @"my folder/space note.txt" please');
+    await waitFor(() => promptsReceived.length === 2);
+    const spacedResBlock = promptsReceived[1]!.find(b => b['type'] === 'resource') as
+      | { resource?: { text?: string } }
+      | undefined;
+    expect(spacedResBlock?.resource?.text).toContain('SPACED_FILE_CONTENT_OK');
+
+    // 3) P2-2: Model picker Esc while highlighting a DIFFERENT model must NOT mutate current model thinking
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    // Move selection to `model-b` (NOT current `model-a`), change thinking to `high`, press Esc
+    controller.store.setPickerSelected('model-b');
+    controller.store.setModelPickerThinking('high');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+    expect(configOptionCalls).toHaveLength(0);
+    expect(controller.store.getState().controls.currentThoughtLevel).toBe('low');
+
+    // Highlighting the CURRENT model `model-a`, changing thinking to `high`, pressing Esc DOES commit
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    expect(controller.store.getState().picker?.selectedId).toBe('model-a');
+    controller.store.setModelPickerThinking('high');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().controls.currentThoughtLevel === 'high');
+    expect(configOptionCalls.some(c => c.configId === 'thought_level' && c.value === 'high')).toBe(true);
+
+    // 4) Git overlay passes `wrap` prop directly onto `<diff>` node
+    await controller.submitInput('/git');
+    await waitFor(() => controller.store.getState().gitOverlay?.diff?.kind === 'diff');
+    host.input.emit('w');
+    await waitFor(() => controller.store.getState().gitOverlay?.wrap === true);
+    const hasWrapSetOp = host.allOps.some(
+      op =>
+        op[0] === 'set' &&
+        typeof op[1] === 'string' &&
+        op[1].includes('diff-') &&
+        (op[2] as Record<string, unknown>)?.['wrap'] === true
+    );
+    expect(hasWrapSetOp).toBe(true);
+    host.input.emit('q');
+    await waitFor(() => controller.store.getState().gitOverlay === null);
+
+    // 5) Progressive /resume displays local cached preview BEFORE remote session/list returns,
+    //    AND searches preview body text (`quantum_flux_capacitor`)!
+    await controller.submitInput('/resume quantum_flux_capacitor');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        controller.store.getState().picker?.selectedId === 'sess-cached-preview'
+    );
+    expect(controller.store.getState().picker?.loading).toBe(true);
+    releaseRemoteList.resolve();
+    await waitFor(() => controller.store.getState().picker?.loading === false);
+
+    // 6) P1-2: ACP exits during `session/close` of `/resume` -> renderer MUST NOT stay suspended,
+    //    crash banner MUST render on wire, and Retry MUST recover last committed session ID (`sess-main-1`)!
+    crashOnNextClose = true;
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    expect(controller.scheduler.suspended).toBe(false);
+    expect(controller.store.getState().isReplaying).toBe(false);
+    const crashNodes = host.findWireNodes(n => n.id.endsWith('crash-banner'));
+    expect(crashNodes.length).toBeGreaterThan(0);
+
+    // Trigger Retry button -> reloads `sess-main-1`
+    const retryBtn = host.findWireNodes(n => n.id.endsWith('crash-banner.end'));
+    expect(retryBtn.length).toBeGreaterThan(0);
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: retryBtn[retryBtn.length - 1]!.id, act: 'click' });
+    await waitFor(
+      () =>
+        loadedSessionsOnRetry.includes('sess-main-1') &&
+        controller.store.getState().sessionId === 'sess-main-1' &&
+        controller.store.getState().connectionStatus === 'ready'
+    );
+    expect(controller.store.getState().sessionId).toBe('sess-main-1');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // -----------------------------------------------------------------------
+    // Part B: P1-3 (1-credit Gone filtering before ACK flush) & no-prefs /settings fallback
+    // -----------------------------------------------------------------------
+    const hostB = new FakeTernHost({
+      credits: 1,
+      autoAck: true,
+      kinds: ['col', 'row', 'text', 'md', 'card', 'button', 'tabs', 'overlay', 'editor', 'status'],
+      features: ['blobs', 'settle', 'dock', 'scroll'],
+    });
+    const sessionB = await createConnectedSession(hostB);
+    const acpB = new MockAcpHarness();
+    acpB.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-b', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-b',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'First reply chunk' } },
+          },
+        });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerB = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: sessionB,
+      output: hostB.safeOutput,
+      acpSpawn: acpB.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions-b') }),
+      configPath: join(tmp, 'config-b.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runB = controllerB.run();
+    await controllerB.readyPromise;
+
+    // Verify no-prefs fallback: `/settings` opens fallback card overlay with ZERO `k: 'prefs'` nodes
+    expect(controllerB.store.getState().supportsPrefs).toBe(false);
+    await controllerB.submitInput('/settings');
+    await waitFor(() => controllerB.store.getState().settings !== null);
+    expect(hostB.findWireNodes(n => n.k === 'prefs')).toHaveLength(0);
+    expect(hostB.findWireNodes(n => n.id === 'layer.settings.fallback-card')).not.toHaveLength(0);
+    hostB.input.emit('\x1b');
+    await waitFor(() => controllerB.store.getState().settings === null);
+
+    // P1-3: 1-credit flow control + Gone BEFORE ACK flush
+    await controllerB.submitInput('hi');
+    await waitFor(
+      () =>
+        controllerB.store.transcript.turns.length === 1 &&
+        !controllerB.store.getState().isStreaming &&
+        hostB.findWireNodes(n => n.k === 'md' && n.p?.['text'] === 'First reply chunk').length > 0 &&
+        !controllerB.surface.blocked
+    );
+    const replyMdNode = hostB.findWireNodes(
+      n => n.k === 'md' && n.p?.['text'] === 'First reply chunk'
+    )[0]!;
+    const evictedAssistantId = replyMdNode.id.slice(0, replyMdNode.id.lastIndexOf('.'));
+    expect(evictedAssistantId.startsWith('main.t0-')).toBe(true);
+
+    // Pause autoAck, send one frame to exhaust the 1 credit, then mutate the evicted turn + trigger Gone BEFORE ACK!
+    hostB.setAutoAck(false);
+    controllerB.store.pushToast('fill-credit', 'info');
+    controllerB.scheduler.renderNow();
+    const blockedSeq = controllerB.surface.seq;
+    expect(controllerB.surface.blocked).toBe(true);
+
+    // Append text to the soon-to-be-evicted node while blocked, then deliver Gone followed immediately by ACK
+    controllerB.store.transcript.turns[0]!.assistantSegments[0]!.text += ' TRAILING_AFTER_GONE';
+    controllerB.scheduler.renderNow();
+
+    const opsBeforeGoneAck = hostB.allOps.length;
+    hostB.input.emitTspEvent({ ev: 'gone', ids: [evictedAssistantId] });
+    hostB.ackFrame('oma', blockedSeq);
+    await new Promise(r => setTimeout(r, 30));
+
+    // Re-enable autoAck and render another frame to ensure NO trailing `del` is emitted either!
+    hostB.setAutoAck(true);
+    controllerB.store.pushToast('after-gone-frame', 'info');
+    controllerB.scheduler.renderNow();
+    await new Promise(r => setTimeout(r, 30));
+
+    const opsAfterGone = hostB.allOps.slice(opsBeforeGoneAck);
+    const offendingOps = opsAfterGone.filter(op => {
+      const target = typeof op[1] === 'string' ? op[1] : '';
+      return target === evictedAssistantId || target.startsWith(`${evictedAssistantId}.`);
+    });
+    expect(offendingOps).toHaveLength(0);
+    // Semantic transcript history remains intact for `/copy` and `/export`
+    expect(controllerB.store.transcript.getAssistantMarkdownByReverseIndex(1)).toContain('First reply chunk');
+
+    await controllerB.shutdown({ cleanExit: true });
+    await runB;
+  });
+
+  test('OMP parity Round 2 regressions: isolated passthrough send, comma @mention round-trip, suspended ACK guard, /resume fast-fail rejection handling, deferred settleTurn, equal-length tool output update, and per-surface Gone routing', async () => {
+    const tmp = makeTempDir();
+    writeFileSync(join(tmp, 'a'), 'UNRELATED_FILE_A_CONTENT\n', 'utf8');
+    writeFileSync(join(tmp, 'a,b.txt'), 'TARGET_COMMA_FILE_CONTENT\n', 'utf8');
+
+    const host = new FakeTernHost({ credits: 1, autoAck: true });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    let failNextSessionList = false;
+    const holdReplayLoad = Promise.withResolvers<void>();
+    let promptSeq = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-r2', configOptions: [] },
+        });
+      } else if (msg.method === 'session/list') {
+        if (failNextSessionList) {
+          failNextSessionList = false;
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'fast session/list failure' },
+          });
+          return;
+        }
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: 'sess-replay-hold',
+                cwd: tmp,
+                title: 'Held Replay Session',
+                updatedAt: '2026-11-22T15:00:00Z',
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK' },
+            },
+          },
+        });
+        void holdReplayLoad.promise.then(() => {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: sid, configOptions: [] } });
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptSeq += 1;
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        if (promptSeq === 3) {
+          // Turn with tool call whose output will later be replaced with equal-length string
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-eqlen',
+                title: 'Run check',
+                kind: 'execute',
+                status: 'completed',
+                rawOutput: 'before',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Done turn 3' },
+              },
+            },
+          });
+        } else if (promptSeq === 4) {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Turn 4 active' },
+              },
+            },
+          });
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const slowPreviewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const origLoadMap = slowPreviewStore.loadMap.bind(slowPreviewStore);
+    let delayPreviewLoad = false;
+    slowPreviewStore.loadMap = async () => {
+      if (delayPreviewLoad) {
+        delayPreviewLoad = false;
+        await new Promise(r => setTimeout(r, 40));
+      }
+      return origLoadMap();
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: slowPreviewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 20,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1-1: Standalone native `send('/compact')` passthrough MUST preserve draft + image attachment
+    controller.store.draft.setText('keep this draft');
+    controller.store.addAttachment({
+      id: 'img-keep-1',
+      kind: 'image',
+      name: 'keep.png',
+      mime: 'image/png',
+      base64Data: 'BBBB',
+    });
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: '/compact' });
+    await waitFor(() => promptsReceived.length === 1);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'text' && b['text'] === '/compact')).toBe(true);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'image')).toBe(false);
+    expect(controller.store.draft.text).toBe('keep this draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+    controller.store.draft.reset();
+    controller.store.clearAttachments();
+
+    // 2) P1-2: `@` completion for `a,b.txt` quotes as `@"a,b.txt"` so submission attaches ONLY `a,b.txt` (never `a`)
+    const { applyTriggerReplacement, detectCompletionTrigger } = await import('../src/editor/trigger');
+    const trig = detectCompletionTrigger('check @a,b', 10);
+    expect(trig?.kind).toBe('file');
+    const rep = applyTriggerReplacement('check @a,b', trig!, 'a,b.txt');
+    expect(rep.text).toBe('check @"a,b.txt" ');
+    await controller.submitInput(rep.text);
+    await waitFor(() => promptsReceived.length === 2);
+    const resBlocks = promptsReceived[1]!.filter(b => b['type'] === 'resource') as Array<{
+      resource?: { text?: string; uri?: string };
+    }>;
+    expect(resBlocks).toHaveLength(1);
+    expect(resBlocks[0]!.resource?.text).toContain('TARGET_COMMA_FILE_CONTENT');
+    expect(resBlocks.some(b => b.resource?.text?.includes('UNRELATED_FILE_A_CONTENT'))).toBe(false);
+
+    // 3) P2-2: Historical completed tool output replaced with equal-length string (`before` -> `after!`) MUST re-render
+    await controller.submitInput('run tool turn');
+    await waitFor(
+      () =>
+        promptsReceived.length === 3 &&
+        !controller.store.getState().isStreaming &&
+        !controller.surface.blocked
+    );
+    await controller.submitInput('next turn to make turn 2 historical');
+    await waitFor(
+      () =>
+        promptsReceived.length === 4 &&
+        !controller.store.getState().isStreaming &&
+        !controller.surface.blocked
+    );
+    const opsBeforeEqualReplace = host.allOps.length;
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-eqlen',
+      status: 'completed',
+      rawOutput: 'after!',
+    });
+    controller.scheduler.renderNow();
+    await waitFor(() => !controller.surface.blocked);
+    const opsAfterEqualReplace = JSON.stringify(host.allOps.slice(opsBeforeEqualReplace));
+    expect(opsAfterEqualReplace).toContain('after!');
+
+    // 4) P1-4: `/resume` fast ACP failure while preview load is still in flight MUST NOT trigger unhandledRejection
+    const unhandledErrors: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandledErrors.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      failNextSessionList = true;
+      delayPreviewLoad = true;
+      await controller.submitInput('/resume');
+      await waitFor(() =>
+        Boolean(controller.store.getState().picker?.error?.includes('fast session/list failure'))
+      );
+      await new Promise(r => setTimeout(r, 30));
+      expect(unhandledErrors).toHaveLength(0);
+      host.input.emit('\x1b');
+      await waitFor(() => controller.store.getState().picker === null);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    // 5) P2-1: `settleTurn` while blocked on 1-credit deferred render MUST settle real `main.t<idx>-*` (never `main.turn-<idx>`)
+    await waitFor(() => !controller.surface.blocked);
+    host.setAutoAck(false);
+    controller.store.pushToast('exhaust-credit-for-settle', 'info');
+    controller.scheduler.renderNow();
+    const settleBlockedSeq = controller.surface.seq;
+    expect(controller.surface.blocked).toBe(true);
+
+    // Add a new turn while blocked, schedule deferred render, and call settleTurn(newTurnIdx) before ACK
+    const deferredTurn = controller.store.transcript.beginUserTurn('deferred settle prompt', []);
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Deferred turn body' },
+    });
+    controller.store.transcript.finishActiveTurn('end_turn');
+    controller.scheduler.renderNow();
+    controller.scheduler.settleTurn(deferredTurn.index);
+
+    const opsBeforeSettleAck = host.allOps.length;
+    host.ackFrame('oma', settleBlockedSeq);
+    await new Promise(r => setTimeout(r, 30));
+    const settleOps = host.allOps
+      .slice(opsBeforeSettleAck)
+      .filter(op => op[0] === 'settle')
+      .map(op => op[1]);
+    expect(settleOps).not.toContain(`main.turn-${deferredTurn.index}`);
+    expect(settleOps.some(id => typeof id === 'string' && id.startsWith(`main.t${deferredTurn.index}-`))).toBe(true);
+
+    // 6) P1-3: While blocked on 1 credit with a deferred builder queued, switching session & suspending
+    //    replay MUST cancel the old builder so an incoming ACK emits ZERO partial replay frames!
+    const currentSeq = controller.surface.seq;
+    host.ackFrame('oma', currentSeq);
+    await waitFor(() => !controller.surface.blocked);
+
+    // Fill credit again, queue a deferred render, then start `/resume` (which suspends replay)
+    controller.store.pushToast('fill-before-resume', 'info');
+    controller.scheduler.renderNow();
+    const preResumeSeq = controller.surface.seq;
+    expect(controller.surface.blocked).toBe(true);
+    controller.store.pushToast('queued-deferred-builder', 'info');
+    controller.scheduler.renderNow(); // queued as deferred builder on surface
+
+    // Suspend for replay (simulating `/resume` transition) and add partial replayed turn
+    controller.scheduler.resetSession();
+    controller.scheduler.suspendForReplay();
+    controller.store.transcript.clear();
+    controller.store.transcript.beginUserTurn('PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK', []);
+
+    const opsBeforeSuspendedAck = host.allOps.length;
+    host.ackFrame('oma', preResumeSeq);
+    await new Promise(r => setTimeout(r, 30));
+    const leakedDuringSuspend = JSON.stringify(host.allOps.slice(opsBeforeSuspendedAck));
+    expect(leakedDuringSuspend).not.toContain('PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK');
+
+    // 7) P2-5: Per-surface `Gone` routing — a `gone` event for surface `other-sf` MUST NOT evict
+    //    a same-named node or disable its callback on surface `oma`!
+    host.setAutoAck(true);
+    controller.scheduler.resumeAfterReplay(false);
+    await waitFor(() => !controller.surface.blocked);
+
+    const otherSurface = session.open({ id: 'other-sf', mode: 'inline' });
+    let otherClicked = 0;
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="shared-btn"
+            text="Other"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              otherClicked += 1;
+            }}
+          />
+        </col>
+      ),
+    });
+    await waitFor(() => !otherSurface.blocked);
+
+    // Evict `main.shared-btn` ONLY on `oma` — `other-sf`'s `main.shared-btn` callback must remain alive!
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.shared-btn'] });
+    await new Promise(r => setTimeout(r, 20));
+    host.input.emitTspEvent({ ev: 'action', sf: 'other-sf', id: 'main.shared-btn', act: 'click' });
+    await waitFor(() => otherClicked === 1);
+    expect(otherClicked).toBe(1);
+
+    // 8) P2 (cancelDeferred): cancelling a blocked pending view MUST:
+    //    (a) restore event routing to the on-screen `#sent` view (never fire cancelled view's callback), AND
+    //    (b) drop queued `settle` ops targeting nodes that were never flushed!
+    host.setAutoAck(false);
+    let sentBtnClicks = 0;
+    let cancelledBtnClicks = 0;
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="live-btn"
+            text="Sent v1"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              sentBtnClicks += 1;
+            }}
+          />
+        </col>
+      ),
+    });
+    const otherSentSeq = otherSurface.seq;
+    expect(otherSurface.blocked).toBe(true);
+
+    // Queue an un-flushed replacement view with a DIFFERENT callback + a `settle` for an unsent node
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="live-btn"
+            text="Cancelled v2"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              cancelledBtnClicks += 1;
+            }}
+          />
+          <text key="never-sent" text="ghost" />
+        </col>
+      ),
+    });
+    otherSurface.settle('main.never-sent');
+    otherSurface.cancelDeferred();
+
+    // Clicking the on-screen button MUST invoke the `#sent` v1 callback, NOT the cancelled v2 callback!
+    host.input.emitTspEvent({ ev: 'action', sf: 'other-sf', id: 'main.live-btn', act: 'click' });
+    await waitFor(() => sentBtnClicks === 1);
+    expect(sentBtnClicks).toBe(1);
+    expect(cancelledBtnClicks).toBe(0);
+
+    // Flushing ACK MUST NOT emit `settle main.never-sent`
+    const opsBeforeCancelAck = host.allOps.length;
+    host.ackFrame('other-sf', otherSentSeq);
+    await new Promise(r => setTimeout(r, 25));
+    const cancelledSettleOps = host.allOps
+      .slice(opsBeforeCancelAck)
+      .filter(op => op[0] === 'settle' && op[1] === 'main.never-sent');
+    expect(cancelledSettleOps).toHaveLength(0);
+
+    host.setAutoAck(true);
+    await otherSurface.close({ keep: false });
+
+    holdReplayLoad.resolve();
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('OMP parity Round 3 regressions: leading-@ filename mention isolation and historical tool kind/tookMs metadata update', async () => {
+    const tmp = makeTempDir();
+    writeFileSync(join(tmp, '@draft.md'), 'AT_PREFIX_DRAFT_CONTENT\n', 'utf8');
+    writeFileSync(join(tmp, 'draft.md'), 'PLAIN_DRAFT_MUST_NOT_SEND\n', 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clockNow = 10_000;
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    let promptCount = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-r3', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        promptCount += 1;
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        if (promptCount === 2) {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r3',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-meta-1',
+                title: 'Inspect',
+                kind: 'read',
+                status: 'completed',
+                rawOutput: 'ok',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r3',
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Turn 2 done' } },
+            },
+          });
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      now: () => clockNow,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1: Completing `@draft.md` quotes as `@"@draft.md"` so ONLY `@draft.md` is attached (never `draft.md`)
+    const { applyTriggerReplacement, detectCompletionTrigger, formatFileMention, extractFileMentions } =
+      await import('../src/editor/trigger');
+    expect(formatFileMention('@draft.md')).toBe('@"@draft.md"');
+    expect(extractFileMentions('check @"@draft.md" now').map(m => m.path)).toEqual(['@draft.md']);
+
+    const trig = detectCompletionTrigger('read @@draft', 12);
+    expect(trig?.kind).toBe('file');
+    const rep = applyTriggerReplacement('read @@draft', trig!, '@draft.md');
+    expect(rep.text).toBe('read @"@draft.md" ');
+    await controller.submitInput(rep.text);
+    await waitFor(() => promptsReceived.length === 1);
+    const resBlocks = promptsReceived[0]!.filter(b => b['type'] === 'resource') as Array<{
+      resource?: { text?: string };
+    }>;
+    expect(resBlocks).toHaveLength(1);
+    expect(resBlocks[0]!.resource?.text).toContain('AT_PREFIX_DRAFT_CONTENT');
+    expect(resBlocks.some(b => b.resource?.text?.includes('PLAIN_DRAFT_MUST_NOT_SEND'))).toBe(false);
+
+    // 2) P2: Historical completed tool changes kind (`read` -> `search`) and tookMs (`0` -> `1150`) -> MUST re-render!
+    await controller.submitInput('turn with read tool');
+    await waitFor(() => promptsReceived.length === 2 && !controller.store.getState().isStreaming);
+    await controller.submitInput('make previous turn historical');
+    await waitFor(() => promptsReceived.length === 3 && !controller.store.getState().isStreaming);
+
+    clockNow = 11_150;
+    const opsBeforeMetaUpdate = host.allOps.length;
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-meta-1',
+      kind: 'search',
+      status: 'completed',
+      rawOutput: 'ok',
+    });
+    // Explicitly update elapsed duration as ACP completion metadata arrives
+    const updatedTool = controller.store.transcript.getToolById('tc-meta-1');
+    expect(updatedTool?.displayName).toBe('search');
+    if (updatedTool) updatedTool.tookMs = 1150;
+    controller.scheduler.renderNow();
+    await new Promise(r => setTimeout(r, 25));
+
+    const metaUpdateOps = host.allOps.slice(opsBeforeMetaUpdate);
+    const serializedMetaOps = JSON.stringify(metaUpdateOps);
+    expect(serializedMetaOps).toContain('"name":"search"');
+    expect(serializedMetaOps).toContain('"took":1150');
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

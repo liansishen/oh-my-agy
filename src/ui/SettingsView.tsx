@@ -769,6 +769,85 @@ export function SettingsView(props: SettingsViewProps): JSX.Element {
     />
   );
 
+  // Degrade gracefully when the connected terminal does not advertise the native `prefs` kind
+  if (!state.supportsPrefs) {
+    return (
+      <overlay key="settings" anchor="center" size="lg" modal>
+        <card
+          key="fallback-card"
+          head="Settings"
+          meta={computed.lead ? [{ t: computed.lead, s: 'muted' }] : undefined}
+          end={
+            <button
+              key="close"
+              text="Close"
+              size="sm"
+              variant="quiet"
+              onClick={() => callbacks.onClose()}
+            />
+          }
+        >
+          <col key="body" gap="sm">
+            <tabs
+              key="pages"
+              active={computed.page}
+              items={computed.pages.map(p => ({ id: p.id, label: p.label ?? p.id }))}
+              onSelect={ev => callbacks.onPageChange(ev.item as SettingsPageId)}
+            />
+            {computed.sections.map((section, sIdx) => (
+              <col key={`sec-${sIdx}`} gap="xs">
+                {section.title ? (
+                  <text key="title" spans={[{ t: section.title, s: 'strong muted' }]} />
+                ) : null}
+                {section.rows.map(row => {
+                  const ctrl = row.control;
+                  const valueText =
+                    ctrl?.k === 'switch'
+                      ? ctrl.on
+                        ? 'On'
+                        : 'Off'
+                      : ctrl?.k === 'choice'
+                        ? ctrl.options?.find(o => o.value === ctrl.value)?.label ?? String(ctrl.value ?? '')
+                        : ctrl?.k === 'number'
+                          ? String(ctrl.value ?? '')
+                          : ctrl?.k === 'text'
+                            ? String(ctrl.value || ctrl.placeholder || '')
+                            : ctrl?.k === 'action'
+                              ? ctrl.label
+                              : '';
+                  return (
+                    <row key={`row-${row.id}`} gap="sm" align="center" justify="between">
+                      <col key="info">
+                        <text
+                          key="lbl"
+                          spans={[{ t: row.label ?? row.id, s: row.id === settings.focus ? 'accent strong' : 'strong' }]}
+                        />
+                        {row.hint ? (
+                          <text key="hint" spans={[{ t: row.hint, s: 'muted' }]} wrap="word" />
+                        ) : null}
+                      </col>
+                      {ctrl && !row.disabled ? (
+                        <button
+                          key="act"
+                          text={valueText || 'Toggle'}
+                          size="sm"
+                          variant={row.id === settings.focus ? 'primary' : 'quiet'}
+                          onClick={() => callbacks.onActivate(row.id)}
+                        />
+                      ) : valueText ? (
+                        <text key="val" spans={[{ t: valueText, s: 'muted' }]} />
+                      ) : null}
+                    </row>
+                  );
+                })}
+              </col>
+            ))}
+          </col>
+        </card>
+      </overlay>
+    );
+  }
+
   if (state.supportsAside) {
     return prefsNode;
   }

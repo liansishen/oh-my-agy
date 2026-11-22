@@ -35,7 +35,13 @@ function indexMainChildIdsByTurn(ids: readonly string[]): Map<number, string[]> 
   return byTurn;
 }
 
-export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'>;
+export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'> & {
+  readonly blocked?: boolean;
+  renderDeferred?: (build: () => Renderable | undefined) => void;
+  cancelDeferred?: () => void;
+  evictNodes?: (ids: readonly string[]) => void;
+  resetEvicted?: () => void;
+};
 
 export interface RenderSchedulerOptions {
   /** Frame coalescing interval in ms for streaming updates (default: 33ms / ~30fps). */
@@ -62,8 +68,11 @@ export class RenderScheduler {
   #dirty = false;
   #suspended = false;
   #disposed = false;
+  #renderEpoch = 0;
+  #hasPendingDeferredRender = false;
   #settledIds = new Set<string>();
   #evictedIds = new Set<string>();
+  #pendingSettleTurns = new Set<number>();
   #lastMainChildIds: string[] = [];
   #lastMainChildIdsByTurn = new Map<number, string[]>();
 
@@ -110,15 +119,37 @@ export class RenderScheduler {
     }
     this.#clearTimer();
     this.#dirty = false;
-    const view = this.#buildView();
-    this.#lastMainChildIds = extractMainChildIds(view);
-    this.#lastMainChildIdsByTurn = indexMainChildIdsByTurn(this.#lastMainChildIds);
-    this.#surface.render(view);
+    const epoch = this.#renderEpoch;
+    const buildAndIndex = (fromDeferred: boolean): Renderable | undefined => {
+      if (this.#disposed || this.#surface.closed) return undefined;
+      if (fromDeferred && (this.#suspended || epoch !== this.#renderEpoch)) {
+        return undefined;
+      }
+      this.#hasPendingDeferredRender = false;
+      const view = this.#buildView();
+      this.#lastMainChildIds = extractMainChildIds(view);
+      this.#lastMainChildIdsByTurn = indexMainChildIdsByTurn(this.#lastMainChildIds);
+      this.#flushPendingSettleTurns();
+      return view;
+    };
+    if (!force && this.#surface.blocked && this.#surface.renderDeferred) {
+      this.#hasPendingDeferredRender = true;
+      this.#surface.renderDeferred(() => buildAndIndex(true));
+      return;
+    }
+    const built = buildAndIndex(false);
+    if (built !== undefined) {
+      this.#surface.render(built);
+    }
   }
 
   /** Suspends intermediate renders while replaying history during `session/load`. */
   suspendForReplay(): void {
     this.#suspended = true;
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
+    this.#surface.cancelDeferred?.();
     this.#clearTimer();
   }
 
@@ -136,6 +167,18 @@ export class RenderScheduler {
    * so Tern can reduce diff overhead and consider them for scrollback memory eviction.
    */
   settleTurn(turnIndex: number): boolean {
+    if (this.#disposed || this.#surface.closed) return false;
+    // When a deferred render is waiting for flow-control credit, defer turn settlement until
+    // the actual frame builds and indexes the turn's `main.t<index>-*` nodes so we never emit
+    // a stale fallback `settle main.turn-<index>` for a turn whose real nodes haven't flushed yet.
+    if (this.#hasPendingDeferredRender) {
+      this.#pendingSettleTurns.add(turnIndex);
+      return true;
+    }
+    return this.#settleIndexedTurn(turnIndex);
+  }
+
+  #settleIndexedTurn(turnIndex: number): boolean {
     const matching = this.#lastMainChildIdsByTurn.get(turnIndex);
     if (matching && matching.length > 0) {
       let settledAny = false;
@@ -147,6 +190,15 @@ export class RenderScheduler {
       return settledAny;
     }
     return this.settleNode(`main.turn-${turnIndex}`);
+  }
+
+  #flushPendingSettleTurns(): void {
+    if (this.#pendingSettleTurns.size === 0) return;
+    const turns = [...this.#pendingSettleTurns];
+    this.#pendingSettleTurns.clear();
+    for (const turnIndex of turns) {
+      this.#settleIndexedTurn(turnIndex);
+    }
   }
 
   settleNode(nodeId: string): boolean {
@@ -169,6 +221,7 @@ export class RenderScheduler {
       }
     }
     if (newlyEvicted.length > 0) {
+      this.#surface.evictNodes?.(newlyEvicted);
       this.#onEvicted?.(newlyEvicted);
     }
     return newlyEvicted;
@@ -192,14 +245,23 @@ export class RenderScheduler {
 
   /** Resets settled/evicted tracking when switching or starting a fresh session. */
   resetSession(): void {
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
     this.#settledIds.clear();
     this.#evictedIds.clear();
+    this.#surface.cancelDeferred?.();
+    this.#surface.resetEvicted?.();
     this.#lastMainChildIds = [];
     this.#lastMainChildIdsByTurn.clear();
   }
 
   dispose(): void {
     this.#disposed = true;
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
+    this.#surface.cancelDeferred?.();
     this.#clearTimer();
   }
 

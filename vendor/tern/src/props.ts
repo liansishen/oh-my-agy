@@ -633,6 +633,7 @@ export interface DiffProps {
    readonly path?: string;
    readonly lang?: string;
    readonly mode?: 'unified' | 'split' | 'auto' | (string & {});
+   readonly wrap?: boolean;
 }
 
 /** Props of `ansi`. */

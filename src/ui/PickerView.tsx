@@ -300,9 +300,19 @@ export function computePickerData(
       const titleMatch = fuzzyMatchText(label, query);
       const cwdMatch = fuzzyMatchText(s.displayCwd, query);
       const idMatch = fuzzyMatchText(s.sessionId, query);
+      let bestPreviewScore = -Infinity;
+      if (s.preview && s.preview.length > 0) {
+        for (const msg of s.preview) {
+          const pm = fuzzyMatchText(msg.text, query);
+          if (pm && pm.score - 10 > bestPreviewScore) {
+            bestPreviewScore = pm.score - 10;
+          }
+        }
+      }
       const bestScore = Math.max(
         titleMatch ? titleMatch.score + 50 : -Infinity,
         cwdMatch ? cwdMatch.score : -Infinity,
+        bestPreviewScore,
         idMatch ? idMatch.score - 20 : -Infinity
       );
       if (bestScore > -Infinity) {

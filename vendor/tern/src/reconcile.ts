@@ -29,6 +29,18 @@ export class ViewError extends Error {
    override name = 'ViewError';
 }
 
+/** Whether `id` itself or any ancestor dot-prefix of `id` is in `evicted`. */
+export function isEvictedId(id: string, evicted: ReadonlySet<string>): boolean {
+   if (evicted.size === 0) return false;
+   if (evicted.has(id)) return true;
+   let dot = id.lastIndexOf('.');
+   while (dot > 0) {
+      if (evicted.has(id.slice(0, dot))) return true;
+      dot = id.lastIndexOf('.', dot - 1);
+   }
+   return false;
+}
+
 /** One node of a view with its id assigned. */
 export class Tree {
    readonly id: string;
@@ -36,10 +48,23 @@ export class Tree {
    readonly children: readonly Tree[];
    /** The props as sent: slot props (`head`, `end`, `foot`) given a node set to its id. */
    readonly props: JsonObject;
+   /** True when one or more descendants were pruned due to Tern `Gone` eviction. */
+   readonly pruned: boolean;
 
-   constructor(id: string, node: Node) {
+   constructor(
+      id: string,
+      node: Node,
+      prebuilt?: { readonly props: JsonObject; readonly children: readonly Tree[]; readonly pruned: boolean }
+   ) {
       this.id = id;
       this.node = node;
+      if (prebuilt) {
+         this.props = prebuilt.props;
+         this.children = prebuilt.children;
+         this.pruned = prebuilt.pruned;
+         return;
+      }
+      this.pruned = false;
       if (node.slots.length === 0) this.props = node.props;
       else {
          const props: Record<string, Json> = { ...node.props };
@@ -59,6 +84,26 @@ export class Tree {
          children.push(new Tree(childId, child));
       });
       this.children = children;
+   }
+
+   /** Returns a tree with every node matching `evicted` (or under an evicted ancestor) removed. */
+   prune(evicted: ReadonlySet<string>): Tree | undefined {
+      if (evicted.size === 0) return this;
+      if (isEvictedId(this.id, evicted)) return undefined;
+      if (this.children.length === 0) return this;
+      let changed = false;
+      const nextChildren: Tree[] = [];
+      for (const child of this.children) {
+         const prunedChild = child.prune(evicted);
+         if (prunedChild !== child) changed = true;
+         if (prunedChild) nextChildren.push(prunedChild);
+      }
+      if (!changed) return this;
+      return new Tree(this.id, this.node, {
+         props: this.props,
+         children: nextChildren,
+         pruned: true,
+      });
    }
 
    /** The kind. */
@@ -161,6 +206,19 @@ export class View {
       return this.#index.get(id);
    }
 
+   /** Returns a view with all nodes matching `evicted` removed (zero-copy when none match). */
+   prune(evicted: ReadonlySet<string>): View {
+      if (evicted.size === 0) return this;
+      let changed = false;
+      const nextRegions = this.regions.map(region => {
+         if (!region) return undefined;
+         const pruned = region.prune(evicted);
+         if (pruned !== region) changed = true;
+         return pruned;
+      });
+      return changed ? new View(nextRegions) : this;
+   }
+
    /** The ops turning this view into `next` in surface `surface`. */
    ops(next: View, surface: string): Op[] {
       const ops: Op[] = [];
@@ -180,6 +238,7 @@ export class View {
 
 /** Ops turning `old` into `now`, which share id and kind. */
 function diff(old: Tree, now: Tree, ops: Op[]): void {
+   if (old.node === now.node && !old.pruned && !now.pruned) return;
    const text = isTextKind(now.kind);
    const set: Record<string, Json> = {};
    let changed = false;

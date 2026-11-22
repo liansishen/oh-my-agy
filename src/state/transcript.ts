@@ -246,6 +246,8 @@ export interface TranscriptTurn {
   endedAt?: number;
   /** True when reconstructed during `session/load` replay where original turn duration is unknown. */
   readonly replayed?: boolean;
+  /** Monotonic per-turn mutation counter used for reliable view-level memo invalidation. */
+  revision: number;
   /** Marked via `surface.settle('main.turn-<index>')`. */
   settled: boolean;
   /** Marked when Tern drops this node via `GoneEvent`. */
@@ -1403,6 +1405,7 @@ export class TranscriptStore {
       startedAt: now,
       createdAt: now,
       ...(options.isReplaying ? { replayed: true } : {}),
+      revision: 0,
       settled: false,
       evicted: false,
     };
@@ -1517,6 +1520,7 @@ export class TranscriptStore {
       this.cancelActiveBackgroundTasks('cancelled');
     }
 
+    this.bumpTurn(turn);
     this._activeTurnIndex = null;
     return turn;
   }
@@ -1562,6 +1566,7 @@ export class TranscriptStore {
       turn.status = terminalTurnStatus;
       turn.endedAt = turn.endedAt ?? now;
     }
+    this.bumpTurn(turn);
     this._activeTurnIndex = null;
     return turn;
   }
@@ -1605,6 +1610,7 @@ export class TranscriptStore {
           this.syncSubagentsForTool(turn, tool);
         }
       }
+      this.bumpTurn(turn);
     }
     this._activeTurnIndex = null;
   }
@@ -1996,6 +2002,7 @@ export class TranscriptStore {
     const turn = this._turns[turnIndex];
     if (turn) {
       this.syncSubagentsForTool(turn, tool);
+      this.bumpTurn(turn);
     }
     return tool;
   }
@@ -2006,6 +2013,7 @@ export class TranscriptStore {
       if (thought) {
         thought.open = open !== undefined ? open : !thought.open;
         thought.userToggled = true;
+        this.bumpTurn(turn);
         return true;
       }
     }
@@ -2017,6 +2025,7 @@ export class TranscriptStore {
     if (!found) return false;
     found.tool.collapsed = collapsed !== undefined ? collapsed : !found.tool.collapsed;
     found.tool.userToggled = true;
+    this.bumpTurn(this._turns[found.turnIndex]);
     return true;
   }
 
@@ -2029,6 +2038,7 @@ export class TranscriptStore {
         tool.collapsed = collapsed;
         tool.userToggled = false;
       }
+      this.bumpTurn(turn);
     }
   }
 
@@ -2041,6 +2051,7 @@ export class TranscriptStore {
         thought.open = open;
         thought.userToggled = false;
       }
+      this.bumpTurn(turn);
     }
   }
 
@@ -2069,6 +2080,7 @@ export class TranscriptStore {
       const notice = turn.notices.find((n) => n.id === noticeId);
       if (notice) {
         notice.collapsed = collapsed !== undefined ? collapsed : !notice.collapsed;
+        this.bumpTurn(turn);
         return true;
       }
     }
@@ -2080,6 +2092,7 @@ export class TranscriptStore {
       const agent = turn.agents.find((a) => a.id === agentId);
       if (agent) {
         agent.collapsed = collapsed !== undefined ? collapsed : !(agent.collapsed ?? true);
+        this.bumpTurn(turn);
         return true;
       }
     }
@@ -2572,6 +2585,12 @@ export class TranscriptStore {
   // Internal helpers
   // -------------------------------------------------------------------------
 
+  private bumpTurn(turn: TranscriptTurn | undefined): void {
+    if (turn) {
+      turn.revision += 1;
+    }
+  }
+
   private ensureActiveTurn(isReplaying = false): TranscriptTurn {
     if (this._activeTurnIndex !== null) {
       const existing = this._turns[this._activeTurnIndex];
@@ -2593,6 +2612,7 @@ export class TranscriptStore {
       startedAt: now,
       createdAt: now,
       ...(isReplaying ? { replayed: true } : {}),
+      revision: 0,
       settled: false,
       evicted: false,
     };
@@ -2677,6 +2697,7 @@ export class TranscriptStore {
       const meta = mapToolDisplayMeta(tool.kind, tool.rawName);
       tool.displayName = meta.displayName;
       tool.targetKind = meta.targetKind;
+      this.bumpTurn(existingTurn);
 
       if (fields.title !== undefined) {
         tool.title = normalizeDisplayPath(fields.title);

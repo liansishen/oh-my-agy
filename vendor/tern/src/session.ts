@@ -585,9 +585,34 @@ export class Session implements AsyncIterable<SessionInput>, AsyncDisposable {
          case 'features':
             this.#caps = { ...this.#caps, features: event.features };
             break;
-         case 'gone':
-            for (const id of event.ids) this.#surfaces.get(id)?.gone();
+         case 'gone': {
+            if (event.sf !== undefined) {
+               const target = this.#surfaces.get(event.sf);
+               if (target) {
+                  const nodeIds: string[] = [];
+                  let surfaceDropped = false;
+                  for (const id of event.ids) {
+                     if (id === event.sf) surfaceDropped = true;
+                     else nodeIds.push(id);
+                  }
+                  if (surfaceDropped) target.gone();
+                  else if (nodeIds.length > 0) target.evictNodes(nodeIds);
+               }
+            } else {
+               const nodeIds: string[] = [];
+               for (const id of event.ids) {
+                  const surface = this.#surfaces.get(id);
+                  if (surface) surface.gone();
+                  else nodeIds.push(id);
+               }
+               if (nodeIds.length > 0) {
+                  for (const surface of this.#surfaces.values()) {
+                     surface.evictNodes(nodeIds);
+                  }
+               }
+            }
             break;
+         }
          default: {
             const sf = 'sf' in event ? event.sf : undefined;
             const surface = sf === undefined ? undefined : this.#surfaces.get(sf);

@@ -435,6 +435,7 @@ export function GitOverlayView(props: GitOverlayViewProps): JSX.Element {
           text={git.diff.unifiedDiff}
           path={git.diff.filePath}
           mode={git.viewMode === 'split' ? 'split' : 'unified'}
+          wrap={git.wrap}
         />
       );
     }

@@ -110,6 +110,91 @@ const diffLineStatsCache = new WeakMap<
   ToolDiffItem,
   { readonly added: number; readonly removed: number }
 >();
+const completedTurnNodesCache = new WeakMap<
+  TranscriptTurn,
+  { readonly key: string; readonly nodes: readonly JSX.Element[] }
+>();
+
+function hashTextFingerprint(text: string): string {
+  // Fast dual 32-bit FNV-1a + length fingerprint sensitive to any character mutation,
+  // including equal-length in-place replacements (e.g. `before` -> `after!`).
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= c + i;
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `${text.length}:${(h1 >>> 0).toString(36)}:${(h2 >>> 0).toString(36)}`;
+}
+
+function computeCompletedTurnMemoKey(
+  turn: TranscriptTurn,
+  state: AppState,
+  toolPreviewLines: number,
+  evictedNodeIds?: ReadonlySet<string>,
+): string {
+  const parts: string[] = [
+    String(turn.index),
+    String(turn.revision),
+    turn.status,
+    String(turn.endedAt ?? ''),
+    hashTextFingerprint(turn.errorMessage ?? ''),
+    String(turn.timeline.length),
+    String(turn.assistantSegments.length),
+    state.showThinking ? '1' : '0',
+    state.expandAllTools ? '1' : '0',
+    state.toolDisplayMode,
+    state.hour12 ? '1' : '0',
+    state.displayCwd,
+    String(toolPreviewLines),
+    hashTextFingerprint(turn.user?.text ?? ''),
+    String(turn.user?.attachments.length ?? 0),
+  ];
+
+  for (const th of turn.thoughts) {
+    parts.push(`th:${th.id}:${th.open ? 1 : 0}:${th.endedAt ?? ''}:${hashTextFingerprint(th.text)}`);
+  }
+  for (const seg of turn.assistantSegments) {
+    parts.push(`as:${seg.id}:${hashTextFingerprint(seg.text)}`);
+  }
+  for (const tc of turn.toolCalls) {
+    let diffSig = String(tc.diffs.length);
+    for (const d of tc.diffs) {
+      diffSig += `,${d.path}:${hashTextFingerprint(d.patchText ?? '')}:${hashTextFingerprint(d.oldText ?? '')}:${hashTextFingerprint(d.newText ?? '')}`;
+    }
+    parts.push(
+      `tc:${tc.toolCallId}:${tc.displayName}:${tc.kind ?? ''}:${tc.targetKind}:${tc.status}:${tc.collapsed ? 1 : 0}:${tc.cancelled ? 1 : 0}:${tc.exitCode ?? ''}:${tc.tookMs ?? ''}:${tc.endedAt ?? ''}:${tc.locations.length}:${hashTextFingerprint(tc.outputText)}:${diffSig}:${tc.awaitingPermission ? 1 : 0}:${tc.approved ?? ''}:${hashTextFingerprint(tc.title)}:${hashTextFingerprint(tc.target ?? '')}:${hashTextFingerprint(tc.intent ?? '')}`,
+    );
+  }
+  for (const n of turn.notices) {
+    parts.push(`no:${n.id}:${n.collapsed ? 1 : 0}:${hashTextFingerprint(n.text)}:${hashTextFingerprint(n.summaryText)}`);
+  }
+  for (const a of turn.agents) {
+    parts.push(
+      `ag:${a.id}:${a.status}:${a.collapsed ? 1 : 0}:${hashTextFingerprint(a.name)}:${hashTextFingerprint(a.task ?? '')}:${hashTextFingerprint(a.outputPreview ?? '')}`,
+    );
+  }
+
+  const groupPrefix = `turn-${turn.index}:`;
+  for (const [k, v] of Object.entries(state.expandedToolGroups)) {
+    if (k.startsWith(groupPrefix)) {
+      parts.push(`eg:${k}:${v ? 1 : 0}`);
+    }
+  }
+  if (evictedNodeIds && evictedNodeIds.size > 0) {
+    const evPrefix = `main.t${turn.index}-`;
+    for (const id of evictedNodeIds) {
+      if (id.startsWith(evPrefix)) {
+        parts.push(`ev:${id}`);
+      }
+    }
+  }
+
+  return parts.join('|');
+}
 
 function formatUnifiedDiff(diff: ToolDiffItem): string {
   const cached = formattedDiffCache.get(diff);
@@ -1154,6 +1239,17 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
       {turns.flatMap(turn => {
         const turnPrefix = `t${turn.index}-`;
         const isLastTurn = lastTurn?.index === turn.index;
+        const canMemoizeTurn = turn.status !== 'streaming' && !isLastTurn;
+        const turnMemoKey = canMemoizeTurn
+          ? computeCompletedTurnMemoKey(turn, state, toolPreviewLines, evictedNodeIds)
+          : '';
+        if (canMemoizeTurn) {
+          const cached = completedTurnNodesCache.get(turn);
+          if (cached && cached.key === turnMemoKey) {
+            return cached.nodes;
+          }
+        }
+
         const lastTimelineRef = turn.timeline[turn.timeline.length - 1];
         const groups = groupTurnTimeline(turn, {
           showThinking: state.showThinking,
@@ -1484,6 +1580,10 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
               </col>
             );
           }
+        }
+
+        if (canMemoizeTurn) {
+          completedTurnNodesCache.set(turn, { key: turnMemoKey, nodes: turnNodes });
         }
 
         return turnNodes;

@@ -71,6 +71,7 @@ import {
   type ExecCommandFn,
 } from '../ecosystem/cli';
 import { nextCodePointOffset, prevCodePointOffset } from '../editor/draft';
+import { extractFileMentions } from '../editor/trigger';
 import { WorkspaceFileIndexer } from '../filesearch/indexer';
 import {
   getDataDir,
@@ -330,13 +331,10 @@ function looksBinary(bytes: Uint8Array): boolean {
 function extractMentionedPaths(text: string): string[] {
   const found: string[] = [];
   const seen = new Set<string>();
-  const re = /(?:^|[\s([{"'`,;:<>|])@([^\s)\]}"'`,;<>|]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const token = match[1];
-    if (token && !seen.has(token)) {
-      seen.add(token);
-      found.push(token);
+  for (const mention of extractFileMentions(text)) {
+    if (mention.path && !seen.has(mention.path)) {
+      seen.add(mention.path);
+      found.push(mention.path);
     }
   }
   return found;
@@ -398,6 +396,8 @@ export class AppController {
   #promptSubmitting = false;
   #acpClientAlive = false;
   #sessionEpoch = 0;
+  #lastCommittedSessionId: string | null = null;
+  #lastCommittedCwd: string | null = null;
   #replayingSessionId: string | null = null;
   #replayingSessionEpoch: number | null = null;
   #creatingSessionEpoch: number | null = null;
@@ -495,6 +495,8 @@ export class AppController {
       recentModels: this.#config.recent_models,
       hour12: this.session.caps.hour12,
       supportsAside: this.session.caps.features.includes('aside'),
+      supportsPrefs:
+        this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
       now: this.#now,
     });
@@ -844,20 +846,26 @@ export class AppController {
   #removeMentionTokenFromDraft(rawPath: string): void {
     const draftText = this.store.draft.text;
     if (!draftText.includes('@')) return;
-    const escaped = rawPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`(^|[\\s([{"'\`,;:<>|])(@${escaped})(?=$|[\\s)\\]}"'\`,;<>|])`, 'g');
+    const targetKey = this.#normalizeMentionPathKey(rawPath);
     const ranges: Array<[number, number]> = [];
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(draftText)) !== null) {
-      const lead = match[1] ?? '';
-      const token = match[2] ?? '';
-      let start = match.index + lead.length;
-      let end = start + token.length;
+    for (const mention of extractFileMentions(draftText)) {
+      if (
+        mention.path !== rawPath &&
+        this.#normalizeMentionPathKey(mention.path) !== targetKey
+      ) {
+        continue;
+      }
+      let start = mention.start;
+      let end = mention.end;
       // Consume at most ONE single space adjacent to the `@path` token so completion's
       // trailing space is cleaned up without ever touching indentation or unrelated spaces.
       if (draftText[end] === ' ') {
         end += 1;
-      } else if (start > 0 && draftText[start - 1] === ' ' && (end === draftText.length || /[\n\r)\]}"'`,;<>|]/.test(draftText[end]!))) {
+      } else if (
+        start > 0 &&
+        draftText[start - 1] === ' ' &&
+        (end === draftText.length || /[\n\r)\]}"'`,;<>|]/.test(draftText[end]!))
+      ) {
         start -= 1;
       }
       ranges.push([start, end]);
@@ -1102,6 +1110,8 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#lastCommittedSessionId = created.sessionId;
+      this.#lastCommittedCwd = cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
       }
@@ -1221,6 +1231,8 @@ export class AppController {
         modes: loaded.modes,
         ...(loadedTier ? { tier: loadedTier } : {}),
       });
+      this.#lastCommittedSessionId = loaded.sessionId;
+      this.#lastCommittedCwd = cwd;
 
       this.#bindSessionMetrics(loaded.sessionId, false);
       await this.#syncSessionMetricsFromTranscript();
@@ -1630,6 +1642,11 @@ export class AppController {
       `agy acp exited unexpectedly${info.code !== null ? ` (exit code ${info.code})` : ''}.`;
 
     this.#cancelReplayDrain(new Error(crashMessage));
+    this.#replayingSessionId = null;
+    this.#replayingSessionEpoch = null;
+    this.#creatingSessionEpoch = null;
+    this.#pendingNewSessionUpdates = [];
+    this.store.setReplaying(false);
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
@@ -1665,7 +1682,11 @@ export class AppController {
       stderrTail: info.stderrTail,
       exitCode: info.code,
     });
-    this.scheduler.renderNow();
+    if (this.scheduler.suspended) {
+      this.scheduler.resumeAfterReplay(false);
+    } else {
+      this.scheduler.renderNow(true);
+    }
     this.syncFocus();
   }
 
@@ -1718,6 +1739,9 @@ export class AppController {
   }
 
   #handleGoneEvent(event: GoneEvent): void {
+    if (event.sf !== undefined && event.sf !== this.surface.id) {
+      return;
+    }
     const evicted = this.scheduler.handleGone(event);
     if (evicted.length > 0) {
       this.store.traffic.recordSystem(`Tern evicted nodes: ${evicted.join(', ')}`);
@@ -2909,7 +2933,15 @@ export class AppController {
   }
 
   async #handleEditorSend(event: SendEvent): Promise<void> {
-    await this.submitInput(event.text);
+    const trimmed = event.text.trim();
+    // Reject blank native `send` events without consuming existing draft text or attachments.
+    if (trimmed.length === 0) {
+      return;
+    }
+    // Isolate standalone `send` events whose payload differs from the current composer draft so
+    // pending draft attachments are never leaked and the user's draft + attachments stay intact.
+    const matchesCurrentDraft = event.text === this.store.draft.text;
+    await this.submitInput(event.text, { isolated: !matchesCurrentDraft });
   }
 
   async #handleCtrlV(): Promise<void> {
@@ -2994,9 +3026,15 @@ export class AppController {
   // Prompt Submission & Slash Command Execution
   // -------------------------------------------------------------------------
 
-  async submitInput(rawText: string): Promise<void> {
+  async submitInput(
+    rawText: string,
+    options: { readonly isolated?: boolean } = {},
+  ): Promise<void> {
+    const isolated = options.isolated === true;
     const text = rawText.trim();
-    const pendingAttachments = [...this.store.getState().pendingAttachments];
+    const pendingAttachments = isolated
+      ? []
+      : [...this.store.getState().pendingAttachments];
 
     if (text.length === 0 && pendingAttachments.length === 0) {
       return;
@@ -3009,18 +3047,24 @@ export class AppController {
     if (pendingAttachments.length === 0) {
       const dispatched = dispatchSlashCommand(text, this.store.commands);
       if (dispatched.isCommand) {
-        this.store.draft.reset();
+        if (!isolated) {
+          this.store.draft.reset();
+        }
         void this.store.history.push(text, this.store.getState().cwd);
         this.scheduler.renderNow();
-        await executeCommandAction(dispatched.action, this.#commandExecutor());
+        await executeCommandAction(
+          dispatched.action,
+          this.#commandExecutor({ preserveDraft: isolated })
+        );
         return;
       }
     }
 
-    await this.#sendPromptToAcp(text, pendingAttachments);
+    await this.#sendPromptToAcp(text, pendingAttachments, { preserveDraft: isolated });
   }
 
-  #commandExecutor(): CommandActionExecutor {
+  #commandExecutor(options: { readonly preserveDraft?: boolean } = {}): CommandActionExecutor {
+    const preserveDraft = options.preserveDraft === true;
     const copyByIndex = async (index?: number) => {
       const idx = index && index >= 1 ? index : 1;
       const md = this.store.transcript.getAssistantMarkdownByReverseIndex(idx);
@@ -3121,7 +3165,7 @@ export class AppController {
           this.#syncSwarmFxStylesheet();
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
-        await this.#sendPromptToAcp(text, []);
+        await this.#sendPromptToAcp(text, [], { preserveDraft });
       },
       unknownCommand: (commandName, _rawText, suggestions) => {
         const hint =
@@ -3132,7 +3176,12 @@ export class AppController {
     };
   }
 
-  async #sendPromptToAcp(text: string, attachments: readonly AttachmentItem[]): Promise<void> {
+  async #sendPromptToAcp(
+    text: string,
+    attachments: readonly AttachmentItem[],
+    options: { readonly preserveDraft?: boolean } = {},
+  ): Promise<void> {
+    const preserveDraft = options.preserveDraft === true;
     const client = this.#acpClient;
     const state = this.store.getState();
 
@@ -3153,7 +3202,9 @@ export class AppController {
     this.#promptSubmitting = true;
     const sessionId = state.sessionId;
     const promptEpoch = this.#sessionEpoch;
-    const suppressedMentions = new Set(this.#suppressedMentionPaths);
+    const suppressedMentions = preserveDraft
+      ? new Set<string>()
+      : new Set(this.#suppressedMentionPaths);
 
     try {
       this.#clearDoneIdleTimer();
@@ -3165,9 +3216,11 @@ export class AppController {
         this.scheduler.settleTurn(this.#deferredSettleTurnIndex);
         this.#deferredSettleTurnIndex = null;
       }
-      this.store.draft.reset();
-      this.store.clearAttachments();
-      this.#suppressedMentionPaths.clear();
+      if (!preserveDraft) {
+        this.store.draft.reset();
+        this.store.clearAttachments();
+        this.#suppressedMentionPaths.clear();
+      }
       if (text.length > 0) {
         void this.store.history.push(text, state.cwd);
       }
@@ -3694,9 +3747,17 @@ export class AppController {
   async #closePicker(options: { commitModelThinking?: boolean } = {}): Promise<void> {
     const prevState = this.store.getState();
     const prevPicker = prevState.picker;
+    // Align with omp's model picker: pressing Esc only commits a thinking-level change when
+    // the highlighted row is still the currently active model; adjusting thinking while
+    // previewing a different candidate model and cancelling via Esc must not mutate the
+    // currently active model.
+    const highlightedIsCurrentModel =
+      Boolean(prevState.controls.currentModelId) &&
+      prevPicker?.selectedId === prevState.controls.currentModelId;
     const pendingThinking =
       options.commitModelThinking &&
       prevPicker?.kind === 'model' &&
+      highlightedIsCurrentModel &&
       prevPicker.modelPickerThinkingDirty &&
       prevPicker.modelPickerThinking &&
       prevPicker.modelPickerThinking !== prevState.controls.currentThoughtLevel
@@ -3886,12 +3947,53 @@ export class AppController {
     }
 
     try {
-      const [remoteSessions, previewMap] = await Promise.all([
-        client.listAllSessions(),
-        this.#previewStore.loadMap(),
-      ]);
-
+      // Immediately capture rejection on the concurrent remote list request so a fast failure
+      // while local previews are still reading — or after the picker closes — never produces
+      // an `unhandledRejection`.
+      const remoteResultPromise = client.listAllSessions().then(
+        sessions => ({ ok: true as const, sessions }),
+        error => ({ ok: false as const, error })
+      );
+      const previewMap = await this.#previewStore.loadMap();
       if (isStale()) return;
+
+      // Render locally cached sessions immediately as progressive first paint while ACP pages load
+      if (previewMap.size > 0) {
+        const cachedEntries: ResumeSessionEntry[] = [];
+        for (const cached of previewMap.values()) {
+          const rawCwd = cached.cwd || '';
+          cachedEntries.push({
+            sessionId: cached.sessionId,
+            cwd: rawCwd,
+            displayCwd: normalizeDisplayPath(rawCwd),
+            title: (cached.title ?? '').trim(),
+            updatedAt: cached.updatedAt || '',
+            ...(cached.model ? { model: cached.model } : {}),
+            ...(cached.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+            ...(cached.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
+            ...(cached.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
+          });
+        }
+        this.store.setResumeSessions(cachedEntries, { loading: true });
+        const partialState = this.store.getState();
+        if (partialState.picker) {
+          const computed = computePickerData(
+            partialState,
+            partialState.picker,
+            this.store.traffic.list(),
+            this.#now()
+          );
+          this.store.setPickerSelected(computed.selectedId ?? null);
+        }
+        this.scheduler.renderNow();
+      }
+
+      const remoteResult = await remoteResultPromise;
+      if (isStale()) return;
+      if (!remoteResult.ok) {
+        throw remoteResult.error;
+      }
+      const remoteSessions = remoteResult.sessions;
 
       const merged: ResumeSessionEntry[] = remoteSessions.map(s => {
         const cached: SessionAnchorRecord | undefined = previewMap.get(s.sessionId);
@@ -4283,22 +4385,31 @@ export class AppController {
       meta?.cwd && !sameDir(meta.cwd, state.cwd) ? normalizeDisplayPath(meta.cwd) : state.cwd;
 
     const switchEpoch = this.#beginSessionTransition('replaying', sessionId);
-    if (oldSessionId && oldSessionId !== sessionId) {
-      if (wasStreaming) {
-        await client.cancel(oldSessionId).catch(() => {});
-      }
-      await client.closeSession(oldSessionId).catch(() => {});
-    }
-
-    if (
-      this.#shuttingDown ||
-      switchEpoch !== this.#sessionEpoch ||
-      !this.#isAcpClientLive(client)
-    ) {
-      return;
-    }
-
     try {
+      if (oldSessionId && oldSessionId !== sessionId) {
+        if (wasStreaming) {
+          await client.cancel(oldSessionId).catch(() => {});
+        }
+        await client.closeSession(oldSessionId).catch(() => {});
+      }
+
+      if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) {
+        return;
+      }
+      if (!this.#isAcpClientLive(client)) {
+        if (this.#replayingSessionEpoch === switchEpoch) {
+          this.#replayingSessionId = null;
+          this.#replayingSessionEpoch = null;
+        }
+        this.store.setReplaying(false);
+        if (this.scheduler.suspended) {
+          this.scheduler.resumeAfterReplay(false);
+        } else {
+          this.scheduler.renderNow(true);
+        }
+        return;
+      }
+
       const applied = await this.#loadSessionWithReplay(
         client,
         sessionId,
@@ -4326,10 +4437,19 @@ export class AppController {
       this.scheduler.renderNow();
       this.syncFocus();
     } catch (err) {
-      if (
-        switchEpoch !== this.#sessionEpoch ||
-        (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed')
-      ) {
+      if (switchEpoch !== this.#sessionEpoch) {
+        return;
+      }
+      if (this.#replayingSessionEpoch === switchEpoch) {
+        this.#replayingSessionId = null;
+        this.#replayingSessionEpoch = null;
+      }
+      this.store.setReplaying(false);
+      if (this.scheduler.suspended) {
+        this.scheduler.resumeAfterReplay(false);
+      }
+      if (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed') {
+        this.scheduler.renderNow(true);
         return;
       }
       this.store.pushToast(
@@ -4385,6 +4505,8 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#lastCommittedSessionId = created.sessionId;
+      this.#lastCommittedCwd = state.cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
       }
@@ -5124,7 +5246,11 @@ export class AppController {
   }
 
   async #retryAfterCrash(): Promise<void> {
-    const previousSessionId = this.store.getState().sessionId ?? undefined;
+    const previousSessionId =
+      this.store.getState().sessionId ?? this.#lastCommittedSessionId ?? undefined;
+    if (this.#lastCommittedCwd && !sameDir(this.store.getState().cwd, this.#lastCommittedCwd)) {
+      this.store.setCwd(this.#lastCommittedCwd);
+    }
     if (this.#acpClient) {
       await this.#acpClient.close({ timeoutMs: 200 }).catch(() => {});
       this.#acpClient = null;
@@ -5467,6 +5593,7 @@ export class AppController {
     const diff = await loadGitFileDiff(repoRoot, file, {
       wholeFile: git.viewMode === 'file',
       headSha: git.snapshot?.headCommit?.sha,
+      parentSha: git.snapshot?.headCommit?.parents[0],
       ...(gitEnv ? { gitEnv } : {}),
       ...(this.#gitExec ? { exec: this.#gitExec } : {}),
     });
@@ -5918,6 +6045,7 @@ export class AppController {
               this.#suppressedMentionPaths.add(this.#normalizeMentionPathKey(removed.path));
               this.#removeMentionTokenFromDraft(removed.path);
             }
+            this.#refreshCompletion();
             this.scheduler.renderNow();
           },
           onOpenPicker: kind => {

@@ -124,10 +124,10 @@ describe('git_tui repository snapshot, diff, and actions', () => {
           stdout: 'abcdef1234567890\x1fabcdef1\x1fInitial commit\x1f\x1fAlice\x1falice@example.com\x1f2026-11-22T00:00:00Z\x1f',
         };
       }
-      if (args[0] === 'diff' && args[1] === '--numstat') {
+      if (args[0] === 'diff' && args.includes('--numstat') && !args.includes('--cached')) {
         return { exitCode: 0, stdout: '5\t2\tsrc/app.ts\n' };
       }
-      if (args[0] === 'diff' && args[1] === '--cached') {
+      if (args[0] === 'diff' && args.includes('--cached')) {
         return { exitCode: 0, stdout: '10\t0\tsrc/new.ts\n' };
       }
       return { exitCode: 0, stdout: '' };
@@ -152,10 +152,16 @@ describe('git_tui repository snapshot, diff, and actions', () => {
           stdout: 'abcdef1234567890\x1fabcdef1\x1fInitial commit\x1fBody text\x1fAlice\x1falice@example.com\x1f2026-11-22T00:00:00Z\x1f',
         };
       }
-      if (args[0] === 'show' && args.includes('--name-status')) {
+      if (
+        (args[0] === 'diff' || args[0] === 'diff-tree' || args[0] === 'show') &&
+        args.includes('--name-status')
+      ) {
         return { exitCode: 0, stdout: 'A\tREADME.md\n' };
       }
-      if (args[0] === 'show' && args.includes('--numstat')) {
+      if (
+        (args[0] === 'diff' || args[0] === 'diff-tree' || args[0] === 'show') &&
+        args.includes('--numstat')
+      ) {
         return { exitCode: 0, stdout: '20\t0\tREADME.md\n' };
       }
       return { exitCode: 0, stdout: '' };
@@ -675,6 +681,168 @@ describe('git_tui repository snapshot, diff, and actions', () => {
     } finally {
       if (prevAlt === undefined) delete process.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'];
       else process.env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = prevAlt;
+    }
+  });
+
+  test('real git: staged 100% rename preview shows 0/0 (not +N/-0), File view shows full doc, and merge HEAD uses first-parent baseline', async () => {
+    const repo = await makeTempDir('oma-git-rename-merge-');
+    const runGit = async (args: string[]) => {
+      const proc = Bun.spawn(['git', ...args], { cwd: repo, stdout: 'pipe', stderr: 'pipe' });
+      const [out, err, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      if (code !== 0) throw new Error(`git ${args.join(' ')} failed (${code}): ${err || out}`);
+      return out;
+    };
+
+    await runGit(['init']);
+    await runGit(['config', 'user.name', 'OMP Parity']);
+    await runGit(['config', 'user.email', 'omp@example.com']);
+    const baseLines = [
+      'line 1 unchanged',
+      'line 2 unchanged',
+      'line 3 unchanged',
+      'line 4 unchanged',
+      'line 5 unchanged',
+      'line 6 editable',
+    ].join('\n') + '\n';
+    await fs.writeFile(path.join(repo, 'alpha.txt'), baseLines, 'utf8');
+    await runGit(['add', '.']);
+    await runGit(['commit', '-m', 'initial']);
+
+    // 1. Staged 100% identical rename (`git mv alpha.txt beta.txt`)
+    await runGit(['mv', 'alpha.txt', 'beta.txt']);
+    const snapRename = await loadGitRepoSnapshot(repo);
+    const stagedRename = snapRename.staged.find(f => f.path === 'beta.txt');
+    expect(stagedRename?.kind).toBe('renamed');
+    expect(stagedRename?.origPath).toBe('alpha.txt');
+
+    const diffIdentical = await loadGitFileDiff(repo, stagedRename!);
+    expect(diffIdentical.additions).toBe(0);
+    expect(diffIdentical.deletions).toBe(0);
+    expect(diffIdentical.kind).toBe('empty');
+    expect(diffIdentical.message).toContain('Renamed from alpha.txt');
+
+    // File view (`wholeFile: true`) still displays full document content for 100% rename!
+    const fileViewIdentical = await loadGitFileDiff(repo, stagedRename!, { wholeFile: true });
+    expect(fileViewIdentical.kind).toBe('diff');
+    expect(fileViewIdentical.additions).toBe(0);
+    expect(fileViewIdentical.deletions).toBe(0);
+    expect(fileViewIdentical.unifiedDiff).toContain(' line 1 unchanged');
+    expect(fileViewIdentical.unifiedDiff).toContain(' line 6 editable');
+
+    // 2. Modified rename: edit 1 of 6 lines, re-stage, reload FRESH snapshot and verify rename +1 / -1
+    await fs.writeFile(
+      path.join(repo, 'beta.txt'),
+      baseLines.replace('line 6 editable', 'line 6 edited'),
+      'utf8',
+    );
+    await runGit(['add', 'beta.txt']);
+    const snapEditedRename = await loadGitRepoSnapshot(repo);
+    const stagedEditedRename = snapEditedRename.staged.find(f => f.path === 'beta.txt');
+    expect(stagedEditedRename?.kind).toBe('renamed');
+    expect(stagedEditedRename?.origPath).toBe('alpha.txt');
+    const diffEdited = await loadGitFileDiff(repo, stagedEditedRename!);
+    expect(diffEdited.kind).toBe('diff');
+    expect(diffEdited.additions).toBe(1);
+    expect(diffEdited.deletions).toBe(1);
+
+    // 3. Merge commit HEAD: file listing & detail share first-parent baseline
+    await runGit(['commit', '-m', 'rename and edit on main']);
+    await runGit(['checkout', '-b', 'feature', 'HEAD~1']);
+    await fs.writeFile(path.join(repo, 'feature.txt'), 'from feature\n', 'utf8');
+    await runGit(['add', 'feature.txt']);
+    await runGit(['commit', '-m', 'feature work']);
+    await runGit(['checkout', '-']);
+    await runGit(['merge', '--no-ff', 'feature', '-m', 'merge feature']);
+
+    const snapMerge = await loadGitRepoSnapshot(repo);
+    expect(snapMerge.clean).toBe(true);
+    expect(snapMerge.headCommit?.parents.length).toBe(2);
+    const mergedFile = snapMerge.headCommit?.files.find(f => f.path === 'feature.txt');
+    expect(mergedFile).toBeDefined();
+    const mergeDiff = await loadGitFileDiff(repo, mergedFile!, {
+      headSha: snapMerge.headCommit!.sha,
+      parentSha: snapMerge.headCommit!.parents[0],
+    });
+    expect(mergeDiff.kind).toBe('diff');
+    expect(mergeDiff.additions).toBe(1);
+    expect(mergeDiff.unifiedDiff).toContain('+from feature');
+  });
+
+  test('real git: SHA-256 root commit, non-ASCII UTF-8 root file (中文.txt), and mode-only File view full context', async () => {
+    const runGitIn = async (cwd: string, args: string[]) => {
+      const proc = Bun.spawn(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+      const [out, err, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      if (code !== 0) throw new Error(`git ${args.join(' ')} failed (${code}): ${err || out}`);
+      return out;
+    };
+
+    // 1. SHA-1 root commit with non-ASCII filename `中文.txt` + mode-only chmod change in File mode
+    const repoUtf8 = await makeTempDir('oma-git-utf8-root-');
+    await runGitIn(repoUtf8, ['init']);
+    await runGitIn(repoUtf8, ['config', 'user.name', 'UTF8 Test']);
+    await runGitIn(repoUtf8, ['config', 'user.email', 'utf8@example.com']);
+    await fs.writeFile(path.join(repoUtf8, '中文.txt'), '你好世界\n第二行\n', 'utf8');
+    await fs.writeFile(path.join(repoUtf8, 'run.sh'), '#!/bin/sh\necho ok\n', 'utf8');
+    await runGitIn(repoUtf8, ['add', '.']);
+    await runGitIn(repoUtf8, ['commit', '-m', 'root commit with utf8']);
+
+    const snapUtf8 = await loadGitRepoSnapshot(repoUtf8);
+    expect(snapUtf8.clean).toBe(true);
+    const cnFile = snapUtf8.headCommit?.files.find(f => f.path === '中文.txt');
+    expect(cnFile).toBeDefined();
+    expect(cnFile?.additions).toBe(2);
+    const cnDiff = await loadGitFileDiff(repoUtf8, cnFile!, {
+      headSha: snapUtf8.headCommit!.sha,
+      parentSha: snapUtf8.headCommit!.parents[0],
+    });
+    expect(cnDiff.kind).toBe('diff');
+    expect(cnDiff.unifiedDiff).toContain('+你好世界');
+
+    // Stage mode-only change (`old mode 100644 -> new mode 100755`) and inspect in File mode
+    await runGitIn(repoUtf8, ['update-index', '--chmod=+x', 'run.sh']);
+    const snapMode = await loadGitRepoSnapshot(repoUtf8);
+    const modeFile = snapMode.staged.find(f => f.path === 'run.sh');
+    expect(modeFile).toBeDefined();
+    const modeWholeFile = await loadGitFileDiff(repoUtf8, modeFile!, { wholeFile: true });
+    expect(modeWholeFile.kind).toBe('diff');
+    expect(modeWholeFile.unifiedDiff).toContain(' #!/bin/sh');
+    expect(modeWholeFile.unifiedDiff).toContain(' echo ok');
+
+    // 2. SHA-256 repository root commit (must NOT rely on hardcoded SHA-1 empty tree)
+    const repoSha256 = await makeTempDir('oma-git-sha256-root-');
+    let sha256Supported = true;
+    try {
+      await runGitIn(repoSha256, ['init', '--object-format=sha256']);
+    } catch {
+      sha256Supported = false;
+    }
+    if (sha256Supported) {
+      await runGitIn(repoSha256, ['config', 'user.name', 'SHA256 Test']);
+      await runGitIn(repoSha256, ['config', 'user.email', 'sha256@example.com']);
+      await fs.writeFile(path.join(repoSha256, 'sha256.txt'), 'sha256 line\n', 'utf8');
+      await runGitIn(repoSha256, ['add', '.']);
+      await runGitIn(repoSha256, ['commit', '-m', 'sha256 root']);
+
+      const snap256 = await loadGitRepoSnapshot(repoSha256);
+      expect(snap256.clean).toBe(true);
+      expect(snap256.headCommit?.sha.length).toBe(64);
+      const f256 = snap256.headCommit?.files.find(f => f.path === 'sha256.txt');
+      expect(f256).toBeDefined();
+      expect(f256?.additions).toBe(1);
+      const d256 = await loadGitFileDiff(repoSha256, f256!, {
+        headSha: snap256.headCommit!.sha,
+        parentSha: snap256.headCommit!.parents[0],
+      });
+      expect(d256.kind).toBe('diff');
+      expect(d256.unifiedDiff).toContain('+sha256 line');
     }
   });
 });

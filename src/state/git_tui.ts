@@ -297,6 +297,34 @@ export function parsePorcelainV1Z(stdout: string): {
 export function parseNumstatMap(stdout: string): Map<string, { additions: number; deletions: number }> {
   const map = new Map<string, { additions: number; deletions: number }>();
   if (!stdout) return map;
+
+  // Handle NUL-delimited `-z --numstat` output so non-ASCII and special-char paths
+  // (e.g. `中文.txt`, spaces, quotes) are parsed verbatim without C-style escaping.
+  if (stdout.includes('\0')) {
+    const tokens = stdout.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const entry = tokens[i++];
+      if (!entry) continue;
+      const parts = entry.split('\t');
+      if (parts.length < 2) continue;
+      const rawAdd = parts[0]!;
+      const rawDel = parts[1]!;
+      let filePath = parts.length >= 3 ? parts.slice(2).join('\t') : '';
+      if (filePath.length === 0) {
+        // Rename/copy entry in `-z --numstat`: `<add>\t<del>\t\0<origPath>\0<newPath>\0`
+        const _orig = tokens[i++];
+        const nextPath = tokens[i++] ?? '';
+        filePath = nextPath || _orig || '';
+      }
+      if (!filePath) continue;
+      const additions = rawAdd === '-' ? 0 : Number.parseInt(rawAdd, 10) || 0;
+      const deletions = rawDel === '-' ? 0 : Number.parseInt(rawDel, 10) || 0;
+      map.set(filePath, { additions, deletions });
+    }
+    return map;
+  }
+
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trimEnd();
     if (!line) continue;
@@ -355,6 +383,43 @@ function parseCommitNameStatus(
   numstat: Map<string, { additions: number; deletions: number }>,
 ): GitChangedFile[] {
   const files: GitChangedFile[] = [];
+
+  // Handle NUL-delimited `-z --name-status` output for unquoted verbatim paths (e.g. `中文.txt`).
+  if (stdout.includes('\0')) {
+    const tokens = stdout.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const statusTok = tokens[i++];
+      if (!statusTok) continue;
+      const code = statusTok[0];
+      if (!code) continue;
+      if (code === 'R' || code === 'C') {
+        const origPath = tokens[i++] ?? '';
+        const nextPath = tokens[i++] ?? '';
+        if (!nextPath) continue;
+        const st = numstat.get(nextPath);
+        files.push({
+          path: nextPath,
+          ...(origPath ? { origPath } : {}),
+          kind: kindFromCode(code),
+          area: 'commit',
+          ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
+        });
+      } else {
+        const filePath = tokens[i++] ?? '';
+        if (!filePath) continue;
+        const st = numstat.get(filePath);
+        files.push({
+          path: filePath,
+          kind: kindFromCode(code),
+          area: 'commit',
+          ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
+        });
+      }
+    }
+    return files;
+  }
+
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -368,7 +433,7 @@ function parseCommitNameStatus(
       files.push({
         path: nextPath,
         origPath,
-        kind: 'renamed',
+        kind: kindFromCode(code),
         area: 'commit',
         ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
       });
@@ -808,10 +873,10 @@ export async function loadGitRepoSnapshot(
   if (!clean) {
     const [unstagedStatRes, stagedStatRes] = await Promise.all([
       unstaged.length > 0
-        ? exec(['diff', '--numstat'], execOpts)
+        ? exec(['diff', '-z', '--numstat'], execOpts)
         : Promise.resolve<GitExecResult>({ exitCode: 0, stdout: '' }),
       staged.length > 0
-        ? exec(['diff', '--cached', '--numstat'], execOpts)
+        ? exec(['diff', '-z', '--cached', '--numstat'], execOpts)
         : Promise.resolve<GitExecResult>({ exitCode: 0, stdout: '' }),
     ]);
     if (unstagedStatRes.exitCode === 0) {
@@ -821,10 +886,25 @@ export async function loadGitRepoSnapshot(
       staged = attachStats(staged, parseNumstatMap(stagedStatRes.stdout));
     }
   } else if (headMeta) {
-    const [nameStatusRes, numstatRes] = await Promise.all([
-      exec(['show', '--format=', '--name-status', '--root', headMeta.sha], execOpts),
-      exec(['show', '--format=', '--numstat', '--root', headMeta.sha], execOpts),
-    ]);
+    // Use the first-parent baseline for commits with parents (including merges), and Git's
+    // native `--root` for root commits so both SHA-1 and SHA-256 repositories work verbatim.
+    // Always pass `-z` so non-ASCII paths (e.g. `中文.txt`) are never C-escaped.
+    const firstParent = headMeta.parents[0];
+    const [nameStatusRes, numstatRes] = firstParent
+      ? await Promise.all([
+          exec(['diff', '-z', '--name-status', '-M', '-C', firstParent, headMeta.sha], execOpts),
+          exec(['diff', '-z', '--numstat', '-M', '-C', firstParent, headMeta.sha], execOpts),
+        ])
+      : await Promise.all([
+          exec(
+            ['diff-tree', '--root', '-r', '-z', '--no-commit-id', '--name-status', '-M', '-C', headMeta.sha],
+            execOpts,
+          ),
+          exec(
+            ['diff-tree', '--root', '-r', '-z', '--no-commit-id', '--numstat', '-M', '-C', headMeta.sha],
+            execOpts,
+          ),
+        ]);
     const statsMap = numstatRes.exitCode === 0 ? parseNumstatMap(numstatRes.stdout) : new Map();
     const headFiles =
       nameStatusRes.exitCode === 0
@@ -843,6 +923,56 @@ export async function loadGitRepoSnapshot(
     staged,
     headCommit,
   };
+}
+
+function buildFullContextDiffFromText(text: string): {
+  readonly unifiedDiff: string;
+  readonly lineCount: number;
+} {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  if (lines.length === 0) {
+    return { unifiedDiff: '', lineCount: 0 };
+  }
+  return {
+    unifiedDiff: [`@@ -1,${lines.length} +1,${lines.length} @@`, ...lines.map(l => ` ${l}`)].join(
+      '\n',
+    ),
+    lineCount: lines.length,
+  };
+}
+
+async function readFullDocumentForFileMode(
+  cwd: string,
+  file: GitChangedFile,
+  exec: GitExecFn,
+  execOpts: { readonly cwd: string; readonly timeoutMs: number; readonly env?: Readonly<Record<string, string>> },
+  headRev: string,
+): Promise<string | null> {
+  if (file.kind === 'deleted') return null;
+  if (file.area === 'unstaged') {
+    try {
+      const absPath = path.resolve(cwd, file.path);
+      const st = await fs.lstat(absPath);
+      if (st.isSymbolicLink()) return await fs.readlink(absPath);
+      if (!st.isFile() || st.size > MAX_UNTRACKED_DIFF_BYTES) return null;
+      const bytes = await fs.readFile(absPath);
+      const checkLen = Math.min(bytes.byteLength, 8192);
+      for (let i = 0; i < checkLen; i++) {
+        if (bytes[i] === 0) return null;
+      }
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+  const spec = file.area === 'staged' ? `:${file.path}` : `${headRev}:${file.path}`;
+  const res = await exec(['show', spec], execOpts);
+  if (res.exitCode !== 0) return null;
+  if (res.stdout.includes('\0')) return null;
+  return res.stdout;
 }
 
 function countUnifiedDiffStats(diffText: string): { additions: number; deletions: number } {
@@ -874,6 +1004,7 @@ export async function loadGitFileDiff(
   options?: {
     readonly wholeFile?: boolean;
     readonly headSha?: string;
+    readonly parentSha?: string;
     readonly timeoutMs?: number;
     readonly exec?: GitExecFn;
     readonly gitEnv?: Readonly<Record<string, string>>;
@@ -882,7 +1013,17 @@ export async function loadGitFileDiff(
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
   const key = gitFileKey(file.area, file.path);
-  const contextArg = options?.wholeFile ? '-U99999' : '-U3';
+  const execOpts = {
+    cwd,
+    timeoutMs,
+    ...(options?.gitEnv ? { env: options.gitEnv } : {}),
+  };
+  const headRev = options?.headSha || 'HEAD';
+  const fullDoc = options?.wholeFile
+    ? await readFullDocumentForFileMode(cwd, file, exec, execOpts, headRev)
+    : null;
+  const fullDocLineCount = fullDoc ? fullDoc.split(/\r?\n/).length : 0;
+  const contextArg = options?.wholeFile ? `-U${Math.max(99999, fullDocLineCount + 10)}` : '-U3';
 
   if (file.area === 'unstaged' && file.kind === 'untracked') {
     const absPath = path.resolve(cwd, file.path);
@@ -991,31 +1132,68 @@ export async function loadGitFileDiff(
     }
   }
 
-  let args: string[];
-  if (file.area === 'staged') {
-    args = ['--literal-pathspecs', 'diff', '--cached', '--no-color', contextArg, '--', file.path];
-  } else if (file.area === 'commit') {
-    const rev = options?.headSha || 'HEAD';
-    args = [
-      '--literal-pathspecs',
-      'show',
-      '--format=',
-      '--no-color',
-      '--root',
-      contextArg,
-      rev,
-      '--',
-      file.path,
-    ];
-  } else {
-    args = ['--literal-pathspecs', 'diff', '--no-color', contextArg, '--', file.path];
-  }
+  const isRenameOrCopy =
+    (file.kind === 'renamed' || file.kind === 'copied') &&
+    Boolean(file.origPath && file.origPath !== file.path);
 
-  const res = await exec(args, {
-    cwd,
-    timeoutMs,
-    ...(options?.gitEnv ? { env: options.gitEnv } : {}),
-  });
+  let res: GitExecResult;
+  if (file.area === 'staged') {
+    if (isRenameOrCopy && file.origPath) {
+      // Compare exact dual endpoints (`HEAD:<origPath>` vs index `:<path>`) so 100% renames
+      // report 0 additions/deletions instead of `+N / -0` and modified renames show only actual edits.
+      const dualRes = await exec(
+        ['--literal-pathspecs', 'diff', '--no-color', '--no-ext-diff', contextArg, `HEAD:${file.origPath}`, `:${file.path}`],
+        execOpts,
+      );
+      if (dualRes.exitCode === 0) {
+        res = dualRes;
+      } else {
+        res = await exec(
+          ['--literal-pathspecs', 'diff', '--cached', '--no-color', '-M', '-C', contextArg, '--', file.origPath, file.path],
+          execOpts,
+        );
+      }
+    } else {
+      res = await exec(
+        ['--literal-pathspecs', 'diff', '--cached', '--no-color', contextArg, '--', file.path],
+        execOpts,
+      );
+    }
+  } else if (file.area === 'commit') {
+    const firstParent = options?.parentSha;
+    if (firstParent) {
+      if (isRenameOrCopy && file.origPath) {
+        const dualRes = await exec(
+          ['--literal-pathspecs', 'diff', '--no-color', '--no-ext-diff', contextArg, `${firstParent}:${file.origPath}`, `${headRev}:${file.path}`],
+          execOpts,
+        );
+        if (dualRes.exitCode === 0) {
+          res = dualRes;
+        } else {
+          res = await exec(
+            ['--literal-pathspecs', 'diff', '--no-color', '-M', '-C', contextArg, firstParent, headRev, '--', file.origPath, file.path],
+            execOpts,
+          );
+        }
+      } else {
+        res = await exec(
+          ['--literal-pathspecs', 'diff', '--no-color', '-M', '-C', contextArg, firstParent, headRev, '--', file.path],
+          execOpts,
+        );
+      }
+    } else {
+      // Root commit (works identically for both SHA-1 and SHA-256 repositories)
+      res = await exec(
+        ['--literal-pathspecs', 'show', '--format=', '--no-color', '--root', '-M', '-C', contextArg, headRev, '--', file.path],
+        execOpts,
+      );
+    }
+  } else {
+    res = await exec(
+      ['--literal-pathspecs', 'diff', '--no-color', contextArg, '--', file.path],
+      execOpts,
+    );
+  }
   if (res.exitCode !== 0) {
     return {
       fileKey: key,
@@ -1031,6 +1209,25 @@ export async function loadGitFileDiff(
 
   const raw = res.stdout;
   if (!raw.trim()) {
+    // In whole-file (`File`) view mode, render the full document even when there are no textual edits
+    // (e.g., 100% identical renames or mode-only changes).
+    if (options?.wholeFile && fullDoc !== null) {
+      const ctx = buildFullContextDiffFromText(fullDoc);
+      if (ctx.lineCount > 0) {
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'diff',
+          unifiedDiff: ctx.unifiedDiff,
+          additions: 0,
+          deletions: 0,
+        };
+      }
+    }
+    const emptyMsg = isRenameOrCopy && file.origPath
+      ? `${file.kind === 'copied' ? 'Copied' : 'Renamed'} from ${file.origPath} (100% identical).`
+      : 'No textual differences.';
     return {
       fileKey: key,
       filePath: file.path,
@@ -1039,7 +1236,7 @@ export async function loadGitFileDiff(
       unifiedDiff: '',
       additions: 0,
       deletions: 0,
-      message: 'No textual differences.',
+      message: emptyMsg,
     };
   }
   if (/^Binary files .+ differ$/m.test(raw) || /^GIT binary patch$/m.test(raw)) {
@@ -1053,6 +1250,38 @@ export async function loadGitFileDiff(
       deletions: 0,
       message: 'Binary file changed.',
     };
+  }
+
+  // Handle patches with no textual hunks (e.g. 100% rename/copy or mode-only chmod changes).
+  // In whole-file (`File`) view mode, always synthesize full document context when readable!
+  const hasHunk = raw.split(/\r?\n/).some(l => l.startsWith('@@ '));
+  if (!hasHunk) {
+    if (options?.wholeFile && fullDoc !== null) {
+      const ctx = buildFullContextDiffFromText(fullDoc);
+      if (ctx.lineCount > 0) {
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'diff',
+          unifiedDiff: ctx.unifiedDiff,
+          additions: 0,
+          deletions: 0,
+        };
+      }
+    }
+    if (isRenameOrCopy && file.origPath) {
+      return {
+        fileKey: key,
+        filePath: file.path,
+        area: file.area,
+        kind: 'empty',
+        unifiedDiff: '',
+        additions: 0,
+        deletions: 0,
+        message: `${file.kind === 'copied' ? 'Copied' : 'Renamed'} from ${file.origPath} (100% identical).`,
+      };
+    }
   }
 
   const unifiedDiff = stripDiffPreamble(raw);

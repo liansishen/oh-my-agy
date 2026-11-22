@@ -44,16 +44,20 @@ oma update --version v0.1.0
 
 ## 核心特性
 
-- **1:1 对齐 `omp` 原生聊天与交互体验**：基于 `@stencil-hq/tern`（TypeScript + TSX）与 Bun，原生命中 Tern 预加载 `omp*.css` 及 Reader / Spine / Console 三种 Chat Style：
+- **基于 Tern 原生组件与 `omp` 样式/交互约定构建**：基于 `@stencil-hq/tern`（TypeScript + TSX）与 Bun，原生复用 Tern 预加载 `omp*.css` 及 Reader / Spine / Console 三种 Chat Style：
   - **一体化 Composer 与底部状态栏遥测**：融合模型/思考档位单胶囊（`Alt+P` 紧凑模型浮层 + 思考强度滑块）、常驻上下文进度条、语义着色权限模式（点击切换）、可点击 Git 分支与脏态（点击打开全屏 Git UI）、实时滑窗 + `transcript.jsonl` 校准的输出速率（`tok/s`）与累计 Token / 缓存命中率（点击查看 `/context`）；
-  - **全屏 Git Diff & Commit 界面（点击底部 Git 状态或 `/git`）**：1:1 复刻 `omp.app.git` 原生界面，支持 `Split / Inline / File` 视图、`Path / Tree` 目录树、Unstaged / Staged 折叠分组、单文件或批量 Stage / Unstage、Amend 与提交，以及干净工作区下的 HEAD Commit 卡片浏览；
+  - **全屏 Git Diff & Commit 界面（点击底部 Git 状态或 `/git`）**：基于 `omp.app.git` 原生组件实现，支持 `Split / Inline / File` 视图、行折行（`Wrap`）、`Path / Tree` 目录树、Unstaged / Staged 折叠分组、双端点重命名预览、单文件或批量 Stage / Unstage、Amend 与提交，以及干净工作区下按第一父提交基准的 HEAD Commit 浏览；
   - **原生交互式问答卡片（`ask_question` / `elicitation/create`）**：在 `initialize` 握手中完整声明 `elicitation` 能力，自动合并 `agy acp` 的单选/多选 + `Other` 自由输入字段，支持鼠标点选与全键盘导航（`↑/↓`、`1–9`、`Tab`/`Shift+Tab`、`Enter`、`Esc`）；
   - **原版 `agy` 风格 Swarm Board 蜂群实时看板与像素小蜜蜂动效**：常驻轻量监听 `swarm.json` / `members.json` / `board.jsonl`，蜂群模式下根据实际成员数动态呈现环绕输入框飞舞的像素小蜜蜂；按 `Alt+S`、点击 `jobs` 左侧小蜜蜂或输入 `/swarm board` 打开居中蜂群面板（多彩成员 Roster + 倒序 Posts 列表 + Markdown 详情）；
-  - **光标下方 `/` 与 `@` 智能补全 & 全量 P0/P1 命令**：支持 `/resume`、`/git`、`/jobs`（`/tasks`）、`/settings`（`/config`）、`/permissions`、`/status`、`/context`、`/usage`、`/mcp`、`/plugins`、`/skills`、`/agents`、`/model`、`/thought`、`/mode`、`/new`、`/export`、`/copy`、`/login`、`/logout`、`/log`、`/compact`、`/help`、`/quit`；
-  - **可靠的后台任务/蜂群通知与终端光标根治**：后台任务与蜂群运行期间不提前发送 `OSC 7501 state=done`，并支持输入补充消息实时转向；双锁 + 节流重申 `DECTCEM` 消除 Windows ConPTY 下孤立光标。
+  - **光标下方 `/` 与 `@` 智能补全 & 全量命令**：支持带空格路径的统一 `@"..."` 文件引用解析，覆盖 `/resume`、`/git`、`/jobs`（`/tasks`）、`/settings`（`/config`）、`/permissions`、`/status`、`/context`、`/usage`、`/mcp`、`/plugins`、`/skills`、`/agents`、`/model`、`/thought`、`/mode`、`/new`、`/export`、`/copy`、`/login`、`/logout`、`/log`、`/compact`、`/help`、`/quit`；
+  - **可靠的后台任务/蜂群通知与终端光标抑制**：后台任务与蜂群运行期间不提前发送 `OSC 7501 state=done`；双锁 + 节流重申 `DECTCEM` 消除 Windows ConPTY 下孤立光标。
 - **跨平台单文件分发**：通过 `bun build --compile` 打包为 Windows / Linux / macOS 独立单可执行文件，零外部运行时依赖。
 - **可选 Tern 重启自动恢复**：配套轻量 Host 插件 [plugins/oma-reopen](plugins/oma-reopen/README.md)，在 Tern 守护进程重建或分屏时自动拉起 `oma --resume` 续接会话。
-- **合规边界**：严格调用官方未修改的 `agy acp` 二进制并走其原生本地认证，不提取/转发 OAuth Token，不触碰任何凭证文件。
+- **合规与后端能力边界**：严格调用官方未修改的 `agy acp` 二进制并走其原生本地认证，不提取/转发 OAuth Token，不触碰任何凭证文件。受限于当前 `agy acp` 协议接口：
+  - 不支持当轮实时 `steer` 队列注入（运行中需等待当前回合结束或按 `Esc` 取消后发送新指令）；
+  - `/usage` 展示当前会话的 Token、缓存命中率与输出速率统计（非提供商账户配额周期面板）；
+  - `--fork` 不支持独立分叉会话，将安全回退为加载原会话；
+  - `/resume` 搜索基于 ACP `session/list` 与本地预览缓存正文，不做全量磁盘对话全文索引。
 
 ## 从源码构建
 
