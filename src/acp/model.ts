@@ -29,6 +29,317 @@ export const KNOWN_THOUGHT_LEVELS = [
   "max",
 ] as const;
 
+const DEFAULT_THREE_THOUGHT_LEVELS: readonly ConfigOptionChoice[] = [
+  { value: "low", name: "Low" },
+  { value: "medium", name: "Medium" },
+  { value: "high", name: "High" },
+];
+
+const DEFAULT_FOUR_THOUGHT_LEVELS: readonly ConfigOptionChoice[] = [
+  { value: "low", name: "Low" },
+  { value: "medium", name: "Medium" },
+  { value: "high", name: "High" },
+  { value: "xhigh", name: "Extra" },
+];
+
+/** `/model` 选择框中用于代表全部 Orchestrator 变体的统一合并条目 ID */
+export const ORCHESTRATOR_PICKER_ID = "orchestrator";
+
+/** Orchestrator Planner 严格受限的可选模型白名单（固定展示顺序，对齐 `agy`） */
+export const ORCHESTRATOR_PLANNER_MODEL_IDS = [
+  "gemini-4-neon",
+  "gemini-4-carbon",
+  "gemini-4-argon",
+  "claude-opus-5-5",
+] as const;
+
+/** Orchestrator Executor 严格受限的可选模型白名单（固定展示顺序，对齐 `agy`） */
+export const ORCHESTRATOR_EXECUTOR_MODEL_IDS = [
+  "gemini-4-hydrogen",
+  "claude-sonnet-5-5",
+] as const;
+
+/**
+ * 判断模型 ID 或名称是否为 Orchestrator 编排模型（如 `gemini-pro-orchestrator-neon` 或合并 ID `orchestrator`）。
+ */
+export function isOrchestratorModelId(
+  modelIdOrName: string | null | undefined,
+): boolean {
+  if (!modelIdOrName) return false;
+  return modelIdOrName.toLowerCase().includes("orchestrator");
+}
+
+/**
+ * 按 Orchestrator 角色严格过滤可选模型列表，并与服务端当前可用模型取交集：
+ * - `planner`：限定为 `Gemini 4 Neon`、`Gemini 4 Carbon`、`Gemini 4 Argon`、`Claude Opus 5.5`
+ * - `executor`：限定为 `Gemini 4 Hydrogen`、`Claude Sonnet 5.5`
+ */
+export function filterOrchestratorRoleModels(
+  role: "planner" | "executor",
+  availableModels: readonly ConfigOptionChoice[],
+): readonly ConfigOptionChoice[] {
+  const allowlist: readonly string[] =
+    role === "planner"
+      ? ORCHESTRATOR_PLANNER_MODEL_IDS
+      : ORCHESTRATOR_EXECUTOR_MODEL_IDS;
+  const byLowerId = new Map<string, ConfigOptionChoice>();
+  for (const choice of availableModels) {
+    byLowerId.set(choice.value.toLowerCase(), choice);
+  }
+  const matched: ConfigOptionChoice[] = [];
+  for (const id of allowlist) {
+    const found = byLowerId.get(id);
+    if (found) matched.push(found);
+  }
+  if (matched.length > 0) {
+    return matched;
+  }
+  // 极简离线/Mock 环境兜底：若服务端未使用标准模型 ID，至少过滤掉 Orchestrator 自身
+  const nonOrch = availableModels.filter((c) => !isOrchestratorModelId(c.value));
+  return nonOrch.length > 0 ? nonOrch : availableModels;
+}
+
+/**
+ * 将模型全名精简为底部紧凑胶囊使用的短名（悬停 tooltip 仍展示完整名称）：
+ * - `Gemini 4 Neon` -> `Neon`
+ * - `Gemini 4 Carbon` -> `Carbon`
+ * - `Gemini 4 Argon` -> `Argon`
+ * - `Gemini 4 Hydrogen` -> `Hydrogen`
+ * - `Claude Opus 5.5` -> `Opus 5.5`
+ * - `Claude Sonnet 5.5` -> `Sonnet 5.5`
+ */
+export function formatShortOrchestratorModelName(rawName: string): string {
+  const trimmed = rawName.trim();
+  if (!trimmed) return "";
+  const geminiMatch = /^gemini\s+\d+(?:\.\d+)?\s+(.+)$/i.exec(trimmed);
+  if (geminiMatch && geminiMatch[1]) {
+    return geminiMatch[1].trim();
+  }
+  const claudeMatch = /^claude\s+(.+)$/i.exec(trimmed);
+  if (claudeMatch && claudeMatch[1]) {
+    return claudeMatch[1].trim();
+  }
+  return trimmed;
+}
+
+/**
+ * 推导某个 Orchestrator 变体对应的默认 Planner 模型（用于 `settings.json` 未显式配置时的回退显示）。
+ */
+export function inferOrchestratorDefaultPlannerModel(
+  orchestratorModelId: string | null | undefined,
+): { readonly modelId: string; readonly modelName: string } | null {
+  if (!isOrchestratorModelId(orchestratorModelId)) return null;
+  const lower = orchestratorModelId!.trim().toLowerCase();
+  if (lower.includes("neon")) {
+    return { modelId: "gemini-4-neon", modelName: "Gemini 4 Neon" };
+  }
+  if (lower.includes("argon")) {
+    return { modelId: "gemini-4-argon", modelName: "Gemini 4 Argon" };
+  }
+  return { modelId: "gemini-4-carbon", modelName: "Gemini 4 Carbon" };
+}
+
+/**
+ * 推导 Orchestrator 默认 Executor 模型（`settings.json` 未显式配置时默认 `Gemini 4 Hydrogen`）。
+ */
+export function inferOrchestratorDefaultExecutorModel(
+  orchestratorModelId: string | null | undefined,
+): { readonly modelId: string; readonly modelName: string } | null {
+  if (!isOrchestratorModelId(orchestratorModelId)) return null;
+  return { modelId: "gemini-4-hydrogen", modelName: "Gemini 4 Hydrogen" };
+}
+
+/**
+ * 根据选定的 Planner 模型名/ID 映射到 ACP 服务端提供的对应 Orchestrator 变体 ID：
+ * - Neon -> `gemini-pro-orchestrator-neon`
+ * - Argon -> `gemini-pro-orchestrator-argon`
+ * - Carbon -> `gemini-pro-orchestrator`
+ * - Claude Opus 5.5 / 其他 -> 若当前已是 Orchestrator 变体则保留，否则回退 `gemini-pro-orchestrator` 或首个可用 Orchestrator
+ */
+export function resolveAcpOrchestratorModelIdForPlanner(
+  plannerModelIdOrName: string | null | undefined,
+  availableModels: readonly ConfigOptionChoice[],
+  currentModelId?: string | null,
+): string | null {
+  const orchChoices = availableModels.filter((c) => isOrchestratorModelId(c.value));
+  if (orchChoices.length === 0) return null;
+
+  const findOrch = (predicate: (lower: string) => boolean): string | undefined =>
+    orchChoices.find((c) => predicate(c.value.toLowerCase()))?.value;
+
+  const lowerPlanner = plannerModelIdOrName?.trim().toLowerCase() ?? "";
+  if (lowerPlanner.includes("neon")) {
+    const m = findOrch((v) => v.includes("neon"));
+    if (m) return m;
+  } else if (lowerPlanner.includes("argon")) {
+    const m = findOrch((v) => v.includes("argon"));
+    if (m) return m;
+  } else if (lowerPlanner.includes("carbon")) {
+    const m = findOrch(
+      (v) => v === "gemini-pro-orchestrator" || v.includes("carbon"),
+    );
+    if (m) return m;
+  }
+
+  if (
+    currentModelId &&
+    orchChoices.some((c) => c.value === currentModelId)
+  ) {
+    return currentModelId;
+  }
+
+  return (
+    findOrch((v) => v === "gemini-pro-orchestrator") ??
+    findOrch((v) => v.includes("neon")) ??
+    orchChoices[0]!.value
+  );
+}
+
+/**
+ * 解析 Orchestrator 的指定角色（`planner` 或 `executor`）当前对应的真实可调思考档位列表。
+ */
+export function resolveOrchestratorRoleThoughtLevels(
+  role: "planner" | "executor",
+  controls: Pick<
+    SessionControlState,
+    "currentModelId" | "supportsThoughtLevel" | "availableThoughtLevels" | "availableModels"
+  >,
+  cachedByModel?: Readonly<Record<string, readonly ConfigOptionChoice[]>>,
+  configuredModelName?: string | null,
+): readonly ConfigOptionChoice[] {
+  const custom = configuredModelName?.trim();
+  let underlyingModelId: string | undefined;
+  if (custom) {
+    const matched = controls.availableModels.find(
+      (c) =>
+        c.name.toLowerCase() === custom.toLowerCase() ||
+        c.value.toLowerCase() === custom.toLowerCase(),
+    );
+    underlyingModelId = matched?.value ?? custom;
+  } else if (role === "planner") {
+    underlyingModelId =
+      inferOrchestratorDefaultPlannerModel(controls.currentModelId)?.modelId ??
+      "gemini-4-carbon";
+  } else {
+    underlyingModelId = "gemini-4-hydrogen";
+  }
+  return resolveThoughtLevelsForModel(underlyingModelId, controls, cachedByModel);
+}
+
+/**
+ * 判断候选模型是否原生支持 4 档思考深度（`low / medium / high / xhigh`）。
+ * 基于 `agy` 实测：仅 `neon` 与 `hydrogen` 系列（非 Orchestrator）支持 4 档，其余支持思考的模型为 3 档。
+ */
+export function modelSupportsFourThoughtLevels(
+  modelId: string | null | undefined,
+): boolean {
+  if (!modelId) return false;
+  const lower = modelId.trim().toLowerCase();
+  if (!lower || isOrchestratorModelId(lower)) return false;
+  return /(?:^|[-_/\s])(neon|hydrogen)(?:$|[-_/\s])/.test(lower);
+}
+
+/**
+ * 判断候选模型是否支持可调思考档位（排除 Orchestrator 及自带固定档位后缀如 `gpt-oss-120b-medium`）。
+ */
+export function modelSupportsThoughtLevelOption(
+  modelId: string | null | undefined,
+): boolean {
+  if (!modelId) return false;
+  const lower = modelId.trim().toLowerCase();
+  if (!lower) return false;
+  if (isOrchestratorModelId(lower)) return false;
+  if (lower.startsWith("gpt-oss-")) return false;
+  return true;
+}
+
+/**
+ * 解析指定候选模型 `modelId` 应展示的思考档位选项：
+ * 1. 若 `modelId` 即当前激活模型，严格以服务端实时 `controls.availableThoughtLevels` 为准；
+ * 2. 若本次会话已切换过该模型并缓存了服务端实际返回的档位，直接采用权威缓存；
+ * 3. 否则对尚未切换的候选模型按模型族能力精确推导：
+ *    - Orchestrator / 固定档位模型 -> `[]`（不支持）
+ *    - `neon` / `hydrogen` -> 4 档（`low / medium / high / xhigh`）
+ *    - 其余支持思考的模型（`carbon` / `argon` / `flash` / `claude` 等）-> 3 档（`low / medium / high`）
+ */
+export function resolveThoughtLevelsForModel(
+  modelId: string | null | undefined,
+  controls: Pick<
+    SessionControlState,
+    "currentModelId" | "supportsThoughtLevel" | "availableThoughtLevels"
+  >,
+  cachedByModel?: Readonly<Record<string, readonly ConfigOptionChoice[]>>,
+): readonly ConfigOptionChoice[] {
+  const targetId = modelId?.trim() || controls.currentModelId?.trim() || "";
+  if (!targetId) {
+    return controls.supportsThoughtLevel ? controls.availableThoughtLevels : [];
+  }
+
+  // 1. Authoritative live server state for the currently active model
+  if (controls.currentModelId && targetId === controls.currentModelId) {
+    return controls.supportsThoughtLevel ? controls.availableThoughtLevels : [];
+  }
+
+  // 2. Authoritative cached server state from an earlier switch in this session
+  if (cachedByModel && targetId in cachedByModel) {
+    return cachedByModel[targetId] ?? [];
+  }
+
+  // 3. Static capability inference for unvisited candidate models
+  if (!modelSupportsThoughtLevelOption(targetId)) {
+    return [];
+  }
+
+  const labelByValue = new Map<string, string>();
+  for (const c of controls.availableThoughtLevels) {
+    labelByValue.set(c.value.toLowerCase(), c.name);
+  }
+
+  const baseList = modelSupportsFourThoughtLevels(targetId)
+    ? DEFAULT_FOUR_THOUGHT_LEVELS
+    : DEFAULT_THREE_THOUGHT_LEVELS;
+
+  return baseList.map((entry) => ({
+    value: entry.value,
+    name: labelByValue.get(entry.value) ?? entry.name,
+  }));
+}
+
+/**
+ * 将期望思考档位安全钳位到目标模型实际支持的选项列表内
+ * （例如从 4 档模型的 `xhigh` 移到 3 档模型时自动回落到 `high`）。
+ */
+export function clampThoughtLevelForChoices(
+  desired: string | null | undefined,
+  choices: readonly ConfigOptionChoice[],
+): string | undefined {
+  if (choices.length === 0) return undefined;
+  const trimmed = desired?.trim().toLowerCase();
+  if (!trimmed) return choices[0]?.value;
+  const exact = choices.find((c) => c.value.toLowerCase() === trimmed);
+  if (exact) return exact.value;
+
+  const rankOrder = ["minimal", "low", "medium", "high", "xhigh", "max"];
+  const desiredRank = rankOrder.indexOf(trimmed);
+  if (desiredRank >= 0) {
+    // Pick the highest supported level <= desiredRank, or the lowest available level above it
+    let bestBelow: { value: string; rank: number } | null = null;
+    let bestAbove: { value: string; rank: number } | null = null;
+    for (const c of choices) {
+      const r = rankOrder.indexOf(c.value.toLowerCase());
+      if (r < 0) continue;
+      if (r <= desiredRank && (!bestBelow || r > bestBelow.rank)) {
+        bestBelow = { value: c.value, rank: r };
+      } else if (r > desiredRank && (!bestAbove || r < bestAbove.rank)) {
+        bestAbove = { value: c.value, rank: r };
+      }
+    }
+    if (bestBelow) return bestBelow.value;
+    if (bestAbove) return bestAbove.value;
+  }
+  return choices[choices.length - 1]?.value;
+}
+
 export interface SessionControlContext {
   configOptions?: ConfigOption[];
   models?: SessionModelState;
@@ -670,10 +981,33 @@ export async function applyModelSelection(
     latestConfigOptions,
   );
   if (!resolvedThought.ok) {
+    if (resolvedThought.reason === "unsupported") {
+      return {
+        configOptions: latestConfigOptions,
+        appliedModelId: selection.modelId,
+        thoughtLevelSkipped: true,
+      };
+    }
+    const thoughtOpt = getThoughtLevelConfigOption(latestConfigOptions);
+    const availableChoices = flattenConfigOptionChoices(thoughtOpt);
+    const clamped = clampThoughtLevelForChoices(desiredThought, availableChoices);
+    if (!clamped) {
+      return {
+        configOptions: latestConfigOptions,
+        appliedModelId: selection.modelId,
+        thoughtLevelSkipped: true,
+      };
+    }
+    const thoughtRes = await client.setConfigOption({
+      sessionId,
+      configId: "thought_level",
+      value: clamped,
+    });
+    latestConfigOptions = thoughtRes.configOptions;
     return {
       configOptions: latestConfigOptions,
       appliedModelId: selection.modelId,
-      thoughtLevelSkipped: true,
+      appliedThoughtLevel: clamped,
     };
   }
 

@@ -51,7 +51,12 @@ function makeTempDir(): string {
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    if (!dir) continue;
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 30 });
+    } catch {
+      // Ignore transient Windows EBUSY lock on temp dir cleanup after test assertions passed
+    }
   }
 });
 
@@ -110,13 +115,27 @@ class FakeTernHost {
   readonly allOps: Op[] = [];
 
   #decoder = new TextDecoder();
-  #autoAck = true;
+  #autoAck: boolean;
   readonly #features: readonly string[];
+  readonly #kinds?: readonly string[];
+  readonly #credits: number;
   readonly #hour12: boolean;
   readonly #dark: boolean;
 
-  constructor(options: { features?: readonly string[]; hour12?: boolean; dark?: boolean } = {}) {
+  constructor(
+    options: {
+      features?: readonly string[];
+      kinds?: readonly string[];
+      credits?: number;
+      autoAck?: boolean;
+      hour12?: boolean;
+      dark?: boolean;
+    } = {}
+  ) {
     this.#features = options.features ?? ['blobs', 'settle', 'dock', 'scroll', 'font', 'aside'];
+    this.#kinds = options.kinds;
+    this.#credits = options.credits ?? 8;
+    this.#autoAck = options.autoAck ?? true;
     this.#hour12 = options.hour12 ?? false;
     this.#dark = options.dark ?? true;
     this.safeOutput = new SafeTermOutput({
@@ -128,6 +147,14 @@ class FakeTernHost {
         this.#parseOutput(text);
       },
     });
+  }
+
+  setAutoAck(enabled: boolean): void {
+    this.#autoAck = enabled;
+  }
+
+  ackFrame(sf: string, s: number): void {
+    this.input.emitTspEvent({ ev: 'ack', sf, s });
   }
 
   get rawStream(): string {
@@ -174,12 +201,13 @@ class FakeTernHost {
             term: 'tern-fake',
             ver: '0.9.29',
             apc: 65536,
-            credits: 8,
+            credits: this.#credits,
             cols: 120,
             cell: { w: 8, h: 16 },
             dark: this.#dark,
             reduceMotion: false,
             hour12: this.#hour12,
+            ...(this.#kinds ? { kinds: [...this.#kinds] } : {}),
             features: [...this.#features],
           });
         });
@@ -772,7 +800,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: 'Hello agent' });
 
     await waitFor(() =>
-      host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-0')
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t0-'))
     );
 
     expect(host.osc7501).toContain('state=working');
@@ -855,10 +883,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     expect(contextSetOps.length).toBeGreaterThan(0);
 
-    // Verify GoneEvent evicts main.turn-0 cleanly
-    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.turn-0'] });
-    await waitFor(() => controller.scheduler.isEvicted('main.turn-0'));
-    expect(controller.store.transcript.getVisibleTurns().length).toBe(0);
+    // Verify flat omp-aligned main children (`main.t0-user`, `main.t0-assistant-*`, `main.t0-<tool>`) with NO wrapper turn-0 col
+    expect(host.findWireNodes(n => n.id === 'main.turn-0').length).toBe(0);
+    expect(userCards[0]!.id).toBe('main.t0-user');
+
+    // Verify GoneEvent evicts flat top-level node cleanly without breaking subsequent frames
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.t0-user'] });
+    await waitFor(() => controller.scheduler.isEvicted('main.t0-user'));
+    expect(controller.store.transcript.evictedTurnIds.has('main.t0-user')).toBe(true);
 
     // Dynamic configOptions removing thought_level hides embedded dock.composer.bar.model.effort glyph
     acp.send({
@@ -1113,13 +1145,51 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       { id: 'size', format: 'dim' },
     ]);
 
+    // Wait for remote `session/list` to finish, then inspect the current settled preview subtree
+    // (rather than the earliest progressive first-paint `add` op, which may show the newly created
+    // `sess-initial` cached entry before `session/list` resolves on fast tmpfs runners).
+    const currentPreviewNodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+    const addPreviewSubtree = (n: WireNode): void => {
+      currentPreviewNodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+      if (n.c) for (const c of n.c) addPreviewSubtree(c);
+    };
+    const delPreviewSubtree = (id: string): void => {
+      currentPreviewNodes.delete(id);
+      const prefix = `${id}.`;
+      for (const k of [...currentPreviewNodes.keys()]) {
+        if (k.startsWith(prefix)) currentPreviewNodes.delete(k);
+      }
+    };
+    for (const op of host.allOps) {
+      if (op[0] === 'add') addPreviewSubtree(op[4]);
+      else if (op[0] === 'del') delPreviewSubtree(op[1]);
+      else if (op[0] === 'text') {
+        const e = currentPreviewNodes.get(op[1]);
+        if (e) {
+          const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+          e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+        }
+      } else if (op[0] === 'set') {
+        const e = currentPreviewNodes.get(op[1]);
+        if (e) {
+          for (const [k, v] of Object.entries(op[2])) {
+            if (v === null) delete e.p[k];
+            else e.p[k] = v;
+          }
+        }
+      }
+    }
     const previewAddOp = host.allOps.find(
       (op): op is readonly ['add', string, string, string | null, WireNode] =>
         op[0] === 'add' && op[1] === 'layer.modal.preview'
     );
     expect(previewAddOp).toBeDefined();
     expect(previewAddOp![2]).toBe('layer.modal');
-    const serializedPreview = JSON.stringify(previewAddOp![4]);
+    const serializedPreview = JSON.stringify(
+      [...currentPreviewNodes.entries()].filter(
+        ([id]) => id === 'layer.modal.preview' || id.startsWith('layer.modal.preview.')
+      )
+    );
     expect(serializedPreview).toContain('omp.picker.title');
     expect(serializedPreview).toContain('Conversation');
     expect(serializedPreview).toContain('Design Discussion');
@@ -1132,7 +1202,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     // Press Enter to resume selected session -> closes picker, restores EDITOR_NODE_ID focus, loads & replays
     host.input.emit('\r');
-    await waitFor(() => controller.store.getState().sessionId === 'sess-history-42');
+    await waitFor(
+      () =>
+        controller.store.getState().sessionId === 'sess-history-42' &&
+        !controller.scheduler.suspended &&
+        host.allOps.some(op => op[0] === 'scroll' && op[1] === 'main' && op[2] === 'end')
+    );
 
     expect(controller.store.getState().picker).toBeNull();
     expect(controller.currentSurfaceFocus).toBe(EDITOR_NODE_ID);
@@ -3018,7 +3093,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const doneThought1 = current.get(thought1Id)!;
     expect(doneThought1.p['role']).toBe('omp.thinking');
     expect(doneThought1.p['took']).toBe(1500);
-    expect(JSON.stringify(doneThought1.p['head'])).toContain('Thought for 1.5s');
+    // Aligned with `omp`: completed thoughts round to whole seconds (1500ms -> 2s)
+    expect(JSON.stringify(doneThought1.p['head'])).toContain('Thought for 2s');
     // Old live head row, spinner, and live <elapsed> MUST be completely deleted!
     expect(current.has(`${thought1Id}.head`)).toBe(false);
     expect(current.has(`${thought1Id}.head.age`)).toBe(false);
@@ -3431,20 +3507,26 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
-        sessionUpdate: 'tool_call_update',
-        toolCallId: 'tc-wf-live',
-        status: 'completed',
-        rawOutput: { output: '0 lint issues' },
+        sessionId: 'sess-hud-jobs',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-wf-live',
+          status: 'completed',
+          rawOutput: { output: '0 lint issues' },
+        },
       },
     });
     acp.send({
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
-        sessionUpdate: 'tool_call_update',
-        toolCallId: 'tc-sub-live',
-        status: 'completed',
-        rawOutput: { output: 'HUD verified' },
+        sessionId: 'sess-hud-jobs',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-sub-live',
+          status: 'completed',
+          rawOutput: { output: 'HUD verified' },
+        },
       },
     });
     acp.send({ jsonrpc: '2.0', id: activePromptId, result: { stopReason: 'end_turn' } });
@@ -3589,7 +3671,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const beforeTurn = host.rawStream.length;
     await controller.submitInput('Check settle cursor reassert');
     await waitFor(() =>
-      host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-0')
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t0-'))
     );
     expect(host.rawStream.slice(beforeTurn)).toContain(HIDE_CURSOR);
 
@@ -3886,7 +3968,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => cancelCount >= 1);
 
     // When all swarm workers transition to `waiting` + post `[done]` (and workers retired leaving 2 active members):
-    // - OSC 7501 `state=done` is emitted automatically
+    // - Swarm workers finishing on their own MUST NOT emit a spurious OSC 7501 `state=done`
+    //   before the coordinator emits a user-facing reply (avoids false finish notifications on
+    //   worker pauses, subtask handoffs, or monitor checks!)
     // - bottom button switches back to Send!
     // - because session is STILL in swarm mode (`hasSwarm`), perimeter bee animation STAYS visible with 2 idle bees!
     writeFileSync(
@@ -3908,6 +3992,21 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
 
     await waitFor(() => controller.store.isSwarmWorking === false);
+    await Bun.sleep(60);
+    expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
+
+    // Once the coordinator actually posts its user-facing final reply via ACP, OSC 7501 `state=done` fires cleanly
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'All swarm tasks finished and verified!' },
+        },
+      },
+    });
     await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
 
     current = replayCurrentWireNodes();
@@ -4384,7 +4483,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     const turnStream = host.rawStream.slice(streamBeforeTurn);
     const replyIdx = turnStream.indexOf('Synchronous final answer text.');
-    const settleIdx = turnStream.indexOf('["settle","main.turn-0"]');
+    const settleIdx = turnStream.indexOf('["settle","main.t0-');
     const doneIdx = turnStream.indexOf('\x1b]7501;state=done');
     expect(replyIdx).toBeGreaterThanOrEqual(0);
     expect(settleIdx).toBeGreaterThan(replyIdx);
@@ -4438,7 +4537,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await Bun.sleep(140);
     expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
 
-    // Now coordinator finishes (transitions to waiting) -> quiet grace period expires -> state=done fires
+    // Now coordinator transitions to waiting WITHOUT having sent any user-facing reply ->
+    // MUST NOT emit spurious state=done (e.g. worker pause / monitor wake-sleep cycle)
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4450,9 +4550,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }),
       'utf8'
     );
-    await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
+    await waitFor(
+      () => controller.store.getState().swarmSnapshot?.memberByName['coordinator']?.status === 'waiting'
+    );
+    await Bun.sleep(140);
+    expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
 
-    // --- Case 3: Late agent_message_chunk arriving during quiet grace period resets debounce & renders BEFORE state=done ---
+    // --- Case 3: Coordinator emits user-facing summary via ACP after workers finish -> renders BEFORE state=done ---
     const oscLenBeforeLate = host.osc7501.length;
     writeFileSync(
       join(swarmDir, 'members.json'),
@@ -4467,7 +4571,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     await waitFor(() => controller.store.isSwarmWorking === true);
 
-    // All members go waiting -> enters 80ms quiet grace window
+    // All members go waiting (worker finished its subtask) -> still NO premature state=done!
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4481,9 +4585,11 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     await waitFor(() => controller.store.isSwarmWorking === false);
 
-    // 40ms into the 80ms grace window, inject a late coordinator summary chunk via ACP
-    await Bun.sleep(40);
+    // Wait longer than backgroundDoneGraceMs -> still NO state=done until coordinator actually replies
+    await Bun.sleep(120);
     expect(host.osc7501.slice(oscLenBeforeLate)).not.toContain('state=done');
+
+    // Coordinator wakes up and emits user-facing summary via ACP -> debounce waits then fires state=done STRICTLY AFTER render
     const streamBeforeLateChunk = host.rawStream.length;
     acp.send({
       jsonrpc: '2.0',
@@ -4497,8 +4603,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       },
     });
 
-    // Another 50ms later (90ms since worker finished, only 50ms since chunk), debounce reset must still hold off state=done
-    await Bun.sleep(50);
+    await Bun.sleep(40);
     expect(host.osc7501.slice(oscLenBeforeLate)).not.toContain('state=done');
 
     // Once quiet window after chunk completes, state=done fires STRICTLY AFTER the late summary is rendered
@@ -4691,6 +4796,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
 
     controller.store.setGitCommitSummary('feat: update greeting');
+    controller.scheduler.renderNow();
     await waitFor(
       () =>
         replayNodes().get('layer.git.app.side.commit.foot.commit-btn')?.p?.['disabled'] === false
@@ -4911,7 +5017,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         q2_other: 'homebrew',
       },
     });
-    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !controller.store.getState().isBusy);
 
     // 3. Round 2: Single-select answered via Other write-in writes ONLY `q1_other` (never invalid enum value in `q1`)
     void controller.submitInput('ask single question with other');
@@ -4929,6 +5035,3805 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     });
     await waitFor(() => !controller.store.getState().isStreaming);
     expect(controller.currentSurfaceFocus).toBe(EDITOR_NODE_ID);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Tool Call Display modes (all / compact / hidden) via Alt+O & /settings: groups routine tools, hides completed tools while keeping running & ask tools visible, and persists to config.toml', async () => {
+    const tmp = makeTempDir();
+    const configPath = join(tmp, 'config.toml');
+    const host = new FakeTernHost({
+      features: ['blobs', 'styles', 'settle', 'dock', 'scroll', 'font', 'aside'],
+    });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let turnCounter = 0;
+    const releaseRunningTurn = Promise.withResolvers<void>();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-tool-display', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        turnCounter += 1;
+        if (turnCounter === 1) {
+          // Turn 1: 3 completed routine tools (2 bash + 1 read) + final answer
+          const tools = [
+            { id: 'tc-bash-1', name: 'run_command', kind: 'execute', title: 'python -c "print(1)"' },
+            { id: 'tc-bash-2', name: 'run_command', kind: 'execute', title: 'python -c "print(2)"' },
+            { id: 'tc-read-1', name: 'read_file', kind: 'read', title: 'README.md' },
+          ];
+          for (const t of tools) {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: t.id,
+                  name: t.name,
+                  kind: t.kind,
+                  title: t.title,
+                  status: 'in_progress',
+                },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: t.id,
+                  status: 'completed',
+                  rawOutput: { output: 'ok', exit_code: 0 },
+                },
+              },
+            });
+          }
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-tool-display',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'All checks finished.' },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else {
+          // Turn 2: an actively running bash tool to verify `hidden` keeps running tools visible
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-tool-display',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-live-bash',
+                name: 'run_command',
+                kind: 'execute',
+                title: 'sleep 10',
+                status: 'in_progress',
+              },
+            },
+          });
+          void releaseRunningTurn.promise.then(() => {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-live-bash',
+                  status: 'completed',
+                  rawOutput: { output: 'done', exit_code: 0 },
+                },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Second turn done.' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: join(tmp, 'brain'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (node: WireNode): void => {
+        nodes.set(node.id, { k: node.k, p: { ...(node.p ?? {}) } });
+        if (Array.isArray(node.c)) {
+          for (const child of node.c) addSubtree(child);
+        }
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const hasNodeSuffix = (
+      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
+      suffix: string
+    ): boolean => {
+      for (const key of nodes.keys()) {
+        if (key === suffix || key.endsWith(`.${suffix}`) || key.endsWith(`-${suffix}`)) return true;
+      }
+      return false;
+    };
+
+    // 1. Default mode = 'all': all 3 routine tools render directly under main with full previews
+    await controller.submitInput('run checks');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => {
+      const n = replayNodes();
+      return (
+        hasNodeSuffix(n, 'tc-bash-1') &&
+        hasNodeSuffix(n, 'tc-bash-2') &&
+        hasNodeSuffix(n, 'tc-read-1') &&
+        n.get('main.t0-tc-bash-1')?.p['preview'] === 'children'
+      );
+    });
+
+    // 2. Press Alt+O (`\x1bo`) -> switches to 'compact': keeps native top-level `<tool>` nodes
+    // (no custom `oma.tool.group` wrapper that breaks Tern's `Worked for ...` folding),
+    // rendered as compact single-line inline rows (`frame='inline'`, `preview='none'`).
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'compact');
+    await waitFor(() => {
+      const n = replayNodes();
+      const b1 = n.get('main.t0-tc-bash-1');
+      const r1 = n.get('main.t0-tc-read-1');
+      return (
+        b1?.k === 'tool' &&
+        b1?.p['frame'] === 'inline' &&
+        b1?.p['preview'] === 'none' &&
+        r1?.k === 'tool' &&
+        r1?.p['frame'] === 'inline' &&
+        r1?.p['preview'] === 'none'
+      );
+    });
+    expect(replayNodes().has('main.t0-folded-tc-bash-1')).toBe(false);
+
+    // 3. Press Alt+O again -> switches to 'hidden': wraps completed routine tools in native `omp.activity` (`hidden: true`) AND persists `tool_display = "hidden"` to config.toml
+    const isHiddenNode = (
+      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
+      suffix: string
+    ): boolean => {
+      for (const key of nodes.keys()) {
+        if (key === suffix || key.endsWith(`.${suffix}`) || key.endsWith(`-${suffix}`)) {
+          // Walk ancestor chain to see if mounted inside a `hidden: true` container
+          let cur = key;
+          while (cur.includes('.')) {
+            if (nodes.get(cur)?.p['hidden'] === true) return true;
+            cur = cur.slice(0, cur.lastIndexOf('.'));
+          }
+          return nodes.get(cur)?.p['hidden'] === true;
+        }
+      }
+      return true;
+    };
+
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'hidden');
+    await waitFor(() => {
+      const n = replayNodes();
+      return (
+        !n.has('main.t0-folded-tc-bash-1') &&
+        n.get('main.t0-activity-tc-bash-1')?.p['role'] === 'omp.activity' &&
+        n.get('main.t0-activity-tc-bash-1')?.p['hidden'] === true &&
+        isHiddenNode(n, 'tc-bash-1') &&
+        isHiddenNode(n, 'tc-read-1')
+      );
+    });
+    await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('tool_display = "hidden"'));
+    const parsedSaved = parseConfigToml(readFileSync(configPath, 'utf8'));
+    expect(parsedSaved.warnings).toEqual([]);
+    expect(parsedSaved.config.ui.tool_display).toBe('hidden');
+
+    // 4. In 'hidden' mode, actively running tools stay visible while streaming, then hide via `omp.activity` once completed
+    void controller.submitInput('run live command');
+    await waitFor(() => !isHiddenNode(replayNodes(), 'tc-live-bash'));
+    releaseRunningTurn.resolve();
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => isHiddenNode(replayNodes(), 'tc-live-bash'));
+
+    // 5. `/settings` `ui.tool_display` choice switches back to 'all' and restores visible individual tool rows
+    await controller.submitInput('/settings');
+    await waitFor(() => controller.store.getState().settings !== null);
+    host.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.tool_display',
+      value: 'all',
+    });
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'all');
+    await waitFor(() => !isHiddenNode(replayNodes(), 'tc-bash-1'));
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('regression: resumed thoughts omit fake 0ms, pre-tool text finalizes immediately (stream=false), and in-flight background tool at end_turn defers OSC done until tool_call_update + final reply', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 500_000;
+    const resumeSessionId = 'sess-resume-bg-regression';
+    const releaseToolFinish = Promise.withResolvers<void>();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        // Replay a historical turn instantaneously (0ms wall-clock gap)
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Historical prompt' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Historical reasoning' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-hist-bash',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'completed',
+              title: 'echo hist',
+              args: { CommandLine: 'echo hist' },
+              content: [
+                {
+                  type: 'content',
+                  content: {
+                    type: 'text',
+                    text: 'Created At: 2026-11-22T12:41:22+08:00\nCompleted At: 2026-11-22T12:41:25+08:00\nCommand exited with code 0.\n\nhist',
+                  },
+                },
+              ],
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-hist-read',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'README.md',
+              args: { Path: 'README.md' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Historical done.' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: resumeSessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        // Real agy acp pattern: text before tool -> in_progress run_command -> status msg -> end_turn while tool still running -> later completed + final reply
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Starting migration now...' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-bg-migrate',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'in_progress',
+              title: 'python migrate.py',
+              args: { CommandLine: 'python migrate.py', WaitMsBeforeAsync: 500 },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Migrating in background, waiting for completion.' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { stopReason: 'end_turn', usage: { inputTokens: 1000, outputTokens: 120 } },
+        });
+
+        void releaseToolFinish.promise.then(() => {
+          clock += 2000;
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: resumeSessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-bg-migrate',
+                name: 'run_command',
+                status: 'completed',
+                rawOutput: { output: 'Command exited with code 0.\n\nOK', exit_code: 0 },
+              },
+            },
+          });
+          setTimeout(() => {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: resumeSessionId,
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\n\nMigration finished cleanly!' } },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: resumeSessionId,
+                update: { sessionUpdate: 'usage_update', used: 2000, size: 1048576 },
+              },
+            });
+          }, 25);
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', resumeSessionId]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      backgroundDoneGraceMs: 60,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Resumed session: thought renders as plain 'Thought' (NO 'Thought for 0ms' and NO took=0)
+    const nodesAfterResume = replayNodes();
+    const replayedThought = [...nodesAfterResume.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(replayedThought).toBeDefined();
+    expect(JSON.stringify(replayedThought?.p['head'])).toContain('Thought');
+    expect(JSON.stringify(replayedThought?.p['head'])).not.toContain('0ms');
+    expect(replayedThought?.p['took']).toBeUndefined();
+
+    // Resumed bash tool with Created At/Completed At recovers real 3000ms duration; read tool without timestamps has undefined took
+    const histBash = [...nodesAfterResume.entries()].find(
+      ([id, n]) => n.k === 'tool' && (id.endsWith('.tc-hist-bash') || id.endsWith('-tc-hist-bash'))
+    )?.[1];
+    const histRead = [...nodesAfterResume.entries()].find(
+      ([id, n]) => n.k === 'tool' && (id.endsWith('.tc-hist-read') || id.endsWith('-tc-hist-read'))
+    )?.[1];
+    expect(histBash?.p['took']).toBe(3000);
+    expect(histRead?.p['took']).toBeUndefined();
+
+    // Resumed turn footer must NOT display fake '0ms'
+    const turn0Usage = [...nodesAfterResume.entries()].find(
+      ([id]) => id.startsWith('main.t0-') && id.endsWith('.turn-usage.text')
+    )?.[1];
+    expect(String(turn0Usage?.p['text'] ?? '')).toBe('2 tools');
+
+    // 2. Live prompt with in-flight background tool at end_turn:
+    const oscLenBefore = host.osc7501.length;
+    await controller.submitInput('Migrate now');
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // Pre-tool text segment MUST already have stream=false (not held in streaming buffer while tool runs)
+    const nodesWhileRunning = replayNodes();
+    const preToolMd = [...nodesWhileRunning.values()].find(
+      n => n.k === 'md' && n.p['text'] === 'Starting migration now...'
+    );
+    expect(preToolMd).toBeDefined();
+    expect(preToolMd?.p['stream']).toBe(false);
+
+    // Tool MUST stay running, turn-1 MUST NOT settle prematurely, and OSC 7501 state=done MUST NOT fire!
+    const bgTool = controller.store.transcript.getToolById('tc-bg-migrate');
+    expect(bgTool?.status).toBe('running');
+    expect(bgTool?.endedAt).toBeUndefined();
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    await Bun.sleep(100);
+    expect(host.osc7501.slice(oscLenBefore)).not.toContain('state=done');
+    expect(
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t1-'))
+    ).toBe(false);
+
+    // 3. Complete background tool + deliver post-tool final reply -> appended to SAME turn-1, settled, THEN state=done fires!
+    releaseToolFinish.resolve();
+    await waitFor(() => host.osc7501.slice(oscLenBefore).includes('state=done'));
+
+    expect(controller.store.transcript.turns).toHaveLength(2);
+    expect(controller.store.transcript.turns[1]?.assistantText).toContain('Migration finished cleanly!');
+    expect(controller.store.transcript.getToolById('tc-bg-migrate')?.status).toBe('done');
+    expect(
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t1-'))
+    ).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('session/load drains trailing async replay updates emitted after RPC response without splitting turns, losing footer, or misplacing edits', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const resumeSessionId = 'sess-trailing-replay-1';
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = String((msg.params as { sessionId?: string })?.sessionId ?? resumeSessionId);
+        // Batch 1 arrives BEFORE session/load RPC response
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'First historical question' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'First historical answer.' },
+            },
+          },
+        });
+
+        // Resolve session/load EARLY while trailing historical updates are still in flight (real agy acp behavior)
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid },
+        });
+
+        // Batch 2 arrives AFTER session/load RPC response in staggered async chunks
+        setTimeout(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: 'Second historical question' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'Trailing replay thought' },
+              },
+            },
+          });
+        }, 15);
+
+        setTimeout(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-trailing-edit',
+                name: 'edit_file',
+                kind: 'edit',
+                title: 'File /work/src/app/controller.ts',
+                status: 'completed',
+                locations: [{ path: '/work/src/app/controller.ts' }],
+                content: [
+                  {
+                    type: 'diff',
+                    path: '/work/src/app/controller.ts',
+                    oldText: 'line1\nline2\n',
+                    newText: 'line1\nline2\nline3\n',
+                  },
+                ],
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-trailing-bash',
+                name: 'run_command',
+                kind: 'execute',
+                title: 'bun test',
+                status: 'completed',
+                rawOutput: { output: '162 pass', exit_code: 0 },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Final trailing historical summary.' },
+              },
+            },
+          });
+        }, 35);
+      } else if (msg.method === 'session/close') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        server.crash(0);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', resumeSessionId]),
+      config: {
+        ...DEFAULT_CONFIG,
+        ui: { ...DEFAULT_CONFIG.ui, tool_display: 'compact' },
+      },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      replayDrainQuietMs: 60,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Both turns must be cleanly separated, marked replayed & finalized as done (not merged into a streaming turn!)
+    const turns = controller.store.transcript.turns;
+    expect(turns).toHaveLength(2);
+    expect(turns[0]?.user?.text).toBe('First historical question');
+    expect(turns[0]?.status).toBe('done');
+    expect(turns[0]?.replayed).toBe(true);
+
+    expect(turns[1]?.user?.text).toBe('Second historical question');
+    expect(turns[1]?.status).toBe('done');
+    expect(turns[1]?.replayed).toBe(true);
+    expect(turns[1]?.thoughts[0]?.replayed).toBe(true);
+    expect(turns[1]?.thoughts[0]?.tookMs).toBeUndefined();
+    expect(turns[1]?.toolCalls.map(t => t.toolCallId)).toEqual([
+      'tc-trailing-edit',
+      'tc-trailing-bash',
+    ]);
+    expect(turns[1]?.assistantText).toBe('Final trailing historical summary.');
+
+    // 2. Trailing replay must NOT trigger live TPS or spurious OSC 7501 state=done
+    expect(controller.store.getState().sessionMetrics?.isStreamingTps ?? false).toBe(false);
+    expect(host.osc7501).not.toContain('state=done');
+
+    // 3. In compact mode, edit + bash fold together directly under `main` BEFORE the final assistant reply
+    const lastTurnIdx = turns[1]!.index;
+    const prefix = `main.t${lastTurnIdx}-`;
+    const mainAddOps = host.allOps.filter(
+      op => op[0] === 'add' && op[2] === 'main' && typeof op[1] === 'string' && op[1].startsWith(prefix)
+    );
+    // Note: reconcile.ts emits `add` in reverse order using `before` sibling ids; reconstruct visual order from `before`
+    const orderedTopIds: string[] = [];
+    for (const op of mainAddOps) {
+      const id = op[1] as string;
+      const beforeId = op[3] as string | null;
+      const curIdx = orderedTopIds.indexOf(id);
+      if (curIdx >= 0) orderedTopIds.splice(curIdx, 1);
+      if (beforeId === null) {
+        orderedTopIds.push(id);
+      } else {
+        const bIdx = orderedTopIds.indexOf(beforeId);
+        if (bIdx >= 0) orderedTopIds.splice(bIdx, 0, id);
+        else orderedTopIds.push(id);
+      }
+    }
+    const editToolIdx = orderedTopIds.findIndex(id => id.endsWith('-tc-trailing-edit'));
+    const finalReplyIdx = orderedTopIds.findIndex(id => id.includes('-assistant-msg-'));
+    expect(editToolIdx).toBeGreaterThanOrEqual(0);
+    expect(finalReplyIdx).toBeGreaterThan(editToolIdx);
+    // No orphan edit tool after the final assistant reply
+    expect(orderedTopIds.slice(finalReplyIdx + 1).some(id => id.includes('tc-trailing-edit'))).toBe(
+      false
+    );
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('omp-aligned thought & tool UX: live thought survives Ctrl+T with rate/tokens, whole-second Thought for Ns, Ctrl+O decoupled, toolSummary->intent, Bash preview=children, auto-expand running edit, Read(N) group, compact single edit preview=none, and Ctrl+Shift+O hidden toggle', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 1_000_000;
+    const releaseLiveThought = Promise.withResolvers<void>();
+    const releaseRunningEdit = Promise.withResolvers<void>();
+    let promptCount = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-omp-ux' } });
+      } else if (msg.method === 'session/prompt') {
+        promptCount += 1;
+        if (promptCount === 1) {
+          // Turn 0: quick 400ms thought -> rounds to 'Thought for 1s', Bash with toolSummary -> intent + preview='children',
+          // consecutive 2 Reads -> Read (2) group, running Edit -> auto-expanded then collapsed when done
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'Inspecting project files and running tests.' },
+              },
+            },
+          });
+          clock += 400;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-bash-intent',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'bun test',
+                args: { CommandLine: 'bun test', toolSummary: 'Run unit test suite' },
+                rawOutput: { output: '164 pass', exit_code: 0 },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-read-a',
+                name: 'read_file',
+                kind: 'read',
+                status: 'completed',
+                title: 'File /work/src/a.ts',
+                locations: [{ path: '/work/src/a.ts' }],
+                rawOutput: { output: 'export const a = 1;\n' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-read-b',
+                name: 'read_file',
+                kind: 'read',
+                status: 'completed',
+                title: 'File /work/src/b.ts',
+                locations: [{ path: '/work/src/b.ts' }],
+                rawOutput: { output: 'export const b = 2;\n' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-edit-live',
+                name: 'edit_file',
+                kind: 'edit',
+                status: 'in_progress',
+                title: 'File /work/src/a.ts',
+                locations: [{ path: '/work/src/a.ts' }],
+                content: [
+                  {
+                    type: 'diff',
+                    path: '/work/src/a.ts',
+                    oldText: 'export const a = 1;\n',
+                    newText: 'export const a = 2;\n',
+                  },
+                ],
+              },
+            },
+          });
+
+          void releaseRunningEdit.promise.then(() => {
+            clock += 600;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-edit-live',
+                  status: 'completed',
+                },
+              },
+            });
+            clock += 200;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_thought_chunk',
+                  content: { type: 'text', text: 'Summarizing the final answer.' },
+                },
+              },
+            });
+            clock += 300;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Updated a.ts successfully.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          // Turn 1: live streaming thought while showThinking === false -> must STILL render live thought + rate + tokens!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: {
+                  type: 'text',
+                  text: 'Streaming deep reasoning tokens to verify live rate and tooltip display...',
+                },
+              },
+            },
+          });
+          clock += 1000;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: {
+                  type: 'text',
+                  text: ' More reasoning tokens arriving steadily over one second.',
+                },
+              },
+            },
+          });
+          void releaseLiveThought.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Done.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        server.crash(0);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, tool_display: 'all' } },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // 1. Start Turn 0 and inspect while edit_file is still in_progress:
+    const p1 = controller.submitInput('update a.ts');
+    await waitFor(() => replayNodes().has('main.t0-tc-edit-live'));
+
+    const midNodes = replayNodes();
+    // Flat main structure: direct top-level nodes under `main` (NO `main.turn-0` wrapper!)
+    expect(midNodes.has('main.turn-0')).toBe(false);
+    expect(midNodes.get('main.t0-user')?.p['role']).toBe('omp.user');
+    // Running edit_file auto-expands (`collapsed === false`)
+    expect(midNodes.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(false);
+    // Bash tool is direct child of `main`, maps `toolSummary` -> `intent`, and uses `preview: 'children'` in 'all' mode
+    const bashNode = midNodes.get('main.t0-tc-bash-intent');
+    expect(bashNode?.k).toBe('tool');
+    expect(bashNode?.p['intent']).toBe('Run unit test suite');
+    expect(bashNode?.p['preview']).toBe('children');
+    // Consecutive 2 Reads aggregate into a native `<tool role="omp.tool.read" frame="inline">` directly under `main`
+    // (aligned with `omp`'s `ReadToolGroupComponent`, so Tern's `Worked for ...` chain is never broken)
+    const readGroup = midNodes.get('main.t0-read-group-tc-read-a');
+    expect(readGroup?.k).toBe('tool');
+    expect(readGroup?.p['role']).toBe('omp.tool.read');
+    expect(readGroup?.p['name']).toBe('read');
+    expect(readGroup?.p['title']).toBe('Read');
+    expect(readGroup?.p['target']).toBe('2 files');
+    expect(readGroup?.p['frame']).toBe('inline');
+    expect(readGroup?.p['preview']).toBe('none');
+    expect(JSON.stringify(readGroup?.p['meta'] ?? '')).toContain('a.ts, b.ts');
+
+    // Finish Turn 0
+    releaseRunningEdit.resolve();
+    await p1;
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    const doneNodes = replayNodes();
+    // Completed 400ms thought rounds to 'Thought for 1s' and has token tooltip
+    const doneThought = [...doneNodes.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(JSON.stringify(doneThought?.p['head'] ?? '')).toContain('Thought for 1s');
+    expect(String(doneThought?.p['title'] ?? '')).toContain('tokens');
+    // Completed edit returns to collapsed=true
+    expect(doneNodes.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(true);
+    // Trailing thought right before final reply sits in its OWN thought-only `omp.assistant`
+    // container (separate from prose `Done.` + `omp.turn.usage`) so Tern's `Worked for ...`
+    // absorbs all thoughts cleanly without stranding a lone `Thought >` above the final answer.
+    const trailingThoughtEntry = [...doneNodes.entries()].find(
+      ([id, n]) =>
+        n.k === 'section' &&
+        n.p['role'] === 'omp.thinking' &&
+        doneNodes.get(`${id}.body`)?.p['text'] === 'Summarizing the final answer.'
+    );
+    expect(trailingThoughtEntry).toBeDefined();
+    const trailingThoughtParent = trailingThoughtEntry![0].slice(
+      0,
+      trailingThoughtEntry![0].lastIndexOf('.')
+    );
+    const proseMdEntry = [...doneNodes.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Updated a.ts successfully.'
+    );
+    expect(proseMdEntry).toBeDefined();
+    const proseParent = proseMdEntry![0].slice(0, proseMdEntry![0].lastIndexOf('.'));
+    expect(trailingThoughtParent).not.toBe(proseParent);
+    expect(doneNodes.get(`${proseParent}.turn-usage`)?.p['role']).toBe('omp.turn.usage');
+    expect(doneNodes.has(`${trailingThoughtParent}.turn-usage`)).toBe(false);
+
+    // 2. Ctrl+O expands tools ONLY — completed thought stays collapsed!
+    host.input.emit('\x0f');
+    await waitFor(() => controller.store.getState().expandAllTools === true);
+    const afterCtrlO = replayNodes();
+    expect(afterCtrlO.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(false);
+    const thoughtAfterCtrlO = [...afterCtrlO.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(thoughtAfterCtrlO?.p['collapsed']).toBe(true);
+    // Toggle Ctrl+O back off
+    host.input.emit('\x0f');
+    await waitFor(() => controller.store.getState().expandAllTools === false);
+
+    // 3. Ctrl+Shift+O (`CSI 111;6u`) toggles directly to 'hidden' (using omp.activity hidden=true) and back to 'all'
+    host.input.emit('\x1b[111;6u');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'hidden');
+    await waitFor(() => replayNodes().get('main.t0-activity-tc-bash-intent')?.p['hidden'] === true);
+    host.input.emit('\x1b[111;6u');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'all');
+
+    // 4. Compact mode: standalone completed edit uses preview='none' (single-line collapsed header)
+    controller.store.setToolDisplayMode('compact');
+    // Inject a standalone turn with a single edit to test standalone compact edit
+    const standaloneTurn = controller.store.transcript.beginUserTurn('single edit');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-solo-edit',
+      name: 'edit_file',
+      kind: 'edit',
+      status: 'completed',
+      title: 'File /work/src/solo.ts',
+      locations: [{ path: '/work/src/solo.ts' }],
+      content: [
+        { type: 'diff', path: '/work/src/solo.ts', oldText: 'a\n', newText: 'b\n' },
+      ],
+    });
+    controller.store.transcript.finishActiveTurn('end_turn');
+    controller.scheduler.renderNow();
+    const compactSolo = replayNodes().get(`main.t${standaloneTurn.index}-tc-solo-edit`);
+    expect(compactSolo?.p['preview']).toBe('none');
+
+    // 5. Ctrl+T hides completed thoughts, yet Turn 1's LIVE streaming thought remains visible with <rate unit="tok/s"> + tokens tooltip!
+    host.input.emit('\x14');
+    await waitFor(() => controller.store.getState().showThinking === false);
+    const afterCtrlT = replayNodes();
+    expect(
+      [...afterCtrlT.values()].some(n => n.k === 'section' && n.p['role'] === 'omp.thinking')
+    ).toBe(false);
+
+    const p2 = controller.submitInput('think live while hidden');
+    await waitFor(() =>
+      [...replayNodes().values()].some(n => n.k === 'section' && n.p['role'] === 'omp.thinking.live')
+    );
+    const liveNodes = replayNodes();
+    const liveThoughtEntry = [...liveNodes.entries()].find(
+      ([, n]) => n.k === 'section' && n.p['role'] === 'omp.thinking.live'
+    );
+    expect(liveThoughtEntry).toBeDefined();
+    const liveHead = liveNodes.get(`${liveThoughtEntry![0]}.head`);
+    expect(String(liveHead?.p['title'] ?? '')).toContain('tokens');
+    const liveRate = liveNodes.get(`${liveThoughtEntry![0]}.head.rate`);
+    expect(liveRate?.k).toBe('rate');
+    expect(liveRate?.p['unit']).toBe('tok/s');
+    expect(Number(liveRate?.p['value'] ?? 0)).toBeGreaterThanOrEqual(0.05);
+
+    releaseLiveThought.resolve();
+    await p2;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // Once finished while showThinking === false, the thought hides cleanly
+    await waitFor(() =>
+      ![...replayNodes().values()].some(
+        n => n.k === 'section' && (n.p['role'] === 'omp.thinking' || n.p['role'] === 'omp.thinking.live')
+      )
+    );
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P1 regressions: concurrent submit guard, attachment removal cancels file send, stale session updates filtered, broken config preserved, and rapid toggles serialize cleanly', async () => {
+    const tmp = makeTempDir();
+    const secretFile = join(tmp, 'secret.txt');
+    writeFileSync(secretFile, 'SECRET_ATTACHMENT_BODY', 'utf8');
+    const brokenConfigPath = join(tmp, 'broken-config.toml');
+    const brokenToml = 'agy_bin = "/custom/agy"\n[ui\nbroken syntax ===\n';
+    writeFileSync(brokenConfigPath, brokenToml, 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptCalls: Array<{ sessionId: string; prompt: unknown[] }> = [];
+    let releaseFirstPrompt = Promise.withResolvers<void>();
+    let currentServer: { send: (msg: Record<string, unknown>) => void; crash: (code: number) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      currentServer = server;
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'agy', version: '2.0.0' },
+            agentCapabilities: {
+              loadSession: true,
+              promptCapabilities: { image: true, embeddedContext: true },
+            },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        const sid = promptCalls.length === 0 ? 'sess-old' : 'sess-new';
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: [] },
+        });
+      } else if (msg.method === 'session/close') {
+        // Simulate old session failing to close cleanly
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32000, message: 'close busy' },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const params = msg.params as { sessionId: string; prompt: unknown[] };
+        promptCalls.push(params);
+        if (promptCalls.length === 1) {
+          void releaseFirstPrompt.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'First reply.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Second reply.' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath: brokenConfigPath,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P1-5: Toggling tool display via Alt+O with a malformed config.toml must keep the change
+    // in memory ONLY and must NOT overwrite or lose the user's original file (e.g. `agy_bin`).
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'compact');
+    await new Promise(r => setTimeout(r, 30));
+    expect(readFileSync(brokenConfigPath, 'utf8')).toBe(brokenToml);
+
+    // P1-1: Two concurrent `submitInput` calls before the first awaits completes must only send ONE `session/prompt`
+    const c1 = controller.submitInput('first concurrent');
+    const c2 = controller.submitInput('second concurrent');
+    await Promise.all([c1, c2]);
+    await waitFor(() => promptCalls.length === 1);
+    await new Promise(r => setTimeout(r, 30));
+    expect(promptCalls).toHaveLength(1);
+    releaseFirstPrompt.resolve();
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // P1-3: Switch to a new session while old session fails to close; stale updates from `sess-old` must be ignored
+    await controller.submitInput('/new');
+    await waitFor(() => controller.store.getState().sessionId === 'sess-new');
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    currentServer!.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-old',
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'STALE_LEAK_FROM_OLD_SESSION' },
+        },
+      },
+    });
+    await new Promise(r => setTimeout(r, 30));
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+
+    // P1-4: Add file attachment + `@secret.txt` in draft, then remove attachment via TSP remove action ->
+    // outbound `session/prompt` must NOT include `resource` or `resource_link` for `secret.txt`.
+    controller.store.draft.setText('Inspect @secret.txt please');
+    controller.store.addAttachment({
+      id: 'file-rm-1',
+      kind: 'file',
+      name: 'secret.txt',
+      ext: 'txt',
+      mime: 'text/plain',
+      path: 'secret.txt',
+    });
+    controller.scheduler.renderNow();
+    const removeIconId = host.findWireNodes(
+      n => n.k === 'icon' && n.p?.['title'] === 'Remove attachment'
+    )[0]?.id;
+    expect(removeIconId).toBeDefined();
+    host.input.emitTspEvent({
+      ev: 'action',
+      sf: 'oma',
+      id: removeIconId!,
+      act: 'remove',
+    });
+    await waitFor(() => controller.store.getState().pendingAttachments.length === 0);
+    // Removing the file attachment also strips `@secret.txt` from the draft AND suppresses it
+    expect(controller.store.draft.text).not.toContain('@secret.txt');
+    // Even if `@secret.txt` is passed again, removing the attachment suppresses file inclusion
+    await controller.submitInput('Inspect @secret.txt please');
+    await waitFor(() => promptCalls.length === 2);
+    await waitFor(() => !controller.store.getState().isStreaming);
+    const secondBlocks = promptCalls[1]!.prompt as Array<Record<string, unknown>>;
+    expect(secondBlocks.some(b => b['type'] === 'resource' || b['type'] === 'resource_link')).toBe(false);
+    expect(JSON.stringify(secondBlocks)).not.toContain('SECRET_ATTACHMENT_BODY');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // P2-5: Rapid Alt+O toggles on a valid config.toml serialize writes and `shutdown()` flushes final state
+    const tmp2 = makeTempDir();
+    const validCfg = join(tmp2, 'config.toml');
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    acp2.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-ser', configOptions: [] } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+    const controller2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath: validCfg,
+      cwd: tmp2,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp2, 'sessions') }),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise2 = controller2.run();
+    await controller2.readyPromise;
+    // Rapidly toggle all -> compact -> hidden -> all -> compact (4 times) and immediately shut down
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    host2.input.emit('\x1bo');
+    await waitFor(() => controller2.store.getState().toolDisplayMode === 'compact');
+    await controller2.shutdown({ cleanExit: true });
+    await runPromise2;
+    const saved = parseConfigToml(readFileSync(validCfg, 'utf8'));
+    expect(saved.parseError).toBeUndefined();
+    expect(saved.config.ui.tool_display).toBe('compact');
+  });
+
+  test('P1 regression: ACP process crash during session/load replay drain ends in crashed state (never ready)', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'agy', version: '2.0.0' },
+            agentCapabilities: { loadSession: true },
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-crash-replay',
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'old turn' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-crash-replay', configOptions: [] },
+        });
+        // Crash the ACP child while `#waitForReplayDrain()` is still waiting
+        setTimeout(() => {
+          server.crash(137);
+        }, 20);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', 'sess-crash-replay']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 120,
+    });
+
+    const runPromise = controller.run();
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    // Wait past the replay drain window to verify it NEVER transitions back to `ready`
+    await new Promise(r => setTimeout(r, 180));
+    const st = controller.store.getState();
+    expect(st.connectionStatus).toBe('crashed');
+    expect(st.isReady).toBe(false);
+    expect(st.crashError).not.toBeNull();
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P2 regressions: background handoff stays running, manual cancel marks tool+turn cancelled, ACP exit settles post-end_turn tool, and same-RPC swarm_wait reply emits OSC done', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let promptNum = 0;
+    let latestServer: { send: (msg: Record<string, unknown>) => void; crash: (code: number) => void } | null = null;
+    acp.setHandler((msg, server) => {
+      latestServer = server;
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-p2-bg', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        promptNum += 1;
+        if (promptNum === 1) {
+          // Turn 0: Same-RPC `swarm_wait` + coordinator final reply -> must settle & emit OSC done!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-sw-wait',
+                name: 'swarm_wait',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'swarm_wait',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-sw-wait',
+                status: 'completed',
+                content: [{ type: 'content', content: { type: 'text', text: 'woke up' } }],
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Coordinator final summary inside same RPC.' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 2) {
+          // Turn 1: `run_command` starts in_progress, returns end_turn while still running ->
+          // then completes with background task handoff (`task-handoff-1`) -> must stay running until manually cancelled!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-handoff',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'long build',
+                rawInput: { CommandLine: 'bun run build' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 3) {
+          // Turn 2: Leaves an in-flight background tool after end_turn, then ACP exits unexpectedly
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-bg',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-crash-bg',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'crash build',
+                rawInput: { CommandLine: 'sleep 99' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      backgroundDoneGraceMs: 25,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P2-4: Same-RPC swarm_wait + reply emits OSC 7501 done
+    await controller.submitInput('coordinate swarm');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => host.rawWrites.join('').includes('7501;state=done'));
+
+    // P2-3: In-flight placeholder tool hands off to detached background task on `completed` -> stays running!
+    await controller.submitInput('start bg build');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    latestServer!.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-p2-bg',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-handoff',
+          status: 'completed',
+          content: [
+            {
+              type: 'content',
+              content: {
+                type: 'text',
+                text: 'Tool is running as a background task with task id: sess-p2-bg/task-999',
+              },
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(r => setTimeout(r, 30));
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    expect(
+      controller.store.transcript
+        .getDetachedBackgroundTasks()
+        .some(t => t.taskId === 'sess-p2-bg/task-999' && t.status === 'running')
+    ).toBe(true);
+
+    // P2-2 (manual stop): Manually cancel while background task + still-open tool exist ->
+    // task, tool card, and turn all transition consistently to `cancelled` (never `done`)!
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-handoff-child',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'still running step',
+    });
+    await controller.cancelPendingAndTurn();
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(false);
+    const turn1 = controller.store.transcript.getVisibleTurns()[1]!;
+    expect(turn1.status).toBe('cancelled');
+    expect(turn1.toolCalls.find(t => t.toolCallId === 'tc-handoff-child')?.status).toBe('cancelled');
+
+    // P2-2 (ACP exit): Turn 2 ends RPC with background tool still running, then ACP crashes ->
+    // active turn and running tool card must be finalized (not left running)!
+    await controller.submitInput('crash bg');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    latestServer!.crash(1);
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    const turn2 = controller.store.transcript.getVisibleTurns()[2]!;
+    expect(turn2.status).toBe('error');
+    expect(turn2.toolCalls.find(t => t.toolCallId === 'tc-crash-bg')?.status).not.toBe('running');
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(false);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('P2 regressions: hidden mode keeps pending tool visible, Ctrl+O + manual Read group collapse sticks, and Ctrl+T preserves non-evicted prose after GoneEvent', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const releaseTurn = Promise.withResolvers<void>();
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-p2-ui', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Earlier prose block.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: 'Middle reasoning.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Surviving later prose block.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-r1',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'File /w/one.ts',
+              locations: [{ path: '/w/one.ts' }],
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-r2',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'File /w/two.ts',
+              locations: [{ path: '/w/two.ts' }],
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-p2-ui',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-pending-1',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'pending',
+              title: 'Queued command',
+            },
+          },
+        });
+        void releaseTurn.promise.then(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-p2-ui',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-pending-1',
+                status: 'completed',
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, tool_display: 'hidden' } },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const p = controller.submitInput('check ui edge cases');
+    await waitFor(() => replayNodes().has('main.t0-tc-pending-1'));
+
+    // P2-6a: In `hidden` mode, a `pending` tool is still mounted directly under `main` (not inside hidden `omp.activity`)
+    const midNodes = replayNodes();
+    expect(midNodes.get('main.t0-tc-pending-1')?.k).toBe('tool');
+    expect(midNodes.get('main.t0-tc-pending-1')?.p['status']).toBe('pending');
+    expect(midNodes.get('main.t0-activity-tc-r1')?.p['hidden']).toBe(true);
+
+    releaseTurn.resolve();
+    await p;
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // Switch to `all`, expand all with Ctrl+O, then manually collapse the Read group -> must stick!
+    controller.store.setToolDisplayMode('all');
+    controller.scheduler.renderNow();
+    await waitFor(() => replayNodes().has('main.t0-read-group-tc-r1'));
+    host.input.emit('\x0f');
+    await waitFor(() => replayNodes().get('main.t0-read-group-tc-r1')?.p['collapsed'] === false);
+    host.input.emitTspEvent({
+      ev: 'toggle',
+      sf: 'oma',
+      id: 'main.t0-read-group-tc-r1',
+      collapsed: true,
+    });
+    await waitFor(() => replayNodes().get('main.t0-read-group-tc-r1')?.p['collapsed'] === true);
+    expect(controller.store.getState().expandedToolGroups['turn-0:read-group-tc-r1']).toBe(false);
+
+    // P2-6c: Evict the first prose node via Tern GoneEvent, then hide thoughts via Ctrl+T ->
+    // the second (non-evicted) prose block must keep its own stable node ID and remain visible!
+    const beforeEvict = replayNodes();
+    const firstMdEntry = [...beforeEvict.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Earlier prose block.'
+    );
+    const secondMdEntry = [...beforeEvict.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Surviving later prose block.'
+    );
+    expect(firstMdEntry).toBeDefined();
+    expect(secondMdEntry).toBeDefined();
+    const firstParentId = firstMdEntry![0].slice(0, firstMdEntry![0].lastIndexOf('.'));
+    const secondParentId = secondMdEntry![0].slice(0, secondMdEntry![0].lastIndexOf('.'));
+    expect(firstParentId).not.toBe(secondParentId);
+
+    const opsBeforeGone = host.allOps.length;
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: [firstParentId] });
+    await waitFor(() => controller.scheduler.isEvicted(firstParentId));
+
+    host.input.emit('\x14'); // Ctrl+T hide thinking
+    await waitFor(() => controller.store.getState().showThinking === false);
+    const opsAfterGone = host.allOps.slice(opsBeforeGone);
+    // Protocol-level Gone handling must emit zero ops (including no redundant `del`) targeting the evicted node
+    expect(
+      opsAfterGone.some(
+        op =>
+          typeof op[1] === 'string' &&
+          (op[1] === firstParentId || op[1].startsWith(`${firstParentId}.`))
+      )
+    ).toBe(false);
+    const afterCtrlT = replayNodes();
+    expect(afterCtrlT.has(secondParentId)).toBe(true);
+    expect(afterCtrlT.get(secondMdEntry![0])?.p['text']).toBe('Surviving later prose block.');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 2 P1/P2 regressions: /new session epoch & buffered early updates, non-destructive draft mention removal, permanent cancelled/completed task state, and swarm reply/worker separation', async () => {
+    const tmp = makeTempDir();
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Test Swarm',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-1': { role: 'worker', phase: 'RUNNING', wake_mode: 'working', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(join(swarmDir, 'board.jsonl'), '', 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let sessionNum = 0;
+    const releaseOldPrompt = Promise.withResolvers<void>();
+    const releaseNewSession = Promise.withResolvers<void>();
+    let serverRef: { send: (msg: Record<string, unknown>) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      serverRef = server;
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        sessionNum += 1;
+        if (sessionNum === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-r2-1', configOptions: [] } });
+        } else {
+          // While `session/new` for sess-r2-2 is in flight:
+          // - stale old-session chunk arrives (must be discarded!)
+          // - early new-session `available_commands_update` arrives (must be buffered & applied!)
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-1',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'STALE_INFLIGHT_LEAK' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'fresh-cmd', description: 'Early command for new session' }],
+              },
+            },
+          });
+          void releaseNewSession.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              id: msg.id,
+              result: { sessionId: 'sess-r2-2', configOptions: [] },
+            });
+          });
+        }
+      } else if (msg.method === 'session/prompt') {
+        const params = msg.params as { sessionId: string };
+        if (params.sessionId === 'sess-r2-1') {
+          // Stays open across `/new`, then resolves late AFTER we switched to sess-r2-2
+          void releaseOldPrompt.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          // On sess-r2-2: swarm_wait + empty whitespace chunk (must NOT clear wait) + visible reply
+          // while worker snapshot still lags as `working` at `end_turn`!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-sw-r2',
+                name: 'swarm_wait',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'swarm_wait',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-sw-r2',
+                status: 'completed',
+              },
+            },
+          });
+          // Empty/whitespace chunk must NOT clear waiting state
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: '   ' },
+              },
+            },
+          });
+          // Actual visible coordinator reply
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2-2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'All swarm tasks finished!' },
+              },
+            },
+          });
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      swarmDir,
+      swarmPollIntervalMs: 25,
+      backgroundDoneGraceMs: 30,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // P2-1: Removing a file attachment preserves Python indentation, double spaces inside strings, and cursor position!
+    const pythonDraft = 'def f():\n    x = "a  b"\n    # ref @foo.py here\n    return x';
+    controller.store.draft.setText(pythonDraft, 12); // cursor inside `"a  b"` line
+    controller.store.addAttachment({
+      id: 'att-py-1',
+      kind: 'file',
+      name: 'foo.py',
+      ext: 'py',
+      mime: 'text/x-python',
+      path: 'foo.py',
+    });
+    controller.scheduler.renderNow();
+    const rmIcon = host.findWireNodes(n => n.k === 'icon' && n.p?.['title'] === 'Remove attachment')[0];
+    expect(rmIcon).toBeDefined();
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: rmIcon!.id, act: 'remove' });
+    await waitFor(() => controller.store.getState().pendingAttachments.length === 0);
+    expect(controller.store.draft.text).toBe('def f():\n    x = "a  b"\n    # ref here\n    return x');
+    expect(controller.store.draft.cursor).toBe(12);
+    controller.store.draft.reset();
+
+    // P1-1: Start a slow prompt on sess-r2-1, then run `/new` while prompt is still in flight
+    await controller.submitInput('long old turn');
+    await waitFor(() => controller.store.getState().isStreaming);
+    const newSessionPromise = controller.submitInput('/new');
+    // Before `session/new` resolves, verify `sessionId` is already cleared and stale leak did NOT enter transcript
+    await waitFor(() => controller.store.getState().sessionId === null);
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+
+    releaseNewSession.resolve();
+    await newSessionPromise;
+    await waitFor(() => controller.store.getState().sessionId === 'sess-r2-2');
+    // Stale old-session chunk was discarded, while early new-session command was buffered & applied!
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    expect(controller.store.commands.getAll().some(c => c.name === 'fresh-cmd')).toBe(true);
+
+    // Now let the old session's late prompt response arrive -> must NOT emit `state=done` or touch sess-r2-2!
+    const writesBeforeOldResolve = host.rawWrites.join('').length;
+    releaseOldPrompt.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    expect(host.rawWrites.join('').slice(writesBeforeOldResolve)).not.toContain('7501;state=done');
+
+    // P2-2: Cancelled tool card stays `cancelled` on late `completed`; completed handoff task stays `completed` on late title update
+    const tTool = controller.store.transcript.beginUserTurn('cancel & handoff test');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-cancel-persist',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'slow job',
+    });
+    controller.store.transcript.finalizeBackgroundTurn({
+      terminalToolStatus: 'cancelled',
+      terminalTurnStatus: 'cancelled',
+    });
+    expect(tTool.toolCalls[0]?.status).toBe('cancelled');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-cancel-persist',
+      status: 'completed',
+    });
+    expect(tTool.toolCalls[0]?.status).toBe('cancelled');
+
+    const tHandoff = controller.store.transcript.beginUserTurn('completed handoff stays terminal');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-bg-done',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'bg job',
+      content: [{ type: 'content', content: { type: 'text', text: 'Tool is running as a background task with task id: sess-r2-2/task-77' } }],
+    });
+    expect(controller.store.transcript.completeBackgroundTask('sess-r2-2/task-77', 'completed')).toBe(true);
+    expect(controller.store.transcript.hasActiveBackgroundTasks()).toBe(false);
+    // Late incremental title-only update on `tc-bg-done` must NOT resurrect the completed task back to `running`!
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-bg-done',
+      title: 'bg job (renamed)',
+    });
+    expect(controller.store.transcript.hasActiveBackgroundTasks()).toBe(false);
+    controller.store.transcript.finishActiveTurn('end_turn');
+    expect(tHandoff.status).toBe('done');
+
+    // P2-3: On sess-r2-2, swarm worker is still `working` when coordinator emits visible reply + `end_turn`.
+    // Once watcher sees worker transition to `waiting`, OSC 7501 `state=done` MUST fire!
+    await waitFor(() => controller.store.isSwarmWorking === true);
+    const writesBeforeSwarm = host.rawWrites.join('').length;
+    await controller.submitInput('finish swarm');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // While worker-1 is still `working`, `done` must not have fired yet
+    await new Promise(r => setTimeout(r, 40));
+    expect(host.rawWrites.join('').slice(writesBeforeSwarm)).not.toContain('7501;state=done');
+
+    // Transition swarm members to `waiting` (no second coordinator reply arrives!) -> deferred `done` must fire!
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Test Swarm',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-1': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    await waitFor(() => host.rawWrites.join('').slice(writesBeforeSwarm).includes('7501;state=done'));
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 3 P1/P2 regressions: rapid double /new preserves latest command buffer, late anchor save does not overwrite OSC anchor, and stale permission/elicitation requests are rejected cleanly', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let newCount = 0;
+    const releaseNew2 = Promise.withResolvers<void>();
+    const releaseNew3 = Promise.withResolvers<void>();
+    const releaseOldSave = Promise.withResolvers<void>();
+    const serverResponses: Array<{ id: unknown; result: unknown }> = [];
+    let serverRef: { send: (msg: Record<string, unknown>) => void } | null = null;
+
+    acp.setHandler((msg, server) => {
+      serverRef = server;
+      if (msg.id !== undefined && msg.method === undefined) {
+        serverResponses.push({ id: msg.id, result: msg.result });
+        return;
+      }
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      } else if (msg.method === 'session/new') {
+        newCount += 1;
+        if (newCount === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-kept', configOptions: [] } });
+        } else if (newCount === 2) {
+          void releaseNew2.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-superseded', configOptions: [] } });
+          });
+        } else {
+          // Third session (second `/new`) pushes an early slash command BEFORE resolving
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-current',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'final-cmd', description: 'Must survive superseded /new finally' }],
+              },
+            },
+          });
+          void releaseNew3.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-current', configOptions: [] } });
+          });
+        }
+      } else if (msg.method === 'session/prompt') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const basePreviewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    let holdKeptSave = false;
+    const delayedPreviewStore = Object.assign(Object.create(Object.getPrototypeOf(basePreviewStore)), basePreviewStore, {
+      async save(input: Parameters<PreviewStore['save']>[0]): Promise<string> {
+        const savedPath = await basePreviewStore.save(input);
+        if (input.sessionId === 'sess-kept' && holdKeptSave) {
+          await releaseOldSave.promise;
+        }
+        return savedPath;
+      },
+    }) as PreviewStore;
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: delayedPreviewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    expect(controller.store.getState().sessionId).toBe('sess-kept');
+
+    // Trigger a prompt on `sess-kept` whose post-turn anchor `save()` will resolve LATE after we switch sessions
+    holdKeptSave = true;
+    await controller.submitInput('trigger delayed anchor save');
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // P1-2: Trigger TWO consecutive `/new` calls while neither has resolved yet!
+    const firstNew = controller.submitInput('/new');
+    await waitFor(() => newCount === 2);
+    const secondNew = controller.submitInput('/new');
+    await waitFor(() => newCount === 3);
+
+    // First (superseded) `/new` resolves FIRST and runs its `finally` block -> must NOT wipe second `/new`'s command buffer!
+    releaseNew2.resolve();
+    await firstNew;
+    // Now second `/new` resolves -> must apply its buffered `final-cmd`!
+    releaseNew3.resolve();
+    await secondNew;
+    await waitFor(() => controller.store.getState().sessionId === 'sess-current');
+    expect(controller.store.commands.getAll().some(c => c.name === 'final-cmd')).toBe(true);
+
+    // P2-1a: Now let `sess-kept`'s delayed anchor `save()` resolve -> OSC 1337 SetUserVar must NOT revert to `sess-kept.json`!
+    const writesBeforeLateAnchor = host.rawWrites.join('').length;
+    releaseOldSave.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    const lateOsc = host.rawWrites.join('').slice(writesBeforeLateAnchor);
+    expect(lateOsc).not.toContain('SetUserVar=omp_session_file=');
+
+    // P2-1b: Stale reverse server requests (`session/request_permission` & `elicitation/create`) carrying old sessionId
+    // must be automatically cancelled without mounting into `sess-current` UI!
+    serverRef!.send({
+      jsonrpc: '2.0',
+      id: 9001,
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'sess-kept',
+        toolCall: { toolCallId: 'tc-stale-perm', title: 'stale rm' },
+        options: [
+          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      },
+    });
+    serverRef!.send({
+      jsonrpc: '2.0',
+      id: 9002,
+      method: 'elicitation/create',
+      params: {
+        sessionId: 'sess-kept',
+        mode: 'form',
+        message: 'Stale question',
+        requestedSchema: { type: 'object', properties: { q1: { type: 'string' } } },
+      },
+    });
+    await waitFor(
+      () =>
+        serverResponses.some(r => r.id === 9001) &&
+        serverResponses.some(r => r.id === 9002)
+    );
+    expect(controller.store.approvals.hasPending()).toBe(false);
+    expect(controller.store.getState().activeQuestion).toBeNull();
+    expect(serverResponses.find(r => r.id === 9001)?.result).toEqual({
+      outcome: { outcome: 'cancelled' },
+    });
+    expect(serverResponses.find(r => r.id === 9002)?.result).toEqual({ action: 'cancel' });
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Review Round 4 P1 regression: interleaved /resume and /new in BOTH directions preserve latest session, discard old replay, keep early commands, and leave scheduler unsuspended', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let newCount = 0;
+    let loadCount = 0;
+    let closeStarted = 0;
+    let holdFirstClose = true;
+    const releaseFirstClose = Promise.withResolvers<void>();
+    const releaseReplay2 = Promise.withResolvers<void>();
+    const releaseNewAfterReplay = Promise.withResolvers<void>();
+    const loadedSessionIds: string[] = [];
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/list') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: 'sess-hist-1',
+                cwd: tmp,
+                title: 'Historical Session 1',
+                updatedAt: '2026-11-22T10:00:00Z',
+              },
+              {
+                sessionId: 'sess-hist-2',
+                cwd: tmp,
+                title: 'Historical Session 2',
+                updatedAt: '2026-11-22T11:00:00Z',
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        newCount += 1;
+        if (newCount === 1) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-init', configOptions: [] } });
+        } else if (newCount === 2) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-new-wins', configOptions: [] } });
+        } else {
+          // Third `/new` (started WHILE `sess-hist-2` is mid-replay):
+          // Old replay emits a trailing message, while new session emits its early slash command!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-hist-2',
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: 'STALE_REPLAY_MESSAGE_MUST_NOT_LEAK' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-after-replay',
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [{ name: 'after-replay-cmd', description: 'Early command after replay' }],
+              },
+            },
+          });
+          void releaseNewAfterReplay.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-after-replay', configOptions: [] } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        closeStarted += 1;
+        if (holdFirstClose) {
+          holdFirstClose = false;
+          void releaseFirstClose.promise.then(() => {
+            server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+          });
+        } else {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        loadedSessionIds.push(sid);
+        loadCount += 1;
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: `History turn of ${sid}` },
+            },
+          },
+        });
+        void releaseReplay2.promise.then(() => {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: sid, configOptions: [] } });
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 80,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    expect(controller.store.getState().sessionId).toBe('sess-init');
+
+    // Direction 1: Activate `/resume` for `sess-hist-1` -> blocks on `session/close` ->
+    // `/new` completes -> release old `/resume`'s `closeSession` -> MUST NOT load `sess-hist-1` or revert UI!
+    await controller.submitInput('/resume sess-hist-1');
+    await waitFor(() => controller.store.getState().picker?.selectedId === 'sess-hist-1');
+    host.input.emit('\r');
+    await waitFor(() => closeStarted === 1);
+
+    await controller.submitInput('/new');
+    await waitFor(() => controller.store.getState().sessionId === 'sess-new-wins');
+    releaseFirstClose.resolve();
+    await new Promise(r => setTimeout(r, 40));
+    expect(controller.store.getState().sessionId).toBe('sess-new-wins');
+    expect(loadedSessionIds).not.toContain('sess-hist-1');
+    expect(controller.scheduler.suspended).toBe(false);
+
+    // Direction 2: Activate `/resume` for `sess-hist-2` -> actively replaying -> trigger `/new` mid-replay ->
+    // new session must NOT inherit old replay message, MUST keep its own early command,
+    // and scheduler MUST NOT remain suspended!
+    await controller.submitInput('/resume sess-hist-2');
+    await waitFor(() => controller.store.getState().picker?.selectedId === 'sess-hist-2');
+    host.input.emit('\r');
+    await waitFor(() => loadCount === 1 && controller.store.getState().isReplaying === true);
+    expect(controller.scheduler.suspended).toBe(true);
+
+    const newDuringReplay = controller.submitInput('/new');
+    await waitFor(() => newCount === 3);
+    releaseReplay2.resolve();
+    await new Promise(r => setTimeout(r, 30));
+    releaseNewAfterReplay.resolve();
+    await newDuringReplay;
+
+    await waitFor(() => controller.store.getState().sessionId === 'sess-after-replay');
+    expect(controller.store.getState().isReplaying).toBe(false);
+    expect(controller.scheduler.suspended).toBe(false);
+    expect(controller.store.transcript.getVisibleTurns()).toHaveLength(0);
+    expect(controller.store.commands.getAll().some(c => c.name === 'after-replay-cmd')).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('OMP parity P1/P2 regressions: isolated SendEvent, /resume crash recovery + Retry, 1-credit Gone filtering, model Esc guard, quoted @mentions, Git wrap, progressive /resume search, and no-prefs /settings fallback', async () => {
+    const tmp = makeTempDir();
+    const spacedDir = join(tmp, 'my folder');
+    mkdirSync(spacedDir, { recursive: true });
+    const spacedFile = join(spacedDir, 'space note.txt');
+    writeFileSync(spacedFile, 'SPACED_FILE_CONTENT_OK\n', 'utf8');
+
+    // -----------------------------------------------------------------------
+    // Part A: Isolated SendEvent, Model Picker Esc guard, quoted @mention +
+    //         completion refresh, Git wrap prop, and progressive /resume search
+    // -----------------------------------------------------------------------
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    await previewStore.save({
+      sessionId: 'sess-cached-preview',
+      cwd: tmp,
+      title: 'Cached Title',
+      updatedAt: '2026-11-22T12:00:00Z',
+      turnCount: 2,
+      preview: [
+        { role: 'user', text: 'Investigate quantum_flux_capacitor timeout' },
+      ],
+    });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    const configOptionCalls: Array<{ configId: string; value: string }> = [];
+    const releaseRemoteList = Promise.withResolvers<void>();
+    let crashOnNextClose = false;
+    const loadedSessionsOnRetry: string[] = [];
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'sess-main-1',
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                name: 'Model',
+                type: 'select',
+                currentValue: 'model-a',
+                options: [
+                  { value: 'model-a', name: 'Model A' },
+                  { value: 'model-b', name: 'Model B' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                name: 'Thinking',
+                type: 'select',
+                currentValue: 'low',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { configId: string; value: string };
+        configOptionCalls.push(p);
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                name: 'Model',
+                type: 'select',
+                currentValue: p.configId === 'model' ? p.value : 'model-a',
+                options: [
+                  { value: 'model-a', name: 'Model A' },
+                  { value: 'model-b', name: 'Model B' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                name: 'Thinking',
+                type: 'select',
+                currentValue: p.configId === 'thought_level' ? p.value : 'low',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.method === 'session/list') {
+        void releaseRemoteList.promise.then(() => {
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              sessions: [
+                {
+                  sessionId: 'sess-cached-preview',
+                  cwd: tmp,
+                  title: 'Cached Title',
+                  updatedAt: '2026-11-22T12:00:00Z',
+                },
+              ],
+            },
+          });
+        });
+      } else if (msg.method === 'session/close') {
+        if (crashOnNextClose) {
+          crashOnNextClose = false;
+          server.crash(1);
+          return;
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        loadedSessionsOnRetry.push(sid);
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: [] },
+        });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async args => {
+        if (args[0] === 'rev-parse') return { exitCode: 0, stdout: `${tmp}\n` };
+        if (args[0] === 'status') return { exitCode: 0, stdout: ' M a.ts\0' };
+        if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'main\n' };
+        if (args.includes('--numstat')) return { exitCode: 0, stdout: '1\t0\ta.ts\n' };
+        if (args.includes('diff')) return { exitCode: 0, stdout: '@@ -1,1 +1,2 @@\n a\n+b\n' };
+        return { exitCode: 0, stdout: '' };
+      },
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 20,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1-1: Native `send` event isolation — draft text + image attachment stay untouched!
+    controller.store.draft.setText('my unfinished draft');
+    controller.store.addAttachment({
+      id: 'img-draft-1',
+      kind: 'image',
+      name: 'draft.png',
+      mime: 'image/png',
+      base64Data: 'AAAA',
+    });
+    // Blank native send must be rejected without touching draft or attachments
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: '   ' });
+    await new Promise(r => setTimeout(r, 30));
+    expect(promptsReceived).toHaveLength(0);
+    expect(controller.store.draft.text).toBe('my unfinished draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+
+    // Standalone non-blank send must NOT include draft image and must preserve draft + attachment
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: 'standalone prompt' });
+    await waitFor(() => promptsReceived.length === 1);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'image')).toBe(false);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'text' && b['text'] === 'standalone prompt')).toBe(true);
+    expect(controller.store.draft.text).toBe('my unfinished draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+    controller.store.draft.reset();
+    controller.store.clearAttachments();
+
+    // 2) Quoted @mention with spaces resolves standalone (e.g. recalled from history) without attachment sidecar
+    await controller.submitInput('Check @"my folder/space note.txt" please');
+    await waitFor(() => promptsReceived.length === 2);
+    const spacedResBlock = promptsReceived[1]!.find(b => b['type'] === 'resource') as
+      | { resource?: { text?: string } }
+      | undefined;
+    expect(spacedResBlock?.resource?.text).toContain('SPACED_FILE_CONTENT_OK');
+
+    // 3) P2-2: Model picker Esc while highlighting a DIFFERENT model must NOT mutate current model thinking
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    // Move selection to `model-b` (NOT current `model-a`), change thinking to `high`, press Esc
+    controller.store.setPickerSelected('model-b');
+    controller.store.setModelPickerThinking('high');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+    expect(configOptionCalls).toHaveLength(0);
+    expect(controller.store.getState().controls.currentThoughtLevel).toBe('low');
+
+    // Highlighting the CURRENT model `model-a`, changing thinking to `high`, pressing Esc DOES commit
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    expect(controller.store.getState().picker?.selectedId).toBe('model-a');
+    controller.store.setModelPickerThinking('high');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().controls.currentThoughtLevel === 'high');
+    expect(configOptionCalls.some(c => c.configId === 'thought_level' && c.value === 'high')).toBe(true);
+
+    // 4) Git overlay passes `wrap` prop directly onto `<diff>` node
+    await controller.submitInput('/git');
+    await waitFor(() => controller.store.getState().gitOverlay?.diff?.kind === 'diff');
+    host.input.emit('w');
+    await waitFor(() => controller.store.getState().gitOverlay?.wrap === true);
+    const hasWrapSetOp = host.allOps.some(
+      op =>
+        op[0] === 'set' &&
+        typeof op[1] === 'string' &&
+        op[1].includes('diff-') &&
+        (op[2] as Record<string, unknown>)?.['wrap'] === true
+    );
+    expect(hasWrapSetOp).toBe(true);
+    host.input.emit('q');
+    await waitFor(() => controller.store.getState().gitOverlay === null);
+
+    // 5) Progressive /resume displays local cached preview BEFORE remote session/list returns,
+    //    AND searches preview body text (`quantum_flux_capacitor`)!
+    await controller.submitInput('/resume quantum_flux_capacitor');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        controller.store.getState().picker?.selectedId === 'sess-cached-preview'
+    );
+    expect(controller.store.getState().picker?.loading).toBe(true);
+    releaseRemoteList.resolve();
+    await waitFor(() => controller.store.getState().picker?.loading === false);
+
+    // 6) P1-2: ACP exits during `session/close` of `/resume` -> renderer MUST NOT stay suspended,
+    //    crash banner MUST render on wire, and Retry MUST recover last committed session ID (`sess-main-1`)!
+    crashOnNextClose = true;
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().connectionStatus === 'crashed');
+    expect(controller.scheduler.suspended).toBe(false);
+    expect(controller.store.getState().isReplaying).toBe(false);
+    const crashNodes = host.findWireNodes(n => n.id.endsWith('crash-banner'));
+    expect(crashNodes.length).toBeGreaterThan(0);
+
+    // Trigger Retry button -> reloads `sess-main-1`
+    const retryBtn = host.findWireNodes(n => n.id.endsWith('crash-banner.end'));
+    expect(retryBtn.length).toBeGreaterThan(0);
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: retryBtn[retryBtn.length - 1]!.id, act: 'click' });
+    await waitFor(
+      () =>
+        loadedSessionsOnRetry.includes('sess-main-1') &&
+        controller.store.getState().sessionId === 'sess-main-1' &&
+        controller.store.getState().connectionStatus === 'ready'
+    );
+    expect(controller.store.getState().sessionId).toBe('sess-main-1');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // -----------------------------------------------------------------------
+    // Part B: P1-3 (1-credit Gone filtering before ACK flush) & no-prefs /settings fallback
+    // -----------------------------------------------------------------------
+    const hostB = new FakeTernHost({
+      credits: 1,
+      autoAck: true,
+      kinds: ['col', 'row', 'text', 'md', 'card', 'button', 'tabs', 'overlay', 'editor', 'status'],
+      features: ['blobs', 'settle', 'dock', 'scroll'],
+    });
+    const sessionB = await createConnectedSession(hostB);
+    const acpB = new MockAcpHarness();
+    acpB.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-b', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-b',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'First reply chunk' } },
+          },
+        });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerB = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: sessionB,
+      output: hostB.safeOutput,
+      acpSpawn: acpB.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions-b') }),
+      configPath: join(tmp, 'config-b.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runB = controllerB.run();
+    await controllerB.readyPromise;
+
+    // Verify no-prefs fallback: `/settings` opens fallback card overlay with ZERO `k: 'prefs'` nodes
+    expect(controllerB.store.getState().supportsPrefs).toBe(false);
+    await controllerB.submitInput('/settings');
+    await waitFor(() => controllerB.store.getState().settings !== null);
+    expect(hostB.findWireNodes(n => n.k === 'prefs')).toHaveLength(0);
+    expect(hostB.findWireNodes(n => n.id === 'layer.settings.fallback-card')).not.toHaveLength(0);
+    hostB.input.emit('\x1b');
+    await waitFor(() => controllerB.store.getState().settings === null);
+
+    // P1-3: 1-credit flow control + Gone BEFORE ACK flush
+    await controllerB.submitInput('hi');
+    await waitFor(
+      () =>
+        controllerB.store.transcript.turns.length === 1 &&
+        !controllerB.store.getState().isStreaming &&
+        hostB.findWireNodes(n => n.k === 'md' && n.p?.['text'] === 'First reply chunk').length > 0 &&
+        !controllerB.surface.blocked
+    );
+    const replyMdNode = hostB.findWireNodes(
+      n => n.k === 'md' && n.p?.['text'] === 'First reply chunk'
+    )[0]!;
+    const evictedAssistantId = replyMdNode.id.slice(0, replyMdNode.id.lastIndexOf('.'));
+    expect(evictedAssistantId.startsWith('main.t0-')).toBe(true);
+
+    // Pause autoAck, send one frame to exhaust the 1 credit, then mutate the evicted turn + trigger Gone BEFORE ACK!
+    hostB.setAutoAck(false);
+    controllerB.store.pushToast('fill-credit', 'info');
+    controllerB.scheduler.renderNow();
+    const blockedSeq = controllerB.surface.seq;
+    expect(controllerB.surface.blocked).toBe(true);
+
+    // Append text to the soon-to-be-evicted node while blocked, then deliver Gone followed immediately by ACK
+    controllerB.store.transcript.turns[0]!.assistantSegments[0]!.text += ' TRAILING_AFTER_GONE';
+    controllerB.scheduler.renderNow();
+
+    const opsBeforeGoneAck = hostB.allOps.length;
+    hostB.input.emitTspEvent({ ev: 'gone', ids: [evictedAssistantId] });
+    hostB.ackFrame('oma', blockedSeq);
+    await new Promise(r => setTimeout(r, 30));
+
+    // Re-enable autoAck and render another frame to ensure NO trailing `del` is emitted either!
+    hostB.setAutoAck(true);
+    controllerB.store.pushToast('after-gone-frame', 'info');
+    controllerB.scheduler.renderNow();
+    await new Promise(r => setTimeout(r, 30));
+
+    const opsAfterGone = hostB.allOps.slice(opsBeforeGoneAck);
+    const offendingOps = opsAfterGone.filter(op => {
+      const target = typeof op[1] === 'string' ? op[1] : '';
+      return target === evictedAssistantId || target.startsWith(`${evictedAssistantId}.`);
+    });
+    expect(offendingOps).toHaveLength(0);
+    // Semantic transcript history remains intact for `/copy` and `/export`
+    expect(controllerB.store.transcript.getAssistantMarkdownByReverseIndex(1)).toContain('First reply chunk');
+
+    await controllerB.shutdown({ cleanExit: true });
+    await runB;
+  });
+
+  test('OMP parity Round 2 regressions: isolated passthrough send, comma @mention round-trip, suspended ACK guard, /resume fast-fail rejection handling, deferred settleTurn, equal-length tool output update, and per-surface Gone routing', async () => {
+    const tmp = makeTempDir();
+    writeFileSync(join(tmp, 'a'), 'UNRELATED_FILE_A_CONTENT\n', 'utf8');
+    writeFileSync(join(tmp, 'a,b.txt'), 'TARGET_COMMA_FILE_CONTENT\n', 'utf8');
+
+    const host = new FakeTernHost({ credits: 1, autoAck: true });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    let failNextSessionList = false;
+    const holdReplayLoad = Promise.withResolvers<void>();
+    let promptSeq = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-r2', configOptions: [] },
+        });
+      } else if (msg.method === 'session/list') {
+        if (failNextSessionList) {
+          failNextSessionList = false;
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'fast session/list failure' },
+          });
+          return;
+        }
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: 'sess-replay-hold',
+                cwd: tmp,
+                title: 'Held Replay Session',
+                updatedAt: '2026-11-22T15:00:00Z',
+              },
+            ],
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = (msg.params as { sessionId: string }).sessionId;
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK' },
+            },
+          },
+        });
+        void holdReplayLoad.promise.then(() => {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: sid, configOptions: [] } });
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptSeq += 1;
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        if (promptSeq === 3) {
+          // Turn with tool call whose output will later be replaced with equal-length string
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-eqlen',
+                title: 'Run check',
+                kind: 'execute',
+                status: 'completed',
+                rawOutput: 'before',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Done turn 3' },
+              },
+            },
+          });
+        } else if (promptSeq === 4) {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r2',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Turn 4 active' },
+              },
+            },
+          });
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const slowPreviewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const origLoadMap = slowPreviewStore.loadMap.bind(slowPreviewStore);
+    let delayPreviewLoad = false;
+    slowPreviewStore.loadMap = async () => {
+      if (delayPreviewLoad) {
+        delayPreviewLoad = false;
+        await new Promise(r => setTimeout(r, 40));
+      }
+      return origLoadMap();
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: slowPreviewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 20,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1-1: Standalone native `send('/compact')` passthrough MUST preserve draft + image attachment
+    controller.store.draft.setText('keep this draft');
+    controller.store.addAttachment({
+      id: 'img-keep-1',
+      kind: 'image',
+      name: 'keep.png',
+      mime: 'image/png',
+      base64Data: 'BBBB',
+    });
+    host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: '/compact' });
+    await waitFor(() => promptsReceived.length === 1);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'text' && b['text'] === '/compact')).toBe(true);
+    expect(promptsReceived[0]!.some(b => b['type'] === 'image')).toBe(false);
+    expect(controller.store.draft.text).toBe('keep this draft');
+    expect(controller.store.getState().pendingAttachments).toHaveLength(1);
+    controller.store.draft.reset();
+    controller.store.clearAttachments();
+
+    // 2) P1-2: `@` completion for `a,b.txt` quotes as `@"a,b.txt"` so submission attaches ONLY `a,b.txt` (never `a`)
+    const { applyTriggerReplacement, detectCompletionTrigger } = await import('../src/editor/trigger');
+    const trig = detectCompletionTrigger('check @a,b', 10);
+    expect(trig?.kind).toBe('file');
+    const rep = applyTriggerReplacement('check @a,b', trig!, 'a,b.txt');
+    expect(rep.text).toBe('check @"a,b.txt" ');
+    await controller.submitInput(rep.text);
+    await waitFor(() => promptsReceived.length === 2);
+    const resBlocks = promptsReceived[1]!.filter(b => b['type'] === 'resource') as Array<{
+      resource?: { text?: string; uri?: string };
+    }>;
+    expect(resBlocks).toHaveLength(1);
+    expect(resBlocks[0]!.resource?.text).toContain('TARGET_COMMA_FILE_CONTENT');
+    expect(resBlocks.some(b => b.resource?.text?.includes('UNRELATED_FILE_A_CONTENT'))).toBe(false);
+
+    // 3) P2-2: Historical completed tool output replaced with equal-length string (`before` -> `after!`) MUST re-render
+    await controller.submitInput('run tool turn');
+    await waitFor(
+      () =>
+        promptsReceived.length === 3 &&
+        !controller.store.getState().isStreaming &&
+        !controller.surface.blocked
+    );
+    await controller.submitInput('next turn to make turn 2 historical');
+    await waitFor(
+      () =>
+        promptsReceived.length === 4 &&
+        !controller.store.getState().isStreaming &&
+        !controller.surface.blocked
+    );
+    const opsBeforeEqualReplace = host.allOps.length;
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-eqlen',
+      status: 'completed',
+      rawOutput: 'after!',
+    });
+    controller.scheduler.renderNow();
+    await waitFor(() => !controller.surface.blocked);
+    const opsAfterEqualReplace = JSON.stringify(host.allOps.slice(opsBeforeEqualReplace));
+    expect(opsAfterEqualReplace).toContain('after!');
+
+    // 4) P1-4: `/resume` fast ACP failure while preview load is still in flight MUST NOT trigger unhandledRejection
+    const unhandledErrors: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandledErrors.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      failNextSessionList = true;
+      delayPreviewLoad = true;
+      await controller.submitInput('/resume');
+      await waitFor(() =>
+        Boolean(controller.store.getState().picker?.error?.includes('fast session/list failure'))
+      );
+      await new Promise(r => setTimeout(r, 30));
+      expect(unhandledErrors).toHaveLength(0);
+      host.input.emit('\x1b');
+      await waitFor(() => controller.store.getState().picker === null);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    // 5) P2-1: `settleTurn` while blocked on 1-credit deferred render MUST settle real `main.t<idx>-*` (never `main.turn-<idx>`)
+    await waitFor(() => !controller.surface.blocked);
+    host.setAutoAck(false);
+    controller.store.pushToast('exhaust-credit-for-settle', 'info');
+    controller.scheduler.renderNow();
+    const settleBlockedSeq = controller.surface.seq;
+    expect(controller.surface.blocked).toBe(true);
+
+    // Add a new turn while blocked, schedule deferred render, and call settleTurn(newTurnIdx) before ACK
+    const deferredTurn = controller.store.transcript.beginUserTurn('deferred settle prompt', []);
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Deferred turn body' },
+    });
+    controller.store.transcript.finishActiveTurn('end_turn');
+    controller.scheduler.renderNow();
+    controller.scheduler.settleTurn(deferredTurn.index);
+
+    const opsBeforeSettleAck = host.allOps.length;
+    host.ackFrame('oma', settleBlockedSeq);
+    await new Promise(r => setTimeout(r, 30));
+    const settleOps = host.allOps
+      .slice(opsBeforeSettleAck)
+      .filter(op => op[0] === 'settle')
+      .map(op => op[1]);
+    expect(settleOps).not.toContain(`main.turn-${deferredTurn.index}`);
+    expect(settleOps.some(id => typeof id === 'string' && id.startsWith(`main.t${deferredTurn.index}-`))).toBe(true);
+
+    // 6) P1-3: While blocked on 1 credit with a deferred builder queued, switching session & suspending
+    //    replay MUST cancel the old builder so an incoming ACK emits ZERO partial replay frames!
+    const currentSeq = controller.surface.seq;
+    host.ackFrame('oma', currentSeq);
+    await waitFor(() => !controller.surface.blocked);
+
+    // Fill credit again, queue a deferred render, then start `/resume` (which suspends replay)
+    controller.store.pushToast('fill-before-resume', 'info');
+    controller.scheduler.renderNow();
+    const preResumeSeq = controller.surface.seq;
+    expect(controller.surface.blocked).toBe(true);
+    controller.store.pushToast('queued-deferred-builder', 'info');
+    controller.scheduler.renderNow(); // queued as deferred builder on surface
+
+    // Suspend for replay (simulating `/resume` transition) and add partial replayed turn
+    controller.scheduler.resetSession();
+    controller.scheduler.suspendForReplay();
+    controller.store.transcript.clear();
+    controller.store.transcript.beginUserTurn('PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK', []);
+
+    const opsBeforeSuspendedAck = host.allOps.length;
+    host.ackFrame('oma', preResumeSeq);
+    await new Promise(r => setTimeout(r, 30));
+    const leakedDuringSuspend = JSON.stringify(host.allOps.slice(opsBeforeSuspendedAck));
+    expect(leakedDuringSuspend).not.toContain('PARTIAL_REPLAY_MUST_NOT_LEAK_ON_ACK');
+
+    // 7) P2-5: Per-surface `Gone` routing — a `gone` event for surface `other-sf` MUST NOT evict
+    //    a same-named node or disable its callback on surface `oma`!
+    host.setAutoAck(true);
+    controller.scheduler.resumeAfterReplay(false);
+    await waitFor(() => !controller.surface.blocked);
+
+    const otherSurface = session.open({ id: 'other-sf', mode: 'inline' });
+    let otherClicked = 0;
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="shared-btn"
+            text="Other"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              otherClicked += 1;
+            }}
+          />
+        </col>
+      ),
+    });
+    await waitFor(() => !otherSurface.blocked);
+
+    // Evict `main.shared-btn` ONLY on `oma` — `other-sf`'s `main.shared-btn` callback must remain alive!
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.shared-btn'] });
+    await new Promise(r => setTimeout(r, 20));
+    host.input.emitTspEvent({ ev: 'action', sf: 'other-sf', id: 'main.shared-btn', act: 'click' });
+    await waitFor(() => otherClicked === 1);
+    expect(otherClicked).toBe(1);
+
+    // 8) P2 (cancelDeferred): cancelling a blocked pending view MUST:
+    //    (a) restore event routing to the on-screen `#sent` view (never fire cancelled view's callback), AND
+    //    (b) drop queued `settle` ops targeting nodes that were never flushed!
+    host.setAutoAck(false);
+    let sentBtnClicks = 0;
+    let cancelledBtnClicks = 0;
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="live-btn"
+            text="Sent v1"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              sentBtnClicks += 1;
+            }}
+          />
+        </col>
+      ),
+    });
+    const otherSentSeq = otherSurface.seq;
+    expect(otherSurface.blocked).toBe(true);
+
+    // Queue an un-flushed replacement view with a DIFFERENT callback + a `settle` for an unsent node
+    otherSurface.render({
+      main: (
+        <col>
+          <button
+            key="live-btn"
+            text="Cancelled v2"
+            actions={{ click: 'click' }}
+            onClick={() => {
+              cancelledBtnClicks += 1;
+            }}
+          />
+          <text key="never-sent" text="ghost" />
+        </col>
+      ),
+    });
+    otherSurface.settle('main.never-sent');
+    otherSurface.cancelDeferred();
+
+    // Clicking the on-screen button MUST invoke the `#sent` v1 callback, NOT the cancelled v2 callback!
+    host.input.emitTspEvent({ ev: 'action', sf: 'other-sf', id: 'main.live-btn', act: 'click' });
+    await waitFor(() => sentBtnClicks === 1);
+    expect(sentBtnClicks).toBe(1);
+    expect(cancelledBtnClicks).toBe(0);
+
+    // Flushing ACK MUST NOT emit `settle main.never-sent`
+    const opsBeforeCancelAck = host.allOps.length;
+    host.ackFrame('other-sf', otherSentSeq);
+    await new Promise(r => setTimeout(r, 25));
+    const cancelledSettleOps = host.allOps
+      .slice(opsBeforeCancelAck)
+      .filter(op => op[0] === 'settle' && op[1] === 'main.never-sent');
+    expect(cancelledSettleOps).toHaveLength(0);
+
+    host.setAutoAck(true);
+    await otherSurface.close({ keep: false });
+
+    holdReplayLoad.resolve();
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('OMP parity Round 3 regressions: leading-@ filename mention isolation and historical tool kind/tookMs metadata update', async () => {
+    const tmp = makeTempDir();
+    writeFileSync(join(tmp, '@draft.md'), 'AT_PREFIX_DRAFT_CONTENT\n', 'utf8');
+    writeFileSync(join(tmp, 'draft.md'), 'PLAIN_DRAFT_MUST_NOT_SEND\n', 'utf8');
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clockNow = 10_000;
+    const promptsReceived: Array<Array<Record<string, unknown>>> = [];
+    let promptCount = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-r3', configOptions: [] } });
+      } else if (msg.method === 'session/prompt') {
+        promptCount += 1;
+        const p = msg.params as { prompt: Array<Record<string, unknown>> };
+        promptsReceived.push(p.prompt);
+        if (promptCount === 2) {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r3',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-meta-1',
+                title: 'Inspect',
+                kind: 'read',
+                status: 'completed',
+                rawOutput: 'ok',
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-r3',
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Turn 2 done' } },
+            },
+          });
+        }
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      now: () => clockNow,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1) P1: Completing `@draft.md` quotes as `@"@draft.md"` so ONLY `@draft.md` is attached (never `draft.md`)
+    const { applyTriggerReplacement, detectCompletionTrigger, formatFileMention, extractFileMentions } =
+      await import('../src/editor/trigger');
+    expect(formatFileMention('@draft.md')).toBe('@"@draft.md"');
+    expect(extractFileMentions('check @"@draft.md" now').map(m => m.path)).toEqual(['@draft.md']);
+
+    const trig = detectCompletionTrigger('read @@draft', 12);
+    expect(trig?.kind).toBe('file');
+    const rep = applyTriggerReplacement('read @@draft', trig!, '@draft.md');
+    expect(rep.text).toBe('read @"@draft.md" ');
+    await controller.submitInput(rep.text);
+    await waitFor(() => promptsReceived.length === 1);
+    const resBlocks = promptsReceived[0]!.filter(b => b['type'] === 'resource') as Array<{
+      resource?: { text?: string };
+    }>;
+    expect(resBlocks).toHaveLength(1);
+    expect(resBlocks[0]!.resource?.text).toContain('AT_PREFIX_DRAFT_CONTENT');
+    expect(resBlocks.some(b => b.resource?.text?.includes('PLAIN_DRAFT_MUST_NOT_SEND'))).toBe(false);
+
+    // 2) P2: Historical completed tool changes kind (`read` -> `search`) and tookMs (`0` -> `1150`) -> MUST re-render!
+    await controller.submitInput('turn with read tool');
+    await waitFor(() => promptsReceived.length === 2 && !controller.store.getState().isStreaming);
+    await controller.submitInput('make previous turn historical');
+    await waitFor(() => promptsReceived.length === 3 && !controller.store.getState().isStreaming);
+
+    clockNow = 11_150;
+    const opsBeforeMetaUpdate = host.allOps.length;
+    controller.store.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-meta-1',
+      kind: 'search',
+      status: 'completed',
+      rawOutput: 'ok',
+    });
+    // Explicitly update elapsed duration as ACP completion metadata arrives
+    const updatedTool = controller.store.transcript.getToolById('tc-meta-1');
+    expect(updatedTool?.displayName).toBe('search');
+    if (updatedTool) updatedTool.tookMs = 1150;
+    controller.scheduler.renderNow();
+    await new Promise(r => setTimeout(r, 25));
+
+    const metaUpdateOps = host.allOps.slice(opsBeforeMetaUpdate);
+    const serializedMetaOps = JSON.stringify(metaUpdateOps);
+    expect(serializedMetaOps).toContain('"name":"search"');
+    expect(serializedMetaOps).toContain('"took":1150');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('agy 1.5.14 parity: real per-model thought levels (4 vs 3 vs 0), Orchestrator Plan capsule, /thinking stream, and Swarm Overview height guard', async () => {
+    const tmp = makeTempDir();
+    const agySettingsPath = join(tmp, 'agy-settings.json');
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify(
+        {
+          orchestrator: {
+            planner: 'Gemini 4 Carbon (High)',
+            executor: 'Gemini 4 Hydrogen (High)',
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'swarm.json'),
+      JSON.stringify({ version: 1, backend: 'acp', swarm_id: 'sw-1514', created_at: '2026-11-23T00:00:00Z' }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Swarm 1.5.14',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'worker-a': { role: 'worker', phase: 'RUNNING', wake_mode: 'none', killed: false },
+          'worker-b': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      `${JSON.stringify({ seq: 1, agent: 'worker-b', text: '[done] Completed task B', time: '2026-11-23 00:01:00' })}\n`,
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'plan.json'),
+      JSON.stringify({
+        goal: {
+          title: 'Ship Swarm Overview',
+          line: 'Track goal progress and up to 6 threads in real time.',
+        },
+        tasks: {
+          'worker-a': 'Implement core',
+          'worker-b': 'Verify tests',
+        },
+        threads: [
+          { id: 'core', title: 'Core', goal: 'Build', tasks: ['worker-a'] },
+          { id: 'verify', title: 'Verify', goal: 'Test', tasks: ['worker-b'] },
+        ],
+      }),
+      'utf8',
+    );
+
+    const host = new FakeTernHost({ features: ['edit', 'undo', 'send', 'styles', 'blobs', 'aside'] });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const MODEL_CHOICES = [
+      { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+      { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+      { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+      { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+      { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+      { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+      { value: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+      { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+      { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+      { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+    ];
+    const FOUR_LEVELS = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+      { value: 'xhigh', name: 'Extra' },
+    ];
+    const THREE_LEVELS = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+    ];
+    let activeModel = 'gemini-4-neon';
+    let activeThought = 'xhigh';
+
+    const buildConfigOptions = () => {
+      const opts: Array<Record<string, unknown>> = [
+        {
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          type: 'select',
+          currentValue: activeModel,
+          options: MODEL_CHOICES,
+        },
+      ];
+      if (activeModel === 'gemini-4-neon' || activeModel === 'gemini-4-hydrogen') {
+        opts.push({
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: activeThought,
+          options: FOUR_LEVELS,
+        });
+      } else if (activeModel === 'gemini-4-carbon' || activeModel === 'claude-opus-5-5') {
+        opts.push({
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: activeThought === 'xhigh' ? 'high' : activeThought,
+          options: THREE_LEVELS,
+        });
+      }
+      return opts;
+    };
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-1514', configOptions: buildConfigOptions() },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { configId: string; value: string };
+        if (p.configId === 'model') {
+          activeModel = p.value;
+          if (activeModel !== 'gemini-4-neon' && activeModel !== 'gemini-4-hydrogen' && activeThought === 'xhigh') {
+            activeThought = 'high';
+          }
+        } else if (p.configId === 'thought_level') {
+          activeThought = p.value;
+        }
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { configOptions: buildConfigOptions() },
+        });
+      } else if (msg.method === 'session/prompt') {
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1514',
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: 'Full real-time reasoning trace.' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1514',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Final answer.' },
+            },
+          },
+        });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      agySettingsPath,
+      swarmDir,
+      swarmPollIntervalMs: 40,
+      terminalRows: 34,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(() => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (High)');
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // 1) `/model` merges all Orchestrator variants into ONE `orchestrator` entry with NO thinking level,
+    // while dynamically showing 4 / 3 / 0 thought levels for regular models
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    const neonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(neonData.items.filter(i => i.id.includes('orchestrator')).map(i => i.id)).toEqual([
+      'orchestrator',
+    ]);
+    expect(neonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+    expect(neonData.level?.value).toBe('xhigh');
+
+    // Highlight `gemini-4-carbon`: drops to 3 steps and clamps value from `xhigh` -> `high`
+    controller.store.setPickerSelected('gemini-4-carbon');
+    const carbonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(carbonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high']);
+    expect(carbonData.level?.value).toBe('high');
+    expect(controller.store.stepModelPickerThinking(1)).toBe('high');
+
+    // Highlight `claude-opus-5-5`: 3 steps
+    controller.store.setPickerSelected('claude-opus-5-5');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.steps.map(s => s.id),
+    ).toEqual(['low', 'medium', 'high']);
+
+    // Highlight `gemini-4-hydrogen`: 4 steps
+    controller.store.setPickerSelected('gemini-4-hydrogen');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.steps.map(s => s.id),
+    ).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Highlight merged `orchestrator` & `gpt-oss-120b-medium`: disabled (0 steps)
+    controller.store.setPickerSelected('orchestrator');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.disabled,
+    ).toBe('Configure effort in Plan / Exec pills');
+    controller.store.setPickerSelected('gpt-oss-120b-medium');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
+        .level?.disabled,
+    ).toBe('Not supported by this model');
+
+    // Select merged `orchestrator` and press Enter -> activates Orchestrator matching Planner (`Carbon` -> `gemini-pro-orchestrator`)
+    controller.store.setPickerSelected('orchestrator');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(() => controller.store.getState().controls.currentModelId === 'gemini-pro-orchestrator');
+
+    // 2) Bottom bar shows glowing `Orchestrator` pill (no effort) + compact `Plan` (short name) + compact `Exec` (short name)
+    await waitFor(
+      () => replayNodes().has('dock.composer.bar.planner') && replayNodes().has('dock.composer.bar.executor'),
+    );
+    const orchNodes = replayNodes();
+    expect(orchNodes.get('dock.composer.bar.model')?.p['role']).toBe('oma.composer.model.orchestrator');
+    expect(orchNodes.has('dock.composer.bar.model.effort')).toBe(false);
+    expect(orchNodes.get('dock.composer.bar.planner')?.p['role']).toBe('oma.composer.planner');
+    expect(orchNodes.get('dock.composer.bar.planner.tag')?.p['text']).toBe('Plan');
+    expect(orchNodes.get('dock.composer.bar.planner.name')?.p['text']).toBe('Carbon');
+    expect(orchNodes.get('dock.composer.bar.planner.effort')?.p['level']).toBe('high');
+    expect(orchNodes.get('dock.composer.bar.executor')?.p['role']).toBe('oma.composer.executor');
+    expect(orchNodes.get('dock.composer.bar.executor.tag')?.p['text']).toBe('Exec');
+    expect(orchNodes.get('dock.composer.bar.executor.name')?.p['text']).toBe('Hydrogen');
+    expect(orchNodes.get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (Low)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.effort')?.p['level'] === 'low');
+
+    await controller.submitInput('/thought high');
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Carbon (High)',
+    );
+
+    // Clicking `Exec` effort icon cycles Executor thinking (Hydrogen: high -> xhigh)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor.effort', act: 'executor.thinking.cycle' });
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.executor === 'Gemini 4 Hydrogen (Extra)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.executor.effort')?.p['level'] === 'xhigh');
+
+    // Click `Plan` capsule -> strictly restricted to 4 Planner models (Neon, Carbon, Argon, Opus 5.5)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const plannerData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(plannerData.items.map(i => i.id)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-carbon',
+      'gemini-4-argon',
+      'claude-opus-5-5',
+    ]);
+    expect(plannerData.selectedId).toBe('gemini-4-carbon');
+    expect(plannerData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high']);
+
+    // Pressing Esc in planner picker cancels without modifying settings.json
+    controller.store.setPickerSelected('claude-opus-5-5');
+    controller.store.stepModelPickerThinking(-1);
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+    expect(controller.store.getState().orchestratorSettings.planner).toBe('Gemini 4 Carbon (High)');
+
+    // Re-open `Plan` capsule, choose `claude-opus-5-5` (medium) -> persists & shows short name `Opus 5.5`
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    controller.store.setPickerSelected('claude-opus-5-5');
+    controller.store.stepModelPickerThinking(-1); // high -> medium
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Claude Opus 5.5 (Medium)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.name')?.p['text'] === 'Opus 5.5');
+    expect(replayNodes().get('dock.composer.bar.planner.effort')?.p['level']).toBe('medium');
+
+    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'executor');
+    const execData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(execData.items.map(i => i.id)).toEqual(['gemini-4-hydrogen', 'claude-sonnet-5-5']);
+    expect(execData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Select `claude-sonnet-5-5` (clamps xhigh -> high) and press Enter -> persists & shows short name `Sonnet 5.5`
+    controller.store.setPickerSelected('claude-sonnet-5-5');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.executor === 'Claude Sonnet 5.5 (High)',
+    );
+    const savedAgyAfterOrch = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect(savedAgyAfterOrch['orchestrator']).toEqual({
+      planner: 'Claude Opus 5.5 (Medium)',
+      executor: 'Claude Sonnet 5.5 (High)',
+    });
+    await waitFor(() => replayNodes().get('dock.composer.bar.executor.name')?.p['text'] === 'Sonnet 5.5');
+    expect(replayNodes().get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // 3) `/thinking on` enables live thinking stream, persists `showThinking: true`, and keeps completed thoughts expanded
+    await controller.submitInput('/thinking on');
+    await waitFor(() => !controller.store.autoCollapseThought && controller.store.getState().showThinking);
+    const savedAgyThinkingOn = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect(savedAgyThinkingOn['showThinking']).toBe(true);
+
+    await controller.submitInput('Explain with expanded thought');
+    await waitFor(() => !controller.store.getState().isStreaming && controller.store.transcript.turns.length === 1);
+    const nodesAfterThink = replayNodes();
+    const completedThought = [...nodesAfterThink.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking',
+    );
+    expect(completedThought).toBeDefined();
+    expect(completedThought?.p['collapsed']).toBe(false);
+
+    // `/thinking off` disables and removes default false key from settings.json
+    await controller.submitInput('/thinking off');
+    await waitFor(() => !controller.store.getState().showThinking);
+    const savedAgyThinkingOff = JSON.parse(readFileSync(agySettingsPath, 'utf8')) as Record<string, unknown>;
+    expect('showThinking' in savedAgyThinkingOff).toBe(false);
+
+    // 4) `/swarm board` renders Overview when `terminalRows >= 28` and hides it when `< 28`
+    await controller.submitInput('/swarm board');
+    await waitFor(() => controller.store.getState().swarmBoardOpen);
+    await waitFor(() => replayNodes().has('layer.swarm.body.overview'));
+    const ovNodes = replayNodes();
+    expect(ovNodes.get('layer.swarm.body.overview')?.p['role']).toBe('oma.swarm.overview');
+    expect(JSON.stringify(ovNodes.get('layer.swarm.body.overview.overview-head.goal')?.p['spans'] ?? '')).toContain(
+      'Ship Swarm Overview',
+    );
+    expect(ovNodes.get('layer.swarm.body.overview.overview-head.progress.done')?.p['text']).toBe('1/2 done');
+    expect(ovNodes.has('layer.swarm.body.overview.threads.thread-core')).toBe(true);
+    expect(ovNodes.has('layer.swarm.body.overview.threads.thread-verify')).toBe(true);
+
+    // Resize below 28 rows -> Overview hides gracefully while Roster stays visible
+    controller.store.setTerminalRows(24);
+    controller.scheduler.renderNow();
+    await waitFor(() => !replayNodes().has('layer.swarm.body.overview'));
+    expect(replayNodes().has('layer.swarm.body.roster')).toBe(true);
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

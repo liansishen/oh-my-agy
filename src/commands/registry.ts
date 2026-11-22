@@ -11,6 +11,7 @@ export type BuiltinCommandId =
   | 'new'
   | 'model'
   | 'thought'
+  | 'thinking'
   | 'mode'
   | 'copy'
   | 'log'
@@ -124,7 +125,7 @@ export const BUILTIN_COMMANDS: readonly SlashCommandDef[] = [
   },
   {
     name: 'thought',
-    aliases: ['thinking', 't', 'effort'],
+    aliases: ['t', 'effort'],
     description: 'Switch reasoning depth (thought_level)',
     source: 'oma',
     icon: 'gauge',
@@ -361,6 +362,18 @@ export const EXTRA_BUILTIN_COMMANDS: readonly SlashCommandDef[] = [
     takesArgs: false,
     autoExecuteOnEnter: true,
     builtinId: 'git',
+  },
+  {
+    name: 'thinking',
+    aliases: [],
+    description: 'Toggle live thinking stream display (on/off, synced with agy settings)',
+    source: 'oma',
+    icon: 'brain',
+    statusKey: 'thinking',
+    argHint: '[on|off]',
+    takesArgs: true,
+    autoExecuteOnEnter: true,
+    builtinId: 'thinking',
   },
   {
     name: 'jobs',

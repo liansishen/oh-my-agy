@@ -8,13 +8,24 @@ import {
 } from "../src/acp/client.ts";
 import {
   applyModelSelection,
+  clampThoughtLevelForChoices,
   combineModelId,
   extractSessionControlState,
+  filterOrchestratorRoleModels,
+  formatShortOrchestratorModelName,
   getNextModeSelection,
   hasThoughtLevelSupport,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
+  isOrchestratorModelId,
+  modelSupportsFourThoughtLevels,
+  modelSupportsThoughtLevelOption,
+  resolveAcpOrchestratorModelIdForPlanner,
   resolveModeSelection,
   resolveModelSelection,
+  resolveOrchestratorRoleThoughtLevels,
   resolveThoughtLevel,
+  resolveThoughtLevelsForModel,
   splitModelThoughtSuffix,
 } from "../src/acp/model.ts";
 import {
@@ -388,6 +399,138 @@ describe("src/acp/model.ts 双轨模型 ID 与动态 configOptions", () => {
       matchKind: "exact_config_model",
     });
     expect(gptOss?.thoughtLevel).toBeUndefined();
+  });
+
+  test("按模型真实能力解析思考档位（neon/hydrogen 4 档、其余 3 档、orchestrator/gpt-oss 0 档）并支持缓存与安全降档", () => {
+    expect(isOrchestratorModelId("gemini-pro-orchestrator-neon")).toBe(true);
+    expect(isOrchestratorModelId("gemini-4-neon")).toBe(false);
+    expect(modelSupportsFourThoughtLevels("gemini-4-neon")).toBe(true);
+    expect(modelSupportsFourThoughtLevels("gemini-4-hydrogen")).toBe(true);
+    expect(modelSupportsFourThoughtLevels("gemini-4-carbon")).toBe(false);
+    expect(modelSupportsFourThoughtLevels("gemini-4-argon")).toBe(false);
+    expect(modelSupportsFourThoughtLevels("claude-opus-5-5")).toBe(false);
+    expect(modelSupportsFourThoughtLevels("gemini-pro-orchestrator-neon")).toBe(false);
+    expect(modelSupportsThoughtLevelOption("gemini-pro-orchestrator-neon")).toBe(false);
+    expect(modelSupportsThoughtLevelOption("gpt-oss-120b-medium")).toBe(false);
+    expect(modelSupportsThoughtLevelOption("gemini-4-carbon")).toBe(true);
+
+    const activeNeon = extractSessionControlState({
+      configOptions: makeStandardConfigOptions("gemini-4-neon", "xhigh"),
+    });
+    expect(resolveThoughtLevelsForModel("gemini-4-neon", activeNeon).map((c) => c.value)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(resolveThoughtLevelsForModel("gemini-4-hydrogen", activeNeon).map((c) => c.value)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(resolveThoughtLevelsForModel("gemini-4-carbon", activeNeon).map((c) => c.value)).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(resolveThoughtLevelsForModel("claude-opus-5-5", activeNeon).map((c) => c.value)).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(resolveThoughtLevelsForModel("gemini-pro-orchestrator-neon", activeNeon)).toEqual([]);
+    expect(resolveThoughtLevelsForModel("gpt-oss-120b-medium", activeNeon)).toEqual([]);
+
+    // 权威服务端缓存优先于静态推导
+    const cached = {
+      "gemini-4-carbon": [
+        { value: "low", name: "Low" },
+        { value: "high", name: "High" },
+      ],
+    };
+    expect(resolveThoughtLevelsForModel("gemini-4-carbon", activeNeon, cached).map((c) => c.value)).toEqual([
+      "low",
+      "high",
+    ]);
+
+    // 从 xhigh 切到 3 档模型自动安全钳位至 high
+    const threeChoices = resolveThoughtLevelsForModel("gemini-4-carbon", activeNeon);
+    expect(clampThoughtLevelForChoices("xhigh", threeChoices)).toBe("high");
+    expect(clampThoughtLevelForChoices("medium", threeChoices)).toBe("medium");
+    expect(clampThoughtLevelForChoices("high", [])).toBeUndefined();
+
+    // Orchestrator 角色严格白名单过滤（Planner 4 选 1 / Executor 2 选 1）、短名格式化与 ACP 变体映射
+    const fullModels = [
+      { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+      { value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
+      { value: "gemini-4-argon", name: "Gemini 4 Argon" },
+      { value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+      { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+      { value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+      { value: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+      { value: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+      { value: "gemini-pro-orchestrator", name: "Orchestrator (Carbon)" },
+      { value: "gemini-pro-orchestrator-argon", name: "Orchestrator (Argon)" },
+      { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+    ];
+    expect(filterOrchestratorRoleModels("planner", fullModels).map((c) => c.value)).toEqual([
+      "gemini-4-neon",
+      "gemini-4-carbon",
+      "gemini-4-argon",
+      "claude-opus-5-5",
+    ]);
+    expect(filterOrchestratorRoleModels("executor", fullModels).map((c) => c.value)).toEqual([
+      "gemini-4-hydrogen",
+      "claude-sonnet-5-5",
+    ]);
+    expect(formatShortOrchestratorModelName("Gemini 4 Carbon")).toBe("Carbon");
+    expect(formatShortOrchestratorModelName("Gemini 4 Hydrogen")).toBe("Hydrogen");
+    expect(formatShortOrchestratorModelName("Claude Opus 5.5")).toBe("Opus 5.5");
+    expect(formatShortOrchestratorModelName("Claude Sonnet 5.5")).toBe("Sonnet 5.5");
+
+    expect(inferOrchestratorDefaultPlannerModel("gemini-pro-orchestrator-neon")).toEqual({
+      modelId: "gemini-4-neon",
+      modelName: "Gemini 4 Neon",
+    });
+    expect(inferOrchestratorDefaultPlannerModel("gemini-pro-orchestrator")).toEqual({
+      modelId: "gemini-4-carbon",
+      modelName: "Gemini 4 Carbon",
+    });
+    expect(inferOrchestratorDefaultExecutorModel("gemini-pro-orchestrator")).toEqual({
+      modelId: "gemini-4-hydrogen",
+      modelName: "Gemini 4 Hydrogen",
+    });
+    expect(resolveAcpOrchestratorModelIdForPlanner("gemini-4-neon", fullModels)).toBe(
+      "gemini-pro-orchestrator-neon",
+    );
+    expect(resolveAcpOrchestratorModelIdForPlanner("gemini-4-argon", fullModels)).toBe(
+      "gemini-pro-orchestrator-argon",
+    );
+    expect(resolveAcpOrchestratorModelIdForPlanner("claude-opus-5-5", fullModels)).toBe(
+      "gemini-pro-orchestrator",
+    );
+
+    expect(
+      resolveOrchestratorRoleThoughtLevels("planner", activeNeon, undefined, "Gemini 4 Neon").map(
+        (c) => c.value,
+      ),
+    ).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(
+      resolveOrchestratorRoleThoughtLevels("planner", activeNeon, undefined, "Claude Opus 5.5").map(
+        (c) => c.value,
+      ),
+    ).toEqual(["low", "medium", "high"]);
+    expect(
+      resolveOrchestratorRoleThoughtLevels("executor", activeNeon, undefined, "Gemini 4 Hydrogen").map(
+        (c) => c.value,
+      ),
+    ).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(
+      resolveOrchestratorRoleThoughtLevels("executor", activeNeon, undefined, "Claude Sonnet 5.5").map(
+        (c) => c.value,
+      ),
+    ).toEqual(["low", "medium", "high"]);
   });
 
   test("带思考档位后缀的组合 ID（availableModels 轨道与直接拆分）正确拆分为基模型 + thought_level", () => {

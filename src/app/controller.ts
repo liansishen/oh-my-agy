@@ -21,10 +21,19 @@ import {
 } from '../acp/client';
 import {
   applyModelSelection,
+  clampThoughtLevelForChoices,
+  filterOrchestratorRoleModels,
   getNextModeSelection,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
+  isOrchestratorModelId,
+  ORCHESTRATOR_PICKER_ID,
+  resolveAcpOrchestratorModelIdForPlanner,
   resolveModeSelection,
   resolveModelSelection,
+  resolveOrchestratorRoleThoughtLevels,
   resolveThoughtLevel,
+  resolveThoughtLevelsForModel,
 } from '../acp/model';
 import { normalizeDisplayPath, sameDir, toFileUri } from '../acp/path';
 import {
@@ -45,16 +54,21 @@ import {
   type SettingsPageId,
 } from '../commands/handlers';
 import {
+  formatOrchestratorModelSpec,
   getAgySettingsPath,
   isAgySafeSettingKey,
   loadAgySettings,
+  parseOrchestratorModelSpec,
   saveAgySettings,
 } from '../config/agy_settings';
 import {
   DEFAULT_CONFIG,
   getConfigPath,
+  loadConfig,
+  normalizeToolDisplayMode,
   saveConfig,
   type OmaConfig,
+  type ToolDisplayMode,
 } from '../config/config';
 import {
   exportTranscriptMarkdown,
@@ -68,6 +82,7 @@ import {
   type ExecCommandFn,
 } from '../ecosystem/cli';
 import { nextCodePointOffset, prevCodePointOffset } from '../editor/draft';
+import { extractFileMentions } from '../editor/trigger';
 import { WorkspaceFileIndexer } from '../filesearch/indexer';
 import {
   getDataDir,
@@ -86,6 +101,7 @@ import {
   gitFileKey,
   loadGitFileDiff,
   loadGitRepoSnapshot,
+  resolveGitStageActionPaths,
   stageGitFiles,
   unstageGitFiles,
   type GitChangedFile,
@@ -148,6 +164,10 @@ import {
 const MAX_EMBEDDED_FILE_BYTES = 256 * 1024;
 const DONE_TO_IDLE_DELAY_MS = 1500;
 const DEFAULT_BACKGROUND_DONE_GRACE_MS = 2000;
+const DEFAULT_BACKGROUND_WAKEUP_GRACE_MS = 10_000;
+const DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS = 120;
+const DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS = 250;
+const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
 const GIT_PROBE_MIN_INTERVAL_MS = 1500;
 const TPS_FLUSH_MIN_INTERVAL_MS = 120;
 
@@ -218,6 +238,8 @@ export interface AppControllerOptions {
   readonly ecosystemRunner?: ExecCommandFn;
   /** Optional override path to `oma` `config.toml` (for offline deterministic tests). */
   readonly configPath?: string;
+  /** Optional parse error from initial `loadConfig()` to avoid overwriting broken `config.toml`. */
+  readonly configParseError?: string;
   /** Optional override path to `~/.gemini/antigravity-cli/settings.json` (for offline deterministic tests). */
   readonly agySettingsPath?: string;
   /** Optional override for local workspace skills dir (for offline deterministic tests). */
@@ -230,6 +252,10 @@ export interface AppControllerOptions {
   readonly gitExec?: GitExecFn;
   /** Quiet grace period (ms) before emitting deferred background/swarm `state=done`. Default: 2000. */
   readonly backgroundDoneGraceMs?: number;
+  /** Quiet drain window (ms) after `session/load` resolves to capture trailing async replay updates. */
+  readonly replayDrainQuietMs?: number;
+  /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
+  readonly terminalRows?: number;
 }
 
 function cloneConfig(config: OmaConfig): OmaConfig {
@@ -241,6 +267,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
     recent_models: [...(config.recent_models ?? [])],
     ui: {
       auto_collapse_thought: config.ui.auto_collapse_thought,
+      tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
       osc_7501: config.ui.osc_7501,
       reopen_anchor: config.ui.reopen_anchor,
@@ -317,13 +344,10 @@ function looksBinary(bytes: Uint8Array): boolean {
 function extractMentionedPaths(text: string): string[] {
   const found: string[] = [];
   const seen = new Set<string>();
-  const re = /(?:^|[\s([{"'`,;:<>|])@([^\s)\]}"'`,;<>|]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const token = match[1];
-    if (token && !seen.has(token)) {
-      seen.add(token);
-      found.push(token);
+  for (const mention of extractFileMentions(text)) {
+    if (mention.path && !seen.has(mention.path)) {
+      seen.add(mention.path);
+      found.push(mention.path);
     }
   }
   return found;
@@ -358,6 +382,9 @@ export class AppController {
   readonly #dataDir?: string;
   readonly #gitExec?: GitExecFn;
   readonly #backgroundDoneGraceMs: number;
+  readonly #backgroundWakeupGraceMs: number;
+  readonly #replayDrainInitialQuietMs: number;
+  readonly #replayDrainActiveQuietMs: number;
   readonly #metricsTracker: SessionMetricsTracker;
 
   #acpClient: AcpClient | null = null;
@@ -374,7 +401,24 @@ export class AppController {
   #lastFocusedId: string | null | undefined = undefined;
   #workingStartedAt: number | undefined = undefined;
   #pendingBackgroundDone = false;
+  #awaitingPostToolWakeup = false;
+  #awaitingSwarmCoordinatorReply = false;
+  #swarmCoordinatorReplied = false;
+  #deferredSettleTurnIndex: number | null = null;
   #activePromptTask: Promise<void> | null = null;
+  #promptSubmitting = false;
+  #acpClientAlive = false;
+  #sessionEpoch = 0;
+  #lastCommittedSessionId: string | null = null;
+  #lastCommittedCwd: string | null = null;
+  #replayingSessionId: string | null = null;
+  #replayingSessionEpoch: number | null = null;
+  #creatingSessionEpoch: number | null = null;
+  #pendingNewSessionUpdates: SessionUpdateParams[] = [];
+  #suppressedMentionPaths = new Set<string>();
+  #configWriteBlockedReason: string | null = null;
+  #configVerifiedWritable = false;
+  #configSaveChain: Promise<void> = Promise.resolve();
   #pickerLoadToken = 0;
   #attachmentSeq = 0;
   #shutdownPromise: Promise<void> | null = null;
@@ -387,6 +431,11 @@ export class AppController {
   #memberBeeBlobCache: Record<string, BeeMemberBlobPair> = {};
   #doneIdleTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #backgroundDoneTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #replayDrainActive = false;
+  #replayDrainResolve: (() => void) | null = null;
+  #replayDrainReject: ((err: Error) => void) | null = null;
+  #replayDrainTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #replayDrainMaxTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #signalHandlers:
     | { sigint: () => void; sigterm: () => void; sighup: () => void }
     | undefined = undefined;
@@ -409,6 +458,7 @@ export class AppController {
     this.#swarmPollIntervalMs = options.swarmPollIntervalMs;
     this.#ecosystemRunner = options.ecosystemRunner;
     this.#configPath = options.configPath ?? getConfigPath();
+    this.#configWriteBlockedReason = options.configParseError ?? null;
     this.#agySettingsPath = options.agySettingsPath ?? getAgySettingsPath();
     this.#workspaceSkillsDir = options.workspaceSkillsDir;
     this.#globalSkillsDir = options.globalSkillsDir;
@@ -418,6 +468,18 @@ export class AppController {
       0,
       options.backgroundDoneGraceMs ?? DEFAULT_BACKGROUND_DONE_GRACE_MS
     );
+    this.#backgroundWakeupGraceMs =
+      options.backgroundDoneGraceMs !== undefined
+        ? this.#backgroundDoneGraceMs
+        : Math.max(this.#backgroundDoneGraceMs, DEFAULT_BACKGROUND_WAKEUP_GRACE_MS);
+    this.#replayDrainInitialQuietMs =
+      options.replayDrainQuietMs !== undefined
+        ? Math.max(0, options.replayDrainQuietMs)
+        : DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS;
+    this.#replayDrainActiveQuietMs =
+      options.replayDrainQuietMs !== undefined
+        ? Math.max(0, options.replayDrainQuietMs)
+        : DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
       now: this.#now,
@@ -442,10 +504,14 @@ export class AppController {
       cwd: initialCwd,
       autoAllowTools: this.#config.approval.auto_allow_tools,
       autoCollapseThought: this.#config.ui.auto_collapse_thought,
+      toolDisplayMode: normalizeToolDisplayMode(this.#config.ui.tool_display),
       recentModels: this.#config.recent_models,
       hour12: this.session.caps.hour12,
       supportsAside: this.session.caps.features.includes('aside'),
+      supportsPrefs:
+        this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
+      ...(options.terminalRows !== undefined ? { terminalRows: options.terminalRows } : {}),
       now: this.#now,
     });
     if (initialBeeBlobs) {
@@ -633,6 +699,7 @@ export class AppController {
     void this.store.history.load().catch(() => {});
     void this.#fileIndexer.start().catch(() => {});
     void this.#refreshGitStatus({ force: true });
+    void this.#loadInitialAgySettings();
 
     // Bootstrap ACP asynchronously so input events & Ctrl+C remain responsive during startup
     const bootstrapTask = this.#bootstrapAcp().finally(() => {
@@ -690,6 +757,7 @@ export class AppController {
     }
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
+    this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
     this.#metricsTracker.setSession(null);
@@ -725,6 +793,8 @@ export class AppController {
         if (this.#activePromptTask) {
           await this.#activePromptTask.catch(() => {});
         }
+        // Wait for any accepted serialized config writes before exiting
+        await this.#configSaveChain.catch(() => {});
 
         // 4. Stop background schedulers/indexers
         this.scheduler.dispose();
@@ -775,6 +845,127 @@ export class AppController {
     });
   }
 
+  #isAcpClientLive(client: AcpClient): boolean {
+    return (
+      this.#acpClient === client &&
+      this.#acpClientAlive &&
+      this.store.getState().connectionStatus !== 'crashed'
+    );
+  }
+
+  #normalizeMentionPathKey(rawPath: string, cwd = this.store.getState().cwd): string {
+    const absPath = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd, rawPath);
+    return process.platform === 'win32' ? absPath.toLowerCase() : absPath;
+  }
+
+  #removeMentionTokenFromDraft(rawPath: string): void {
+    const draftText = this.store.draft.text;
+    if (!draftText.includes('@')) return;
+    const targetKey = this.#normalizeMentionPathKey(rawPath);
+    const ranges: Array<[number, number]> = [];
+    for (const mention of extractFileMentions(draftText)) {
+      if (
+        mention.path !== rawPath &&
+        this.#normalizeMentionPathKey(mention.path) !== targetKey
+      ) {
+        continue;
+      }
+      let start = mention.start;
+      let end = mention.end;
+      // Consume at most ONE single space adjacent to the `@path` token so completion's
+      // trailing space is cleaned up without ever touching indentation or unrelated spaces.
+      if (draftText[end] === ' ') {
+        end += 1;
+      } else if (
+        start > 0 &&
+        draftText[start - 1] === ' ' &&
+        (end === draftText.length || /[\n\r)\]}"'`,;<>|]/.test(draftText[end]!))
+      ) {
+        start -= 1;
+      }
+      ranges.push([start, end]);
+    }
+    if (ranges.length > 0) {
+      this.store.draft.removeRangesPreservingSelection(ranges);
+    }
+  }
+
+  /**
+   * Atomically begin a single-epoch session transition (`creating` for `/new` or
+   * initial `session/new`, `replaying` for `/resume` or `session/load`).
+   * Cancels any in-flight replay drain, clears stale creation/replay state, and
+   * resets session UI state under one unified epoch so interleaved `/resume` and
+   * `/new` calls can never inherit old replay chunks, wipe a newer command buffer,
+   * or leave the scheduler suspended.
+   */
+  #beginSessionTransition(
+    mode: 'creating' | 'replaying',
+    replaySessionId?: string
+  ): number {
+    const epoch = ++this.#sessionEpoch;
+    this.#cancelReplayDrain(new Error('Superseded by session switch'));
+    this.#stopSwarmWatcher();
+    this.#clearBackgroundDoneTimer();
+    this.#clearDoneIdleTimer();
+    this.#metricsTracker.setSession(null);
+    this.#lastTpsStoreFlushAt = 0;
+    this.#pendingBackgroundDone = false;
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    this.#swarmCoordinatorReplied = false;
+    this.#deferredSettleTurnIndex = null;
+    this.#workingStartedAt = undefined;
+    this.#activePromptTask = null;
+    this.#pendingNewSessionUpdates = [];
+
+    if (mode === 'replaying') {
+      this.#creatingSessionEpoch = null;
+      this.#replayingSessionId = replaySessionId ?? null;
+      this.#replayingSessionEpoch = epoch;
+    } else {
+      this.#replayingSessionId = null;
+      this.#replayingSessionEpoch = null;
+      this.#creatingSessionEpoch = epoch;
+    }
+
+    this.store.resetSessionState({ keepCommands: true });
+    this.#syncSwarmFxStylesheet();
+    this.scheduler.resetSession();
+
+    if (mode === 'replaying') {
+      this.scheduler.suspendForReplay();
+      this.store.setReplaying(true);
+    } else {
+      this.store.setReplaying(false);
+      if (this.scheduler.suspended) {
+        this.scheduler.resumeAfterReplay(false);
+      }
+    }
+
+    return epoch;
+  }
+
+  #drainPendingNewSessionUpdates(sessionId: string, epoch: number): void {
+    const queued = this.#pendingNewSessionUpdates;
+    this.#pendingNewSessionUpdates = [];
+    if (queued.length === 0) return;
+    for (const params of queued) {
+      if (this.#shuttingDown || epoch !== this.#sessionEpoch) return;
+      const sid =
+        typeof params.sessionId === 'string' && params.sessionId.trim().length > 0
+          ? params.sessionId.trim()
+          : undefined;
+      if (sid && sid === sessionId) {
+        this.#handleAcpUpdate(params);
+      } else {
+        this.store.traffic.recordSystem(
+          `ignored stale buffered session/update for ${sid ?? 'unknown'} (active: ${sessionId})`,
+          params
+        );
+      }
+    }
+  }
+
   async #bootstrapAcp(retrySessionId?: string): Promise<void> {
     if (this.#shuttingDown) return;
 
@@ -783,6 +974,7 @@ export class AppController {
 
     const client = this.#createAcpClient();
     this.#acpClient = client;
+    this.#acpClientAlive = true;
 
     try {
       client.start();
@@ -796,6 +988,7 @@ export class AppController {
           },
         },
       });
+      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
       this.#authMethods = initRes.authMethods ?? [];
       this.store.setAgentInitializeInfo(
         initRes.agentInfo,
@@ -804,9 +997,10 @@ export class AppController {
       );
 
       await this.#openInitialSession(client, retrySessionId);
-      if (this.#shuttingDown) return;
+      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
       await this.#applyInitialPreferences(client);
+      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
       this.store.setConnectionStatus('ready');
       this.osc.setStatusIdle();
@@ -826,6 +1020,10 @@ export class AppController {
       }
     } catch (err) {
       if (this.#shuttingDown) return;
+      // Preserve crash state already set by `#handleAcpExit` when the child exited mid-bootstrap/replay
+      if (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed') {
+        return;
+      }
       if (err instanceof AcpRpcError && err.isAuthRequired()) {
         this.osc.setStatusBlocked('auth');
         this.store.setAuthRequired({
@@ -853,7 +1051,8 @@ export class AppController {
       try {
         await this.#loadSessionWithReplay(client, retrySessionId, cwd);
         return;
-      } catch {
+      } catch (err) {
+        if (!this.#isAcpClientLive(client)) throw err;
         // Fallback to new session if previous session cannot be reloaded
       }
     }
@@ -873,6 +1072,7 @@ export class AppController {
           await this.#loadSessionWithReplay(client, target.sessionId, targetCwd, target.title);
           return;
         } catch (err) {
+          if (!this.#isAcpClientLive(client)) throw err;
           if (err instanceof AcpRpcError && err.isAuthRequired()) {
             throw err;
           }
@@ -902,6 +1102,7 @@ export class AppController {
           return;
         }
       } catch (err) {
+        if (!this.#isAcpClientLive(client)) throw err;
         if (err instanceof AcpRpcError && err.isAuthRequired()) {
           throw err;
         }
@@ -909,38 +1110,107 @@ export class AppController {
       }
     }
 
-    const created = await client.newSession({ cwd, mcpServers: [] });
-    const createdTier = client.currentTier ?? extractSessionTier(created._meta);
-    this.store.applySessionSnapshot({
-      sessionId: created.sessionId,
-      cwd,
-      configOptions: created.configOptions,
-      models: created.models,
-      modes: created.modes,
-      ...(createdTier ? { tier: createdTier } : {}),
+    const createEpoch = this.#beginSessionTransition('creating');
+    try {
+      const created = await client.newSession({ cwd, mcpServers: [] });
+      if (this.#shuttingDown || !this.#isAcpClientLive(client) || createEpoch !== this.#sessionEpoch) {
+        throw new Error('ACP connection closed while creating session');
+      }
+      const createdTier = client.currentTier ?? extractSessionTier(created._meta);
+      this.store.applySessionSnapshot({
+        sessionId: created.sessionId,
+        cwd,
+        configOptions: created.configOptions,
+        models: created.models,
+        modes: created.modes,
+        ...(createdTier ? { tier: createdTier } : {}),
+      });
+      this.#lastCommittedSessionId = created.sessionId;
+      this.#lastCommittedCwd = cwd;
+      if (this.#creatingSessionEpoch === createEpoch) {
+        this.#creatingSessionEpoch = null;
+      }
+      this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
+      this.#bindSessionMetrics(created.sessionId);
+      this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
+      void this.#refreshGitStatus();
+    } finally {
+      if (this.#creatingSessionEpoch === createEpoch) {
+        this.#creatingSessionEpoch = null;
+        this.#pendingNewSessionUpdates = [];
+      }
+    }
+  }
+
+  #cancelReplayDrain(abortError?: Error): void {
+    this.#replayDrainActive = false;
+    if (this.#replayDrainTimer !== undefined) {
+      clearTimeout(this.#replayDrainTimer);
+      this.#replayDrainTimer = undefined;
+    }
+    if (this.#replayDrainMaxTimer !== undefined) {
+      clearTimeout(this.#replayDrainMaxTimer);
+      this.#replayDrainMaxTimer = undefined;
+    }
+    const resolve = this.#replayDrainResolve;
+    const reject = this.#replayDrainReject;
+    this.#replayDrainResolve = null;
+    this.#replayDrainReject = null;
+    if (abortError) {
+      reject?.(abortError);
+    } else {
+      resolve?.();
+    }
+  }
+
+  #noteReplayDrainActivity(): void {
+    if (!this.#replayDrainActive) return;
+    if (this.#replayDrainTimer !== undefined) {
+      clearTimeout(this.#replayDrainTimer);
+      this.#replayDrainTimer = undefined;
+    }
+    this.#replayDrainTimer = setTimeout(() => {
+      this.#cancelReplayDrain();
+    }, this.#replayDrainActiveQuietMs);
+  }
+
+  /**
+   * `agy acp` may resolve the `session/load` JSON-RPC response before its async
+   * replay stream finishes pushing all historical `session/update` notifications
+   * (especially on long sessions with large `edit_file` diff payloads). Keep
+   * `isReplaying = true` and `scheduler` suspended until the trailing burst goes
+   * quiet so stdout is drained at full speed without render backpressure or
+   * prematurely fusing trailing history into a live streaming turn.
+   */
+  async #waitForReplayDrain(): Promise<void> {
+    if (this.#shuttingDown || this.#replayDrainInitialQuietMs <= 0) {
+      return;
+    }
+    this.#cancelReplayDrain();
+    this.#replayDrainActive = true;
+    await new Promise<void>((resolve, reject) => {
+      this.#replayDrainResolve = resolve;
+      this.#replayDrainReject = reject;
+      this.#replayDrainTimer = setTimeout(() => {
+        this.#cancelReplayDrain();
+      }, this.#replayDrainInitialQuietMs);
+      this.#replayDrainMaxTimer = setTimeout(() => {
+        this.#cancelReplayDrain();
+      }, DEFAULT_REPLAY_DRAIN_MAX_MS);
     });
-    this.#bindSessionMetrics(created.sessionId);
-    this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
-    void this.#refreshGitStatus();
   }
 
   async #loadSessionWithReplay(
     client: AcpClient,
     sessionId: string,
     cwd: string,
-    knownTitle?: string
-  ): Promise<void> {
-    this.#stopSwarmWatcher();
-    this.#clearBackgroundDoneTimer();
-    this.#metricsTracker.setSession(null);
-    this.#lastTpsStoreFlushAt = 0;
-    this.#pendingBackgroundDone = false;
-    this.#workingStartedAt = undefined;
-    this.store.resetSessionState({ keepCommands: true });
-    this.#syncSwarmFxStylesheet();
-    this.scheduler.resetSession();
-    this.scheduler.suspendForReplay();
-    this.store.setReplaying(true);
+    knownTitle?: string,
+    existingEpoch?: number
+  ): Promise<boolean> {
+    const loadEpoch =
+      existingEpoch !== undefined
+        ? existingEpoch
+        : this.#beginSessionTransition('replaying', sessionId);
 
     try {
       const loaded = await client.loadSession({
@@ -948,6 +1218,21 @@ export class AppController {
         cwd,
         mcpServers: [],
       });
+
+      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
+        return false;
+      }
+      if (!this.#isAcpClientLive(client)) {
+        throw new Error('ACP connection closed during session load');
+      }
+
+      await this.#waitForReplayDrain();
+      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
+        return false;
+      }
+      if (!this.#isAcpClientLive(client)) {
+        throw new Error('ACP connection closed during session replay');
+      }
 
       this.store.transcript.finalizeReplayedTurns();
       this.store.setReplaying(false);
@@ -961,8 +1246,15 @@ export class AppController {
         modes: loaded.modes,
         ...(loadedTier ? { tier: loadedTier } : {}),
       });
+      this.#lastCommittedSessionId = loaded.sessionId;
+      this.#lastCommittedCwd = cwd;
 
-      this.#bindSessionMetrics(loaded.sessionId);
+      this.#bindSessionMetrics(loaded.sessionId, false);
+      await this.#syncSessionMetricsFromTranscript();
+      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
+      if (!this.#isAcpClientLive(client)) {
+        throw new Error('ACP connection closed during session restore');
+      }
       void this.#refreshGitStatus({ force: true });
 
       this.scheduler.resumeAfterReplay(true);
@@ -981,10 +1273,21 @@ export class AppController {
         this.osc.reassertCursorHidden();
       }
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
+      return true;
     } catch (err) {
+      if (loadEpoch !== this.#sessionEpoch) {
+        // Superseded by a newer `/new` or `/resume` transition; do not touch the newer epoch's state
+        return false;
+      }
+      this.#cancelReplayDrain();
       this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(false);
       throw err;
+    } finally {
+      if (this.#replayingSessionEpoch === loadEpoch) {
+        this.#replayingSessionId = null;
+        this.#replayingSessionEpoch = null;
+      }
     }
   }
 
@@ -1050,6 +1353,39 @@ export class AppController {
   }
 
   #handleAcpUpdate(params: SessionUpdateParams): void {
+    const incomingSessionId =
+      typeof params.sessionId === 'string' && params.sessionId.trim().length > 0
+        ? params.sessionId.trim()
+        : undefined;
+
+    // While `session/new` is in flight, buffer incoming notifications and replay ONLY
+    // those whose `sessionId` matches the newly created session (so early new-session
+    // notifications like `available_commands_update` are preserved while stale old-session
+    // chunks are discarded).
+    if (this.#creatingSessionEpoch !== null && !this.#replayingSessionId) {
+      if (incomingSessionId && this.#pendingNewSessionUpdates.length < 256) {
+        this.#pendingNewSessionUpdates.push(params);
+      } else {
+        this.store.traffic.recordSystem(
+          `ignored session/update without sessionId during session creation`,
+          params
+        );
+      }
+      return;
+    }
+
+    const expectedSessionId = this.#replayingSessionId ?? this.store.getState().sessionId;
+    if (incomingSessionId && (!expectedSessionId || incomingSessionId !== expectedSessionId)) {
+      this.store.traffic.recordSystem(
+        `ignored stale session/update for ${incomingSessionId} (active: ${expectedSessionId ?? 'none'})`,
+        params
+      );
+      return;
+    }
+
+    if (this.#replayDrainActive) {
+      this.#noteReplayDrainActivity();
+    }
     const prevBusy = this.store.isBusy;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
@@ -1088,33 +1424,104 @@ export class AppController {
         }
       }
 
-      // Tool call lifecycle hooks: mount swarm watcher, incrementally tail transcript, and refresh git
+      // Tool call lifecycle hooks: mount swarm watcher, track tool-wait TPS pauses,
+      // incrementally tail transcript, and refresh git
+      let toolFinishedInThisUpdate = false;
       if (
         update.sessionUpdate === 'tool_call' ||
         update.sessionUpdate === 'tool_call_update'
       ) {
-        const upd = update as { name?: unknown; title?: unknown; status?: unknown };
+        const upd = update as { name?: unknown; title?: unknown; status?: unknown; args?: unknown; rawInput?: unknown };
         const rawName = typeof upd.name === 'string' ? upd.name.trim().toLowerCase() : '';
         const rawTitle = typeof upd.title === 'string' ? upd.title.trim().toLowerCase() : '';
-        if (rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle)) {
+        const isSwarmWait =
+          rawName === 'swarm_wait' ||
+          rawTitle === 'swarm_wait' ||
+          rawTitle.includes('swarm_wait');
+        const isSwarmTool =
+          rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle);
+        if (isSwarmTool || isSwarmWait) {
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
+        if (isSwarmWait) {
+          this.#awaitingSwarmCoordinatorReply = true;
+        }
         if (upd.status === 'completed' || upd.status === 'failed') {
+          toolFinishedInThisUpdate = true;
           void this.#syncSessionMetricsFromTranscript();
           void this.#refreshGitStatus();
         }
+        if (this.store.hasActiveBackgroundTasks()) {
+          this.#metricsTracker.pauseForTools();
+        } else {
+          this.#metricsTracker.resumeAfterTools();
+        }
+      }
+
+      const isThoughtChunk = update.sessionUpdate === 'agent_thought_chunk';
+      const isMessageChunk = update.sessionUpdate === 'agent_message_chunk';
+      const messageDeltaText =
+        isMessageChunk &&
+        update.content &&
+        update.content.type === 'text' &&
+        typeof update.content.text === 'string'
+          ? update.content.text
+          : '';
+      const hasVisibleMessageDelta = isMessageChunk && messageDeltaText.trim().length > 0;
+      const isToolRunningUpdate =
+        (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+        ((update as { status?: unknown }).status === 'in_progress' ||
+          (update as { status?: unknown }).status === 'pending');
+
+      // Only a non-empty, visible `agent_message_chunk` counts as the coordinator's
+      // user-facing reply (ignoring empty/whitespace-only keepalive chunks). Track
+      // `#swarmCoordinatorReplied` separately from worker idle state so `end_turn` never
+      // re-arms `#awaitingSwarmCoordinatorReply` when workers lag behind the reply.
+      if (hasVisibleMessageDelta) {
+        if (this.#awaitingSwarmCoordinatorReply) {
+          this.#awaitingSwarmCoordinatorReply = false;
+          this.#swarmCoordinatorReplied = true;
+          if (!this.store.getState().isStreaming) {
+            this.#pendingBackgroundDone = true;
+          }
+        } else if (this.store.getState().hasSwarm || this.store.isSwarmWorking) {
+          this.#swarmCoordinatorReplied = true;
+          if (!this.store.getState().isStreaming) {
+            this.#pendingBackgroundDone = true;
+          }
+        }
+      }
+
+      if (
+        toolFinishedInThisUpdate &&
+        prevBusy &&
+        !this.store.getState().isStreaming &&
+        !this.store.hasActiveBackgroundTasks() &&
+        !this.store.isSwarmWorking &&
+        !this.#isSwarmCoordinatorWorking() &&
+        !this.#awaitingSwarmCoordinatorReply
+      ) {
+        // The last background tool just finished; give the model a generous wakeup
+        // window (TTFT) before emitting OSC 7501 `state=done`.
+        this.#awaitingPostToolWakeup = true;
       }
 
       this.#reconcileBackgroundActivity(prevBusy);
 
       // If we are in deferred background/swarm quiet-grace state and live activity arrives
-      // (late assistant text/thought or in-progress tool), keep `working` and reset the grace timer.
+      // (late assistant text/thought, usage_update, or in-progress tool), keep `working`
+      // and pick the appropriate grace timer.
+      const isUsageAfterReply =
+        update.sessionUpdate === 'usage_update' && !this.#awaitingPostToolWakeup;
       const isLiveActivityUpdate =
-        update.sessionUpdate === 'agent_thought_chunk' ||
-        update.sessionUpdate === 'agent_message_chunk' ||
-        ((update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
-          (update as { status?: unknown }).status === 'in_progress');
+        isThoughtChunk || isMessageChunk || isToolRunningUpdate || isUsageAfterReply;
+
       if (this.#pendingBackgroundDone && isLiveActivityUpdate) {
+        if (isMessageChunk) {
+          this.#awaitingPostToolWakeup = false;
+        } else if (isThoughtChunk) {
+          this.#awaitingPostToolWakeup = true;
+        }
         const stateAfter = this.store.getState();
         this.#clearDoneIdleTimer();
         if (
@@ -1128,11 +1535,15 @@ export class AppController {
           stateAfter.isStreaming ||
           stateAfter.hasActiveBackgroundTasks ||
           stateAfter.isSwarmWorking ||
-          this.#isSwarmCoordinatorWorking()
+          this.#isSwarmCoordinatorWorking() ||
+          this.#awaitingSwarmCoordinatorReply
         ) {
           this.#clearBackgroundDoneTimer();
         } else {
-          this.#scheduleBackgroundDone();
+          const delayMs = this.#awaitingPostToolWakeup
+            ? this.#backgroundWakeupGraceMs
+            : this.#backgroundDoneGraceMs;
+          this.#scheduleBackgroundDone(delayMs);
         }
       }
     }
@@ -1145,7 +1556,30 @@ export class AppController {
     const client = this.#acpClient;
     if (!client) return;
 
+    const reqSessionId =
+      req.params && typeof (req.params as { sessionId?: unknown }).sessionId === 'string'
+        ? ((req.params as { sessionId: string }).sessionId.trim() || undefined)
+        : undefined;
+    const activeSessionId = this.store.getState().sessionId;
+    const isStaleRequestSession = Boolean(
+      reqSessionId &&
+        (this.#creatingSessionEpoch !== null ||
+          this.#replayingSessionId !== null ||
+          !activeSessionId ||
+          reqSessionId !== activeSessionId)
+    );
+
     if (isRequestPermissionRequest(req)) {
+      if (isStaleRequestSession) {
+        this.store.traffic.recordSystem(
+          `cancelled stale session/request_permission for ${reqSessionId} (active: ${activeSessionId ?? 'none'})`,
+          req.params
+        );
+        void client
+          .respondToServerRequest(req.id, { outcome: { outcome: 'cancelled' } })
+          .catch(() => {});
+        return;
+      }
       const thoughtOpts = {
         autoCollapseThought: this.store.autoCollapseThought,
         expandAllTools: this.store.getState().expandAllTools,
@@ -1180,6 +1614,14 @@ export class AppController {
     }
 
     if (isElicitationCreateRequest(req)) {
+      if (isStaleRequestSession) {
+        this.store.traffic.recordSystem(
+          `cancelled stale elicitation/create for ${reqSessionId} (active: ${activeSessionId ?? 'none'})`,
+          req.params
+        );
+        void client.respondToServerRequest(req.id, { action: 'cancel' }).catch(() => {});
+        return;
+      }
       this.store.transcript.finalizeActiveThoughts({
         autoCollapseThought: this.store.autoCollapseThought,
         expandAllTools: this.store.getState().expandAllTools,
@@ -1209,9 +1651,24 @@ export class AppController {
   #handleAcpExit(info: AcpExitInfo): void {
     if (this.#shuttingDown || info.expected) return;
 
+    this.#acpClientAlive = false;
+    const crashMessage =
+      info.error?.message ||
+      `agy acp exited unexpectedly${info.code !== null ? ` (exit code ${info.code})` : ''}.`;
+
+    this.#cancelReplayDrain(new Error(crashMessage));
+    this.#replayingSessionId = null;
+    this.#replayingSessionEpoch = null;
+    this.#creatingSessionEpoch = null;
+    this.#pendingNewSessionUpdates = [];
+    this.store.setReplaying(false);
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    this.#swarmCoordinatorReplied = false;
+    this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.store.transcript.cancelActiveBackgroundTasks('cancelled');
 
@@ -1221,26 +1678,30 @@ export class AppController {
     }
     this.store.cancelActiveQuestion();
 
-    if (this.store.getState().isStreaming) {
+    if (this.store.getState().isStreaming || this.store.transcript.activeTurn !== undefined) {
       this.store.transcript.finishActiveTurn(undefined, 'error', undefined, {
         autoCollapseThought: this.store.autoCollapseThought,
         expandAllTools: this.store.getState().expandAllTools,
       });
-      const endedSnap = this.#metricsTracker.endStreamTurn();
-      this.#applySessionMetricsSnapshot(endedSnap);
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
       this.store.setStreaming(false);
     }
 
     this.#syncSwarmFxStylesheet();
     this.osc.setStatusError();
     this.store.setCrashError({
-      message:
-        info.error?.message ||
-        `agy acp exited unexpectedly${info.code !== null ? ` (exit code ${info.code})` : ''}.`,
+      message: crashMessage,
       stderrTail: info.stderrTail,
       exitCode: info.code,
     });
-    this.scheduler.renderNow();
+    if (this.scheduler.suspended) {
+      this.scheduler.resumeAfterReplay(false);
+    } else {
+      this.scheduler.renderNow(true);
+    }
     this.syncFocus();
   }
 
@@ -1282,6 +1743,12 @@ export class AppController {
       return;
     }
     if (event.ev === 'resize') {
+      const eventRows = (event as { rows?: unknown }).rows;
+      if (typeof eventRows === 'number' && Number.isFinite(eventRows) && eventRows > 0) {
+        this.store.setTerminalRows(eventRows);
+      } else if (typeof process.stdout?.rows === 'number' && process.stdout.rows > 0) {
+        this.store.setTerminalRows(process.stdout.rows);
+      }
       this.scheduler.renderNow();
       this.osc.reassertCursorHidden();
       return;
@@ -1293,6 +1760,9 @@ export class AppController {
   }
 
   #handleGoneEvent(event: GoneEvent): void {
+    if (event.sf !== undefined && event.sf !== this.surface.id) {
+      return;
+    }
     const evicted = this.scheduler.handleGone(event);
     if (evicted.length > 0) {
       this.store.traffic.recordSystem(`Tern evicted nodes: ${evicted.join(', ')}`);
@@ -1537,7 +2007,25 @@ export class AppController {
       return;
     }
 
-    if (name === 'o' && key.ctrl && !key.alt && !key.meta) {
+    if (name === 'o' && key.ctrl && key.shift && !key.alt && !key.meta) {
+      const nextMode = this.store.toggleToolVisibility();
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: nextMode },
+      };
+      const label =
+        nextMode === 'hidden'
+          ? 'Tool activity hidden (Ctrl+Shift+O to show)'
+          : nextMode === 'compact'
+            ? 'Tool activity shown (Compact)'
+            : 'Tool activity shown (All)';
+      this.store.pushToast(label, 'info', { ttl: 2000 });
+      this.scheduler.renderNow();
+      void this.#saveConfigSafe();
+      return;
+    }
+
+    if (name === 'o' && key.ctrl && !key.shift && !key.alt && !key.meta) {
       const expanded = this.store.toggleExpandAllTools();
       this.store.pushToast(
         expanded ? 'Expanded all tool outputs' : 'Collapsed tool outputs',
@@ -1545,6 +2033,24 @@ export class AppController {
         { ttl: 1800 }
       );
       this.scheduler.renderNow();
+      return;
+    }
+
+    if (name === 'o' && key.alt && !key.ctrl && !key.meta) {
+      const nextMode = this.store.cycleToolDisplayMode();
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: nextMode },
+      };
+      const label =
+        nextMode === 'all'
+          ? 'Tool calls: All (full previews)'
+          : nextMode === 'compact'
+            ? 'Tool calls: Compact (inline rows)'
+            : 'Tool calls: Hidden (completed runs hidden)';
+      this.store.pushToast(label, 'info', { ttl: 2000 });
+      this.scheduler.renderNow();
+      void this.#saveConfigSafe();
       return;
     }
 
@@ -1817,10 +2323,13 @@ export class AppController {
       return;
     }
 
-    // In compact `/model` picker (Figure 1):
+    // In compact `/model` (and Orchestrator `planner` / `executor`) picker:
     // - Unmodified Left/Right steps the inline Thinking effort `level` slider
     // - Alt/Ctrl + Left/Right moves the search query cursor
-    if (picker.kind === 'model' && (name === 'left' || name === 'right')) {
+    if (
+      (picker.kind === 'model' || picker.kind === 'planner' || picker.kind === 'executor') &&
+      (name === 'left' || name === 'right')
+    ) {
       if (!key.ctrl && !key.alt && !key.meta) {
         this.store.stepModelPickerThinking(name === 'left' ? -1 : 1);
         this.scheduler.renderNow();
@@ -2448,7 +2957,15 @@ export class AppController {
   }
 
   async #handleEditorSend(event: SendEvent): Promise<void> {
-    await this.submitInput(event.text);
+    const trimmed = event.text.trim();
+    // Reject blank native `send` events without consuming existing draft text or attachments.
+    if (trimmed.length === 0) {
+      return;
+    }
+    // Isolate standalone `send` events whose payload differs from the current composer draft so
+    // pending draft attachments are never leaked and the user's draft + attachments stay intact.
+    const matchesCurrentDraft = event.text === this.store.draft.text;
+    await this.submitInput(event.text, { isolated: !matchesCurrentDraft });
   }
 
   async #handleCtrlV(): Promise<void> {
@@ -2509,6 +3026,7 @@ export class AppController {
     if (accepted.item.kind === 'file') {
       const relPath = accepted.item.value;
       const absPath = path.resolve(this.store.getState().cwd, relPath);
+      this.#suppressedMentionPaths.delete(this.#normalizeMentionPathKey(relPath));
       const ext = path.extname(relPath).replace(/^\./, '') || undefined;
       this.store.addAttachment({
         id: `file-${++this.#attachmentSeq}`,
@@ -2532,9 +3050,15 @@ export class AppController {
   // Prompt Submission & Slash Command Execution
   // -------------------------------------------------------------------------
 
-  async submitInput(rawText: string): Promise<void> {
+  async submitInput(
+    rawText: string,
+    options: { readonly isolated?: boolean } = {},
+  ): Promise<void> {
+    const isolated = options.isolated === true;
     const text = rawText.trim();
-    const pendingAttachments = [...this.store.getState().pendingAttachments];
+    const pendingAttachments = isolated
+      ? []
+      : [...this.store.getState().pendingAttachments];
 
     if (text.length === 0 && pendingAttachments.length === 0) {
       return;
@@ -2547,18 +3071,24 @@ export class AppController {
     if (pendingAttachments.length === 0) {
       const dispatched = dispatchSlashCommand(text, this.store.commands);
       if (dispatched.isCommand) {
-        this.store.draft.reset();
+        if (!isolated) {
+          this.store.draft.reset();
+        }
         void this.store.history.push(text, this.store.getState().cwd);
         this.scheduler.renderNow();
-        await executeCommandAction(dispatched.action, this.#commandExecutor());
+        await executeCommandAction(
+          dispatched.action,
+          this.#commandExecutor({ preserveDraft: isolated })
+        );
         return;
       }
     }
 
-    await this.#sendPromptToAcp(text, pendingAttachments);
+    await this.#sendPromptToAcp(text, pendingAttachments, { preserveDraft: isolated });
   }
 
-  #commandExecutor(): CommandActionExecutor {
+  #commandExecutor(options: { readonly preserveDraft?: boolean } = {}): CommandActionExecutor {
+    const preserveDraft = options.preserveDraft === true;
     const copyByIndex = async (index?: number) => {
       const idx = index && index >= 1 ? index : 1;
       const md = this.store.transcript.getAssistantMarkdownByReverseIndex(idx);
@@ -2641,6 +3171,9 @@ export class AppController {
       setThought: async (level: string) => {
         await this.#applyThoughtLevel(level, false);
       },
+      setThinkingDisplay: async (mode: 'on' | 'off' | 'toggle') => {
+        await this.#handleThinkingDisplay(mode);
+      },
       setMode: async (mode: string) => {
         await this.#applyMode(mode, false);
       },
@@ -2659,7 +3192,7 @@ export class AppController {
           this.#syncSwarmFxStylesheet();
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
-        await this.#sendPromptToAcp(text, []);
+        await this.#sendPromptToAcp(text, [], { preserveDraft });
       },
       unknownCommand: (commandName, _rawText, suggestions) => {
         const hint =
@@ -2670,56 +3203,111 @@ export class AppController {
     };
   }
 
-  async #sendPromptToAcp(text: string, attachments: readonly AttachmentItem[]): Promise<void> {
+  async #sendPromptToAcp(
+    text: string,
+    attachments: readonly AttachmentItem[],
+    options: { readonly preserveDraft?: boolean } = {},
+  ): Promise<void> {
+    const preserveDraft = options.preserveDraft === true;
     const client = this.#acpClient;
     const state = this.store.getState();
 
-    if (!client || !state.isReady || !state.sessionId) {
+    if (!client || !this.#isAcpClientLive(client) || !state.isReady || !state.sessionId) {
       this.store.pushToast('Session is not ready yet', 'warning');
       this.scheduler.renderNow();
       return;
     }
 
-    if (state.isStreaming || this.#activePromptTask !== null) {
+    if (state.isStreaming || this.#activePromptTask !== null || this.#promptSubmitting) {
       this.store.pushToast('Wait for current turn to finish or press Esc to stop', 'info');
       this.scheduler.renderNow();
       return;
     }
 
+    // Claim the submission slot synchronously BEFORE the first `await` so concurrent
+    // submit triggers cannot race into two overlapping `session/prompt` RPCs.
+    this.#promptSubmitting = true;
     const sessionId = state.sessionId;
+    const promptEpoch = this.#sessionEpoch;
+    const suppressedMentions = preserveDraft
+      ? new Set<string>()
+      : new Set(this.#suppressedMentionPaths);
 
-    this.#clearDoneIdleTimer();
-    this.#clearBackgroundDoneTimer();
-    this.store.draft.reset();
-    this.store.clearAttachments();
-    if (text.length > 0) {
-      void this.store.history.push(text, state.cwd);
-    }
+    try {
+      this.#clearDoneIdleTimer();
+      this.#clearBackgroundDoneTimer();
+      this.#awaitingPostToolWakeup = false;
+      this.#awaitingSwarmCoordinatorReply = false;
+      this.#swarmCoordinatorReplied = false;
+      if (this.#deferredSettleTurnIndex !== null) {
+        this.scheduler.settleTurn(this.#deferredSettleTurnIndex);
+        this.#deferredSettleTurnIndex = null;
+      }
+      if (!preserveDraft) {
+        this.store.draft.reset();
+        this.store.clearAttachments();
+        this.#suppressedMentionPaths.clear();
+      }
+      if (text.length > 0) {
+        void this.store.history.push(text, state.cwd);
+      }
 
-    // Mark streaming & render user turn synchronously before detaching the long-lived
-    // `client.prompt(...)` RPC so the main session input loop stays responsive for
-    // `y`/`a`/`n` approvals, `<questions>`, `Esc` cancel, and `Ctrl+C`.
-    this.store.transcript.beginUserTurn(text, attachments);
-    this.#metricsTracker.beginStreamTurn();
-    this.#lastTpsStoreFlushAt = 0;
-    this.store.setStreaming(true);
-    if (this.#workingStartedAt === undefined) {
-      this.#workingStartedAt = this.#now();
-    }
-    this.osc.setStatusWorking();
-    this.scheduler.renderNow();
+      // Ensure historical transcript token baseline is synced before starting TPS tracking
+      await this.#syncSessionMetricsFromTranscript();
+      const postSyncState = this.store.getState();
+      if (
+        this.#shuttingDown ||
+        promptEpoch !== this.#sessionEpoch ||
+        !this.#isAcpClientLive(client) ||
+        !postSyncState.isReady ||
+        postSyncState.sessionId !== sessionId
+      ) {
+        return;
+      }
 
-    const runPrompt = async (): Promise<void> => {
-      try {
-        const promptBlocks = await this.#buildPromptBlocks(text, attachments);
-        if (this.#shuttingDown) return;
+      // Mark streaming & render user turn synchronously before detaching the long-lived
+      // `client.prompt(...)` RPC so the main session input loop stays responsive for
+      // `y`/`a`/`n` approvals, `<questions>`, `Esc` cancel, and `Ctrl+C`.
+      this.store.transcript.beginUserTurn(text, attachments);
+      this.#metricsTracker.beginStreamTurn();
+      this.#lastTpsStoreFlushAt = 0;
+      this.store.setStreaming(true);
+      if (this.#workingStartedAt === undefined) {
+        this.#workingStartedAt = this.#now();
+      }
+      this.osc.setStatusWorking();
+      this.scheduler.renderNow();
 
-        const result = await client.prompt({
-          sessionId,
-          prompt: promptBlocks,
-        });
+      const runPrompt = async (): Promise<void> => {
+        try {
+          const promptBlocks = await this.#buildPromptBlocks(
+            text,
+            attachments,
+            suppressedMentions
+          );
+          const preSendState = this.store.getState();
+          if (
+            this.#shuttingDown ||
+            promptEpoch !== this.#sessionEpoch ||
+            !this.#isAcpClientLive(client) ||
+            !preSendState.isReady ||
+            preSendState.sessionId !== sessionId
+          ) {
+            return;
+          }
 
-        if (this.#shuttingDown) return;
+          const result = await client.prompt({
+            sessionId,
+            prompt: promptBlocks,
+          });
+
+        if (
+          this.#shuttingDown ||
+          promptEpoch !== this.#sessionEpoch ||
+          this.store.getState().sessionId !== sessionId
+        ) {
+          return;
+        }
         const finishedTurn = this.store.transcript.finishActiveTurn(
           result.stopReason,
           undefined,
@@ -2727,25 +3315,57 @@ export class AppController {
           {
             autoCollapseThought: this.store.autoCollapseThought,
             expandAllTools: this.store.getState().expandAllTools,
+            preserveInFlightBackgroundTools: true,
           }
         );
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
         this.store.setStreaming(false);
 
+        const hasBgTools = this.store.hasActiveBackgroundTasks();
+        const swarmActive = this.store.isSwarmWorking;
+        const needSwarmReply =
+          this.#awaitingSwarmCoordinatorReply ||
+          (swarmActive && !this.#swarmCoordinatorReplied);
         const stillBusy =
-          this.store.hasActiveBackgroundTasks() ||
-          this.store.isSwarmWorking ||
+          hasBgTools ||
+          swarmActive ||
+          needSwarmReply ||
           (this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking());
 
+        const promptOutputTokens =
+          typeof result.usage?.outputTokens === 'number' &&
+          Number.isFinite(result.usage.outputTokens) &&
+          result.usage.outputTokens > 0
+            ? result.usage.outputTokens
+            : undefined;
+
         if (!stillBusy) {
+          const endedSnap = this.#metricsTracker.endStreamTurn(
+            promptOutputTokens !== undefined
+              ? { authoritativeOutputTokens: promptOutputTokens }
+              : undefined
+          );
+          this.#applySessionMetricsSnapshot(endedSnap);
           this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#awaitingSwarmCoordinatorReply = false;
+          this.#swarmCoordinatorReplied = false;
+          this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
         } else {
-          // Keep OSC 7501 `working` & continuous elapsed timer while detached background
-          // tasks or swarm workers remain active; defer `done` until all finish.
-          this.#pendingBackgroundDone = true;
+          // Keep OSC 7501 `working`, continuous elapsed timer & unsettled turn while
+          // detached/in-flight background tools or swarm workers remain active; defer
+          // `done` and turn settlement until the actual user-facing completion.
+          this.#metricsTracker.pauseForTools();
+          // Keep "waiting for coordinator reply" and "waiting for workers to go idle after
+          // visible reply" distinct so a lagged worker snapshot never suppresses `state=done`.
+          this.#awaitingSwarmCoordinatorReply = needSwarmReply;
+          this.#pendingBackgroundDone =
+            hasBgTools || (!needSwarmReply && this.#swarmCoordinatorReplied);
+          this.#awaitingPostToolWakeup = false;
+          if (finishedTurn) {
+            this.#deferredSettleTurnIndex = finishedTurn.index;
+          }
           this.#clearDoneIdleTimer();
           this.#clearBackgroundDoneTimer();
         }
@@ -2753,7 +3373,7 @@ export class AppController {
         // Flush final non-streaming frame & settle turn BEFORE emitting OSC 7501 `state=done`
         // so the user never receives a completion notification ahead of the final reply.
         this.scheduler.renderNow();
-        if (finishedTurn) {
+        if (!stillBusy && finishedTurn) {
           this.scheduler.settleTurn(finishedTurn.index);
           this.osc.reassertCursorHidden();
         }
@@ -2768,10 +3388,15 @@ export class AppController {
         // Authoritatively calibrate post-turn TPS + cumulative tokens from transcript.jsonl and refresh git
         void this.#syncSessionMetricsFromTranscript();
         void this.#refreshGitStatus();
-
-        await this.#persistSessionAnchorAndOsc();
+        void this.#persistSessionAnchorAndOsc().catch(() => {});
       } catch (err) {
-        if (this.#shuttingDown) return;
+        if (
+          this.#shuttingDown ||
+          promptEpoch !== this.#sessionEpoch ||
+          this.store.getState().sessionId !== sessionId
+        ) {
+          return;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         this.store.transcript.finishActiveTurn(undefined, 'error', msg, {
           autoCollapseThought: this.store.autoCollapseThought,
@@ -2782,6 +3407,8 @@ export class AppController {
         this.store.setStreaming(false);
         if (!this.store.isBusy) {
           this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
         }
@@ -2794,17 +3421,21 @@ export class AppController {
       }
     };
 
-    const task = runPrompt().finally(() => {
-      if (this.#activePromptTask === task) {
-        this.#activePromptTask = null;
-      }
-    });
-    this.#activePromptTask = task;
+      const task = runPrompt().finally(() => {
+        if (this.#activePromptTask === task) {
+          this.#activePromptTask = null;
+        }
+      });
+      this.#activePromptTask = task;
+    } finally {
+      this.#promptSubmitting = false;
+    }
   }
 
   async #buildPromptBlocks(
     text: string,
-    attachments: readonly AttachmentItem[]
+    attachments: readonly AttachmentItem[],
+    suppressedMentions?: ReadonlySet<string>
   ): Promise<ContentBlock[]> {
     const state = this.store.getState();
     const caps = state.promptCapabilities;
@@ -2902,6 +3533,9 @@ export class AppController {
     }
 
     for (const mentioned of extractMentionedPaths(text)) {
+      if (suppressedMentions?.has(this.#normalizeMentionPathKey(mentioned, state.cwd))) {
+        continue;
+      }
       await appendFilePath(mentioned);
     }
 
@@ -2955,9 +3589,22 @@ export class AppController {
         this.store.pushToast('Cancelling turn…', 'info', { ttl: 1500 });
       } else {
         this.#pendingBackgroundDone = false;
+        this.#awaitingPostToolWakeup = false;
+        this.#awaitingSwarmCoordinatorReply = false;
+        this.#deferredSettleTurnIndex = null;
         this.#workingStartedAt = undefined;
         this.#clearDoneIdleTimer();
         this.#clearBackgroundDoneTimer();
+        this.store.transcript.finalizeBackgroundTurn({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: state.expandAllTools,
+          terminalToolStatus: 'cancelled',
+          terminalTurnStatus: 'cancelled',
+        });
+        if (this.#metricsTracker.isStreaming) {
+          const endedSnap = this.#metricsTracker.endStreamTurn();
+          this.#applySessionMetricsSnapshot(endedSnap);
+        }
         if (!this.store.isBusy) {
           this.osc.setStatusIdle();
         }
@@ -2965,9 +3612,22 @@ export class AppController {
       }
     } else if (cancelledBg > 0) {
       this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#awaitingSwarmCoordinatorReply = false;
+      this.#deferredSettleTurnIndex = null;
       this.#workingStartedAt = undefined;
       this.#clearDoneIdleTimer();
       this.#clearBackgroundDoneTimer();
+      this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: state.expandAllTools,
+        terminalToolStatus: 'cancelled',
+        terminalTurnStatus: 'cancelled',
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
       if (!this.store.isBusy) {
         this.osc.setStatusIdle();
       }
@@ -3053,10 +3713,11 @@ export class AppController {
       return;
     }
 
-    const coordinatorSummarizing =
-      this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking();
+    const coordinatorWorking =
+      (this.#pendingBackgroundDone || this.#awaitingSwarmCoordinatorReply) &&
+      this.#isSwarmCoordinatorWorking();
 
-    if (state.hasActiveBackgroundTasks || state.isSwarmWorking || coordinatorSummarizing) {
+    if (state.hasActiveBackgroundTasks) {
       this.#clearBackgroundDoneTimer();
       if (this.#workingStartedAt === undefined) {
         this.#workingStartedAt = this.#now();
@@ -3071,12 +3732,40 @@ export class AppController {
       return;
     }
 
-    if (prevBusy || this.#pendingBackgroundDone) {
-      // Wait for a brief quiet grace period before emitting deferred `state=done`
-      // so coordinator summary / late ACP reply chunks never race behind the notification.
-      this.#pendingBackgroundDone = true;
+    if (state.isSwarmWorking || coordinatorWorking) {
+      this.#clearBackgroundDoneTimer();
+      if (this.#workingStartedAt === undefined) {
+        this.#workingStartedAt = this.#now();
+      }
+      if (!prevBusy) {
+        this.#clearDoneIdleTimer();
+        if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+          this.osc.setStatusWorking();
+        }
+      }
+      return;
+    }
+
+    // Only emit deferred OSC 7501 `state=done` when `#pendingBackgroundDone` was armed by
+    // a non-swarm background task or an actual coordinator `agent_message_chunk` reply —
+    // NEVER merely because swarm workers transitioned from `working` to `waiting`.
+    if (this.#pendingBackgroundDone && !this.#awaitingSwarmCoordinatorReply) {
       if (prevBusy || this.#backgroundDoneTimer === undefined) {
-        this.#scheduleBackgroundDone();
+        const delayMs = this.#awaitingPostToolWakeup
+          ? this.#backgroundWakeupGraceMs
+          : this.#backgroundDoneGraceMs;
+        this.#scheduleBackgroundDone(delayMs);
+      }
+      return;
+    }
+
+    // Swarm workers went idle/waiting while no user-facing coordinator reply has completed:
+    // clear working timer and return quietly to `idle` without firing a spurious `finish`.
+    if (prevBusy) {
+      this.#clearBackgroundDoneTimer();
+      this.#workingStartedAt = undefined;
+      if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+        this.osc.setStatusIdle();
       }
     }
   }
@@ -3084,9 +3773,18 @@ export class AppController {
   async #closePicker(options: { commitModelThinking?: boolean } = {}): Promise<void> {
     const prevState = this.store.getState();
     const prevPicker = prevState.picker;
+    // Align with omp's model picker: pressing Esc only commits a thinking-level change when
+    // the highlighted row is still the currently active model; adjusting thinking while
+    // previewing a different candidate model and cancelling via Esc must not mutate the
+    // currently active model.
+    const highlightedIsCurrentModel =
+      Boolean(prevState.controls.currentModelId) &&
+      !isOrchestratorModelId(prevState.controls.currentModelId) &&
+      prevPicker?.selectedId === prevState.controls.currentModelId;
     const pendingThinking =
       options.commitModelThinking &&
       prevPicker?.kind === 'model' &&
+      highlightedIsCurrentModel &&
       prevPicker.modelPickerThinkingDirty &&
       prevPicker.modelPickerThinking &&
       prevPicker.modelPickerThinking !== prevState.controls.currentThoughtLevel
@@ -3210,7 +3908,11 @@ export class AppController {
       await this.#openSwarmBoard(initialQuery);
       return;
     }
-    if (kind === 'thought' && !this.store.getState().controls.supportsThoughtLevel) {
+    if (
+      kind === 'thought' &&
+      !this.store.getState().controls.supportsThoughtLevel &&
+      !isOrchestratorModelId(this.store.getState().controls.currentModelId)
+    ) {
       this.store.pushToast(
         'Current model does not support thought_level adjustment',
         'info'
@@ -3226,9 +3928,41 @@ export class AppController {
       kind === 'plugins' ||
       kind === 'skills' ||
       kind === 'agents';
+
+    let initialSelectedId: string | null | undefined;
+    let initialModelThinking: string | undefined;
+    if (kind === 'model') {
+      const curId = this.store.getState().controls.currentModelId;
+      if (isOrchestratorModelId(curId)) {
+        initialSelectedId = ORCHESTRATOR_PICKER_ID;
+      }
+    } else if (kind === 'planner' || kind === 'executor') {
+      const curState = this.store.getState();
+      const candidates = filterOrchestratorRoleModels(kind, curState.controls.availableModels);
+      const parsedRole = parseOrchestratorModelSpec(curState.orchestratorSettings[kind]);
+      const fallbackRole =
+        kind === 'planner'
+          ? inferOrchestratorDefaultPlannerModel(curState.controls.currentModelId)
+          : inferOrchestratorDefaultExecutorModel(curState.controls.currentModelId);
+      const targetName = parsedRole?.modelName ?? fallbackRole?.modelName;
+      if (targetName) {
+        const matched = candidates.find(
+          c =>
+            c.name.toLowerCase() === targetName.toLowerCase() ||
+            c.value.toLowerCase() === targetName.toLowerCase()
+        );
+        if (matched) {
+          initialSelectedId = matched.value;
+        }
+      }
+      initialModelThinking = parsedRole?.thoughtLevel ?? 'high';
+    }
+
     this.store.openPicker(kind, {
       initialQuery,
       loading: isAsyncKind,
+      ...(initialSelectedId !== undefined ? { selectedId: initialSelectedId } : {}),
+      ...(initialModelThinking !== undefined ? { modelPickerThinking: initialModelThinking } : {}),
     });
 
     // Render modal picker first, then release editor focus to null (consistent with openHelp)
@@ -3276,12 +4010,53 @@ export class AppController {
     }
 
     try {
-      const [remoteSessions, previewMap] = await Promise.all([
-        client.listAllSessions(),
-        this.#previewStore.loadMap(),
-      ]);
-
+      // Immediately capture rejection on the concurrent remote list request so a fast failure
+      // while local previews are still reading — or after the picker closes — never produces
+      // an `unhandledRejection`.
+      const remoteResultPromise = client.listAllSessions().then(
+        sessions => ({ ok: true as const, sessions }),
+        error => ({ ok: false as const, error })
+      );
+      const previewMap = await this.#previewStore.loadMap();
       if (isStale()) return;
+
+      // Render locally cached sessions immediately as progressive first paint while ACP pages load
+      if (previewMap.size > 0) {
+        const cachedEntries: ResumeSessionEntry[] = [];
+        for (const cached of previewMap.values()) {
+          const rawCwd = cached.cwd || '';
+          cachedEntries.push({
+            sessionId: cached.sessionId,
+            cwd: rawCwd,
+            displayCwd: normalizeDisplayPath(rawCwd),
+            title: (cached.title ?? '').trim(),
+            updatedAt: cached.updatedAt || '',
+            ...(cached.model ? { model: cached.model } : {}),
+            ...(cached.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+            ...(cached.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
+            ...(cached.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
+          });
+        }
+        this.store.setResumeSessions(cachedEntries, { loading: true });
+        const partialState = this.store.getState();
+        if (partialState.picker) {
+          const computed = computePickerData(
+            partialState,
+            partialState.picker,
+            this.store.traffic.list(),
+            this.#now()
+          );
+          this.store.setPickerSelected(computed.selectedId ?? null);
+        }
+        this.scheduler.renderNow();
+      }
+
+      const remoteResult = await remoteResultPromise;
+      if (isStale()) return;
+      if (!remoteResult.ok) {
+        throw remoteResult.error;
+      }
+      const remoteSessions = remoteResult.sessions;
 
       const merged: ResumeSessionEntry[] = remoteSessions.map(s => {
         const cached: SessionAnchorRecord | undefined = previewMap.get(s.sessionId);
@@ -3645,13 +4420,30 @@ export class AppController {
       kind === 'model' && picker?.modelPickerThinkingDirty
         ? picker.modelPickerThinking
         : undefined;
+    const selectedRoleThinking =
+      kind === 'planner' || kind === 'executor' ? picker?.modelPickerThinking : undefined;
 
     await this.#closePicker({ commitModelThinking: false });
 
     if (kind === 'resume') {
       await this.#switchToSession(itemId, selectedSession);
     } else if (kind === 'model') {
-      await this.#applyModelQuery(itemId, desiredModelThinking);
+      if (itemId === ORCHESTRATOR_PICKER_ID) {
+        const curState = this.store.getState();
+        const parsedPlan = parseOrchestratorModelSpec(curState.orchestratorSettings.planner);
+        const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
+          parsedPlan?.modelName,
+          curState.controls.availableModels,
+          curState.controls.currentModelId
+        );
+        if (targetOrchId) {
+          await this.#applyModelQuery(targetOrchId);
+        }
+      } else {
+        await this.#applyModelQuery(itemId, desiredModelThinking);
+      }
+    } else if (kind === 'planner' || kind === 'executor') {
+      await this.#applyOrchestratorRoleModel(kind, itemId, selectedRoleThinking);
     } else if (kind === 'thought') {
       await this.#applyThoughtLevel(itemId, false);
     } else if (kind === 'mode') {
@@ -3668,18 +4460,55 @@ export class AppController {
 
     const state = this.store.getState();
     const oldSessionId = state.sessionId;
-    if (oldSessionId && oldSessionId !== sessionId) {
-      await client.closeSession(oldSessionId).catch(() => {});
-    }
-
+    const wasStreaming = state.isStreaming;
     const targetCwd =
       meta?.cwd && !sameDir(meta.cwd, state.cwd) ? normalizeDisplayPath(meta.cwd) : state.cwd;
 
+    const switchEpoch = this.#beginSessionTransition('replaying', sessionId);
     try {
-      await this.#loadSessionWithReplay(client, sessionId, targetCwd, meta?.title);
+      if (oldSessionId && oldSessionId !== sessionId) {
+        if (wasStreaming) {
+          await client.cancel(oldSessionId).catch(() => {});
+        }
+        await client.closeSession(oldSessionId).catch(() => {});
+      }
+
+      if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) {
+        return;
+      }
+      if (!this.#isAcpClientLive(client)) {
+        if (this.#replayingSessionEpoch === switchEpoch) {
+          this.#replayingSessionId = null;
+          this.#replayingSessionEpoch = null;
+        }
+        this.store.setReplaying(false);
+        if (this.scheduler.suspended) {
+          this.scheduler.resumeAfterReplay(false);
+        } else {
+          this.scheduler.renderNow(true);
+        }
+        return;
+      }
+
+      const applied = await this.#loadSessionWithReplay(
+        client,
+        sessionId,
+        targetCwd,
+        meta?.title,
+        switchEpoch
+      );
+      if (
+        !applied ||
+        this.#shuttingDown ||
+        switchEpoch !== this.#sessionEpoch ||
+        !this.#isAcpClientLive(client)
+      ) {
+        return;
+      }
       this.osc.setStatusIdle();
       this.osc.setWorkingDirectory(this.store.getState().cwd);
       await this.#persistSessionAnchorAndOsc();
+      if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) return;
       this.store.pushToast(
         `Loaded session ${meta?.title || sessionId.slice(0, 8)}`,
         'success',
@@ -3688,6 +4517,21 @@ export class AppController {
       this.scheduler.renderNow();
       this.syncFocus();
     } catch (err) {
+      if (switchEpoch !== this.#sessionEpoch) {
+        return;
+      }
+      if (this.#replayingSessionEpoch === switchEpoch) {
+        this.#replayingSessionId = null;
+        this.#replayingSessionEpoch = null;
+      }
+      this.store.setReplaying(false);
+      if (this.scheduler.suspended) {
+        this.scheduler.resumeAfterReplay(false);
+      }
+      if (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed') {
+        this.scheduler.renderNow(true);
+        return;
+      }
       this.store.pushToast(
         `Failed to load session: ${err instanceof Error ? err.message : String(err)}`,
         'error'
@@ -3701,22 +4545,37 @@ export class AppController {
     if (!client) return;
     const state = this.store.getState();
     const oldId = state.sessionId;
+    const wasStreaming = state.isStreaming;
+    const createEpoch = this.#beginSessionTransition('creating');
+
     if (oldId) {
+      if (wasStreaming) {
+        await client.cancel(oldId).catch(() => {});
+      }
       await client.closeSession(oldId).catch(() => {});
     }
 
-    this.#stopSwarmWatcher();
-    this.#clearBackgroundDoneTimer();
-    this.#metricsTracker.setSession(null);
-    this.#lastTpsStoreFlushAt = 0;
-    this.#pendingBackgroundDone = false;
-    this.#workingStartedAt = undefined;
-    this.store.resetSessionState({ keepCommands: true });
-    this.#syncSwarmFxStylesheet();
-    this.scheduler.resetSession();
+    if (
+      this.#shuttingDown ||
+      createEpoch !== this.#sessionEpoch ||
+      !this.#isAcpClientLive(client)
+    ) {
+      if (this.#creatingSessionEpoch === createEpoch) {
+        this.#creatingSessionEpoch = null;
+        this.#pendingNewSessionUpdates = [];
+      }
+      return;
+    }
 
     try {
       const created = await client.newSession({ cwd: state.cwd, mcpServers: [] });
+      if (
+        this.#shuttingDown ||
+        !this.#isAcpClientLive(client) ||
+        createEpoch !== this.#sessionEpoch
+      ) {
+        return;
+      }
       const createdTier = client.currentTier ?? extractSessionTier(created._meta);
       this.store.applySessionSnapshot({
         sessionId: created.sessionId,
@@ -3726,35 +4585,97 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#lastCommittedSessionId = created.sessionId;
+      this.#lastCommittedCwd = state.cwd;
+      if (this.#creatingSessionEpoch === createEpoch) {
+        this.#creatingSessionEpoch = null;
+      }
+      this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
       this.osc.setStatusIdle();
       await this.#persistSessionAnchorAndOsc();
+      if (this.#shuttingDown || createEpoch !== this.#sessionEpoch) return;
       this.store.pushToast('Started a new session', 'info', { ttl: 2000 });
       this.scheduler.renderNow();
       this.syncFocus();
     } catch (err) {
+      if (
+        createEpoch !== this.#sessionEpoch ||
+        (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed')
+      ) {
+        return;
+      }
       this.store.pushToast(
         `Failed to create session: ${err instanceof Error ? err.message : String(err)}`,
         'error'
       );
       this.scheduler.renderNow();
+    } finally {
+      // Only the owning epoch may clear creation state & buffered updates so an
+      // earlier superseded `/new` never wipes a newer `/new`'s early command buffer.
+      if (this.#creatingSessionEpoch === createEpoch) {
+        this.#creatingSessionEpoch = null;
+        this.#pendingNewSessionUpdates = [];
+      }
     }
   }
 
   async #saveConfigSafe(): Promise<boolean> {
-    try {
-      await saveConfig(this.#config, this.#configPath);
-      return true;
-    } catch (err) {
+    if (this.#configWriteBlockedReason) {
       this.store.pushToast(
-        `Failed to save config.toml: ${err instanceof Error ? err.message : String(err)}`,
-        'error'
+        `config.toml has syntax errors; change kept in memory only until fixed`,
+        'warning',
+        { ttl: 3200 }
       );
       this.scheduler.renderNow();
       return false;
     }
+
+    let ok = false;
+    const writeStep = async (): Promise<void> => {
+      if (this.#configWriteBlockedReason) {
+        ok = false;
+        return;
+      }
+      // Guard against overwriting an existing malformed config.toml even if the
+      // controller was instantiated without forwarding `configParseError`.
+      if (!this.#configVerifiedWritable) {
+        const probe = await loadConfig({ path: this.#configPath });
+        if (probe.exists && probe.parseError) {
+          this.#configWriteBlockedReason = probe.parseError;
+          this.store.pushToast(
+            `config.toml has syntax errors; change kept in memory only until fixed`,
+            'warning',
+            { ttl: 3200 }
+          );
+          this.scheduler.renderNow();
+          ok = false;
+          return;
+        }
+        this.#configVerifiedWritable = true;
+      }
+
+      try {
+        // Always persist the latest in-memory config snapshot so rapid serialized
+        // toggles never clobber a newer change with an older snapshot.
+        await saveConfig(cloneConfig(this.#config), this.#configPath);
+        ok = true;
+      } catch (err) {
+        this.store.pushToast(
+          `Failed to save config.toml: ${err instanceof Error ? err.message : String(err)}`,
+          'error'
+        );
+        this.scheduler.renderNow();
+        ok = false;
+      }
+    };
+
+    const next = this.#configSaveChain.then(writeStep, writeStep);
+    this.#configSaveChain = next.catch(() => {});
+    await next;
+    return ok;
   }
 
   async #applyModelQuery(query: string, overrideThoughtLevel?: string): Promise<void> {
@@ -3795,7 +4716,9 @@ export class AppController {
 
       const label = applied.appliedThoughtLevel
         ? `${applied.appliedModelId} (${applied.appliedThoughtLevel})`
-        : applied.appliedModelId;
+        : isOrchestratorModelId(applied.appliedModelId)
+          ? 'Orchestrator'
+          : applied.appliedModelId;
       this.store.pushToast(`Switched model to ${label}`, 'success', { ttl: 2500 });
       await this.#persistSessionAnchorAndOsc();
       this.scheduler.renderNow();
@@ -3808,10 +4731,259 @@ export class AppController {
     }
   }
 
+  async #loadInitialAgySettings(): Promise<void> {
+    try {
+      const loaded = await loadAgySettings({ path: this.#agySettingsPath });
+      if (this.#shuttingDown) return;
+      this.store.setOrchestratorSettings(loaded.settings.orchestrator);
+      if (loaded.presentKeys.includes('showThinking')) {
+        const show = loaded.settings.showThinking;
+        this.store.setShowThinking(show);
+        if (show) {
+          this.store.setAutoCollapseThought(false);
+        }
+      }
+      this.scheduler.markDirty();
+    } catch {
+      // Non-fatal: keep defaults if settings.json is unreadable
+    }
+  }
+
+  async #handleThinkingDisplay(mode: 'on' | 'off' | 'toggle'): Promise<void> {
+    const state = this.store.getState();
+    const currentlyLiveExpanded = state.showThinking && !state.autoCollapseThought;
+    const enabled = mode === 'on' ? true : mode === 'off' ? false : !currentlyLiveExpanded;
+
+    this.store.setShowThinking(enabled);
+    this.store.setAutoCollapseThought(enabled ? false : this.#config.ui.auto_collapse_thought);
+    this.store.transcript.setAllThoughtsOpen(enabled);
+
+    try {
+      const saved = await saveAgySettings(
+        { showThinking: enabled },
+        { path: this.#agySettingsPath }
+      );
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+    } catch (err) {
+      this.store.pushToast(
+        `Thinking ${enabled ? 'enabled' : 'disabled'} in session (failed to save settings.json: ${
+          err instanceof Error ? err.message : String(err)
+        })`,
+        'warning',
+        { ttl: 2800 }
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
+    this.store.pushToast(
+      enabled
+        ? 'Live thinking stream enabled (stays expanded)'
+        : 'Live thinking stream disabled',
+      'info',
+      { ttl: 2200 }
+    );
+    this.scheduler.renderNow();
+  }
+
+  async #applyOrchestratorRoleModel(
+    role: 'planner' | 'executor',
+    modelId: string,
+    selectedThought?: string
+  ): Promise<void> {
+    const state = this.store.getState();
+    const choice = state.controls.availableModels.find(c => c.value === modelId);
+    const modelName = choice?.name || modelId;
+    const thoughtChoices = resolveThoughtLevelsForModel(
+      modelId,
+      state.controls,
+      state.modelThoughtLevels
+    );
+    const clampedThought =
+      thoughtChoices.length > 0
+        ? clampThoughtLevelForChoices(selectedThought ?? 'high', thoughtChoices)
+        : undefined;
+    const spec = formatOrchestratorModelSpec(modelName, clampedThought);
+    if (!spec) return;
+
+    const nextOrchestrator = {
+      ...state.orchestratorSettings,
+      [role]: spec,
+    };
+
+    try {
+      const saved = await saveAgySettings(
+        { orchestrator: nextOrchestrator },
+        { path: this.#agySettingsPath }
+      );
+      this.store.setOrchestratorSettings(saved.settings.orchestrator);
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+
+      // When updating Planner while currently in Orchestrator mode, keep the active ACP
+      // Orchestrator variant aligned (Neon / Carbon / Argon) whenever a matching variant exists.
+      if (
+        role === 'planner' &&
+        isOrchestratorModelId(state.controls.currentModelId) &&
+        this.#acpClient &&
+        state.sessionId
+      ) {
+        const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
+          modelId,
+          state.controls.availableModels,
+          state.controls.currentModelId
+        );
+        if (targetOrchId && targetOrchId !== state.controls.currentModelId) {
+          try {
+            const res = await this.#acpClient.setConfigOption({
+              sessionId: state.sessionId,
+              configId: 'model',
+              value: targetOrchId,
+            });
+            this.store.updateConfigOptions(res.configOptions);
+          } catch {
+            // Non-fatal: settings.json is already updated
+          }
+        }
+      }
+
+      const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+      this.store.pushToast(
+        `Orchestrator ${roleLabel} set to ${spec}`,
+        'success',
+        { ttl: 2500 }
+      );
+    } catch (err) {
+      this.store.pushToast(
+        `Failed to save Orchestrator ${role}: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+    }
+    this.scheduler.renderNow();
+  }
+
+  async #applyOrchestratorRoleThoughtLevel(
+    role: 'planner' | 'executor',
+    level: string,
+    silent: boolean
+  ): Promise<string | null> {
+    const state = this.store.getState();
+    if (!isOrchestratorModelId(state.controls.currentModelId)) return null;
+
+    const parsedRole = parseOrchestratorModelSpec(state.orchestratorSettings[role]);
+    const fallbackRole =
+      role === 'planner'
+        ? inferOrchestratorDefaultPlannerModel(state.controls.currentModelId)
+        : inferOrchestratorDefaultExecutorModel(state.controls.currentModelId);
+    const modelName =
+      parsedRole?.modelName ??
+      fallbackRole?.modelName ??
+      (role === 'planner' ? 'Gemini 4 Carbon' : 'Gemini 4 Hydrogen');
+    const choices = resolveOrchestratorRoleThoughtLevels(
+      role,
+      state.controls,
+      state.modelThoughtLevels,
+      parsedRole?.modelName
+    );
+    if (choices.length === 0) return null;
+
+    const trimmed = level.trim().toLowerCase();
+    const normalizedInput = trimmed === 'extra' ? 'xhigh' : trimmed;
+    const matched =
+      choices.find(
+        c =>
+          c.value.toLowerCase() === normalizedInput ||
+          c.name.toLowerCase() === trimmed
+      ) ??
+      choices.find(c => c.value.toLowerCase().startsWith(normalizedInput));
+
+    const targetChoice =
+      matched ??
+      (silent
+        ? choices.find(c => c.value === clampThoughtLevelForChoices(normalizedInput, choices))
+        : undefined);
+    if (!targetChoice) {
+      if (!silent) {
+        this.store.pushToast(
+          `Invalid thought level "${level}". Available: ${choices.map(c => c.value).join(', ')}`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+      }
+      return null;
+    }
+
+    const spec = formatOrchestratorModelSpec(modelName, targetChoice.value);
+    const nextOrchestrator = {
+      ...state.orchestratorSettings,
+      [role]: spec,
+    };
+
+    try {
+      const saved = await saveAgySettings(
+        { orchestrator: nextOrchestrator },
+        { path: this.#agySettingsPath }
+      );
+      this.store.setOrchestratorSettings(saved.settings.orchestrator);
+      if (this.store.getState().settings) {
+        this.store.setSettingsAgySettings(saved.settings);
+      }
+      if (!silent) {
+        const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+        this.store.pushToast(
+          `${roleLabel} thinking set to ${targetChoice.name} (${modelName})`,
+          'success',
+          { ttl: 2200 }
+        );
+      }
+      this.scheduler.renderNow();
+      return targetChoice.value;
+    } catch (err) {
+      if (!silent) {
+        this.store.pushToast(
+          `Failed to save Orchestrator ${role} thinking level: ${err instanceof Error ? err.message : String(err)}`,
+          'error'
+        );
+        this.scheduler.renderNow();
+      }
+      return null;
+    }
+  }
+
+  async #cycleOrchestratorRoleThinking(role: 'planner' | 'executor'): Promise<void> {
+    const state = this.store.getState();
+    const { controls } = state;
+    if (!isOrchestratorModelId(controls.currentModelId)) return;
+    const parsedRole = parseOrchestratorModelSpec(state.orchestratorSettings[role]);
+    const choices = resolveOrchestratorRoleThoughtLevels(
+      role,
+      controls,
+      state.modelThoughtLevels,
+      parsedRole?.modelName
+    );
+    if (choices.length === 0) return;
+    const curVal = clampThoughtLevelForChoices(parsedRole?.thoughtLevel ?? 'high', choices);
+    const curIdx = choices.findIndex(c => c.value === curVal);
+    const next = choices[(curIdx + 1 + choices.length) % choices.length];
+    if (!next) return;
+    await this.#applyOrchestratorRoleThoughtLevel(role, next.value, false);
+  }
+
   async #applyThoughtLevel(level: string, silent: boolean): Promise<void> {
     const client = this.#acpClient;
     const state = this.store.getState();
     if (!client || !state.sessionId) return;
+
+    if (
+      !state.controls.supportsThoughtLevel &&
+      isOrchestratorModelId(state.controls.currentModelId)
+    ) {
+      await this.#applyOrchestratorRoleThoughtLevel('planner', level, silent);
+      return;
+    }
 
     const resolved = resolveThoughtLevel(level, [...state.configOptions]);
     if (!resolved.ok) {
@@ -3854,7 +5026,12 @@ export class AppController {
   }
 
   async cycleThinkingLevel(): Promise<void> {
-    const { controls } = this.store.getState();
+    const state = this.store.getState();
+    const { controls } = state;
+    if (!controls.supportsThoughtLevel && isOrchestratorModelId(controls.currentModelId)) {
+      await this.#cycleOrchestratorRoleThinking('planner');
+      return;
+    }
     if (!controls.supportsThoughtLevel || controls.availableThoughtLevels.length === 0) {
       return;
     }
@@ -3934,6 +5111,7 @@ export class AppController {
     try {
       const loaded = await loadAgySettings({ path: this.#agySettingsPath });
       agySnapshot = loaded.settings;
+      this.store.setOrchestratorSettings(loaded.settings.orchestrator);
     } catch {
       agySnapshot = {};
     }
@@ -4085,6 +5263,14 @@ export class AppController {
       };
       this.store.setAutoCollapseThought(next);
       omaUpdated = true;
+    } else if (rowId === 'ui.tool_display') {
+      const next: ToolDisplayMode = normalizeToolDisplayMode(value);
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: next },
+      };
+      this.store.setToolDisplayMode(next);
+      omaUpdated = true;
     } else if (rowId === 'ui.tool_preview_lines') {
       const num = typeof value === 'number' ? value : Number(value);
       if (Number.isFinite(num)) {
@@ -4219,6 +5405,14 @@ export class AppController {
       }
       return;
     }
+    if (act === 'pick-planner') {
+      await this.#openPicker('planner', '');
+      return;
+    }
+    if (act === 'pick-executor') {
+      await this.#openPicker('executor', '');
+      return;
+    }
     if (act === 'save-defaults') {
       const { controls } = this.store.getState();
       this.#config = {
@@ -4244,6 +5438,7 @@ export class AppController {
         recent_models: [...this.#config.recent_models],
       });
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
+      this.store.setToolDisplayMode(this.#config.ui.tool_display);
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
       const ok = await this.#saveConfigSafe();
@@ -4396,7 +5591,11 @@ export class AppController {
   }
 
   async #retryAfterCrash(): Promise<void> {
-    const previousSessionId = this.store.getState().sessionId ?? undefined;
+    const previousSessionId =
+      this.store.getState().sessionId ?? this.#lastCommittedSessionId ?? undefined;
+    if (this.#lastCommittedCwd && !sameDir(this.store.getState().cwd, this.#lastCommittedCwd)) {
+      this.store.setCwd(this.#lastCommittedCwd);
+    }
     if (this.#acpClient) {
       await this.#acpClient.close({ timeoutMs: 200 }).catch(() => {});
       this.#acpClient = null;
@@ -4445,7 +5644,9 @@ export class AppController {
 
   async #persistSessionAnchorAndOsc(): Promise<void> {
     const state = this.store.getState();
-    if (!state.sessionId) return;
+    const sid = state.sessionId;
+    if (!sid) return;
+    const epoch = this.#sessionEpoch;
 
     const firstUserText = this.store.transcript.turns.find(t => t.user?.text)?.user?.text;
     const title =
@@ -4455,7 +5656,7 @@ export class AppController {
 
     try {
       const anchorFile = await this.#previewStore.save({
-        sessionId: state.sessionId,
+        sessionId: sid,
         cwd: state.cwd,
         title,
         ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
@@ -4466,6 +5667,13 @@ export class AppController {
         turnCount: this.store.transcript.turns.length,
         preview: this.store.transcript.getPreviewMessages(3, 400),
       });
+      if (
+        this.#shuttingDown ||
+        epoch !== this.#sessionEpoch ||
+        this.store.getState().sessionId !== sid
+      ) {
+        return;
+      }
       this.osc.setReopenAnchor(anchorFile);
     } catch {
       // Anchor persistence errors must not interrupt interactive conversation
@@ -4513,9 +5721,10 @@ export class AppController {
     return snap?.memberByName['coordinator']?.status === 'working';
   }
 
-  #scheduleBackgroundDone(): void {
+  #scheduleBackgroundDone(delayMs?: number): void {
     this.#clearBackgroundDoneTimer();
     if (this.#shuttingDown) return;
+    const waitMs = delayMs ?? this.#backgroundDoneGraceMs;
     this.#backgroundDoneTimer = setTimeout(() => {
       this.#backgroundDoneTimer = undefined;
       if (this.#shuttingDown || !this.#pendingBackgroundDone) return;
@@ -4524,19 +5733,38 @@ export class AppController {
         state.isStreaming ||
         state.hasActiveBackgroundTasks ||
         state.isSwarmWorking ||
-        this.#isSwarmCoordinatorWorking()
+        this.#isSwarmCoordinatorWorking() ||
+        this.#awaitingSwarmCoordinatorReply
       ) {
         return;
       }
       this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#awaitingSwarmCoordinatorReply = false;
       this.#workingStartedAt = undefined;
+      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: state.expandAllTools,
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
+      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+      this.#deferredSettleTurnIndex = null;
       // Ensure any late chunks or tool updates are flushed to the screen before notifying done
       this.scheduler.renderNow();
+      if (settleIdx !== null) {
+        this.scheduler.settleTurn(settleIdx);
+        this.osc.reassertCursorHidden();
+      }
       if (!this.store.approvals.hasPending() && !state.activeQuestion) {
         this.osc.setStatusDone();
         this.#scheduleDoneToIdle();
       }
-    }, this.#backgroundDoneGraceMs);
+      void this.#syncSessionMetricsFromTranscript();
+      void this.#persistSessionAnchorAndOsc();
+    }, waitMs);
   }
 
   #clearBackgroundDoneTimer(): void {
@@ -4546,11 +5774,11 @@ export class AppController {
     }
   }
 
-  #bindSessionMetrics(sessionId: string | null): void {
+  #bindSessionMetrics(sessionId: string | null, autoSync = true): void {
     this.#metricsTracker.setSession(sessionId);
     this.#lastTpsStoreFlushAt = 0;
     this.store.setSessionMetrics(null);
-    if (sessionId) {
+    if (sessionId && autoSync) {
       void this.#syncSessionMetricsFromTranscript();
     }
   }
@@ -4705,9 +5933,13 @@ export class AppController {
     this.store.selectGitFileKey(key);
     this.scheduler.renderNow();
 
-    const diff = await loadGitFileDiff(state.cwd, file, {
+    const repoRoot = git.snapshot?.cwd ?? state.cwd;
+    const gitEnv = git.snapshot?.gitEnv;
+    const diff = await loadGitFileDiff(repoRoot, file, {
       wholeFile: git.viewMode === 'file',
       headSha: git.snapshot?.headCommit?.sha,
+      parentSha: git.snapshot?.headCommit?.parents[0],
+      ...(gitEnv ? { gitEnv } : {}),
       ...(this.#gitExec ? { exec: this.#gitExec } : {}),
     });
     if (this.#shuttingDown || seq !== this.#gitOverlayDiffSeq || !this.store.getState().gitOverlay) {
@@ -4764,11 +5996,17 @@ export class AppController {
     this.store.setGitOverlayBusy(true);
     this.scheduler.renderNow();
     try {
-      const opts = this.#gitExec ? { exec: this.#gitExec } : undefined;
+      const repoRoot = git.snapshot?.cwd ?? state.cwd;
+      const gitEnv = git.snapshot?.gitEnv;
+      const opts = {
+        ...(this.#gitExec ? { exec: this.#gitExec } : {}),
+        ...(gitEnv ? { gitEnv } : {}),
+      };
+      const targetPaths = resolveGitStageActionPaths(file, op);
       const res =
         op === 'stage'
-          ? await stageGitFiles(state.cwd, [file.path], opts)
-          : await unstageGitFiles(state.cwd, [file.path], opts);
+          ? await stageGitFiles(repoRoot, targetPaths, opts)
+          : await unstageGitFiles(repoRoot, targetPaths, opts);
       this.store.setGitOverlayStatus({
         text: res.message,
         tone: res.ok ? 'success' : 'error',
@@ -4788,11 +6026,16 @@ export class AppController {
     this.store.setGitOverlayBusy(true);
     this.scheduler.renderNow();
     try {
-      const opts = this.#gitExec ? { exec: this.#gitExec } : undefined;
+      const repoRoot = git.snapshot?.cwd ?? state.cwd;
+      const gitEnv = git.snapshot?.gitEnv;
+      const opts = {
+        ...(this.#gitExec ? { exec: this.#gitExec } : {}),
+        ...(gitEnv ? { gitEnv } : {}),
+      };
       const res =
         op === 'stage'
-          ? await stageGitFiles(state.cwd, 'all', opts)
-          : await unstageGitFiles(state.cwd, 'all', opts);
+          ? await stageGitFiles(repoRoot, 'all', opts)
+          : await unstageGitFiles(repoRoot, 'all', opts);
       this.store.setGitOverlayStatus({
         text: res.message,
         tone: res.ok ? 'success' : 'error',
@@ -4816,15 +6059,20 @@ export class AppController {
     this.store.setGitOverlayBusy(true);
     this.scheduler.renderNow();
     try {
+      const repoRoot = git.snapshot?.cwd ?? state.cwd;
+      const gitEnv = git.snapshot?.gitEnv;
       const res = await commitGitChanges(
-        state.cwd,
+        repoRoot,
         {
           summary: git.commitSummary,
           body: git.commitBody,
           amend: git.commitAmend,
           stageAllIfEmpty,
         },
-        this.#gitExec ? { exec: this.#gitExec } : undefined,
+        {
+          ...(this.#gitExec ? { exec: this.#gitExec } : {}),
+          ...(gitEnv ? { gitEnv } : {}),
+        },
       );
       if (res.ok) {
         this.store.clearGitCommitForm();
@@ -5019,6 +6267,7 @@ export class AppController {
       commands: this.store.commands.getAll(),
       trafficEntries: this.store.traffic.list(),
       toolPreviewLines: this.#config.ui.tool_preview_lines,
+      evictedNodeIds: this.store.transcript.evictedTurnIds,
       config: this.#config,
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
@@ -5033,6 +6282,10 @@ export class AppController {
           },
           onToggleTool: (toolCallId, collapsed) => {
             this.store.transcript.toggleTool(toolCallId, collapsed);
+            this.scheduler.renderNow();
+          },
+          onToggleToolGroup: (groupId, expanded) => {
+            this.store.toggleToolGroup(groupId, expanded);
             this.scheduler.renderNow();
           },
           onToggleNotice: (noticeId, collapsed) => {
@@ -5129,14 +6382,34 @@ export class AppController {
             void this.cancelPendingAndTurn();
           },
           onRemoveAttachment: id => {
+            const removed = this.store
+              .getState()
+              .pendingAttachments.find(att => att.id === id);
             this.store.removeAttachment(id);
+            if (removed?.kind === 'file' && removed.path) {
+              this.#suppressedMentionPaths.add(this.#normalizeMentionPathKey(removed.path));
+              this.#removeMentionTokenFromDraft(removed.path);
+            }
+            this.#refreshCompletion();
             this.scheduler.renderNow();
           },
           onOpenPicker: kind => {
             void this.#openPicker(kind, '');
           },
+          onOpenPlannerPicker: () => {
+            void this.#openPicker('planner', '');
+          },
+          onOpenExecutorPicker: () => {
+            void this.#openPicker('executor', '');
+          },
           onCycleThinking: () => {
             void this.cycleThinkingLevel();
+          },
+          onCyclePlannerThinking: () => {
+            void this.#cycleOrchestratorRoleThinking('planner');
+          },
+          onCycleExecutorThinking: () => {
+            void this.#cycleOrchestratorRoleThinking('executor');
           },
           onOpenSwarmBoard: () => {
             void this.#openSwarmBoard('');
@@ -5176,9 +6449,13 @@ export class AppController {
           },
           onScopeChange: scope => {
             const prevPicker = this.store.getState().picker;
+            const isModelLike =
+              prevPicker?.kind === 'model' ||
+              prevPicker?.kind === 'planner' ||
+              prevPicker?.kind === 'executor';
             const nextScope =
-              prevPicker?.kind === 'model' &&
-              scope === prevPicker.scope &&
+              isModelLike &&
+              scope === prevPicker?.scope &&
               scope !== 'all'
                 ? 'all'
                 : scope;

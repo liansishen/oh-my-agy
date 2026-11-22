@@ -746,4 +746,106 @@ describe('Swarm command routing & registry integration', () => {
       }
     }
   });
+
+  test('parses plan.json into Swarm Overview (goal, done/working/blocked counts, up to 6 threads) and watches plan.json updates', async () => {
+    const baseBrainDir = await makeTempDir('oma-swarm-overview-');
+    const sessionId = 'sess-overview';
+    const swarmDir = getSwarmDir(sessionId, { baseBrainDir });
+    await fs.mkdir(swarmDir, { recursive: true });
+
+    await fs.writeFile(
+      path.join(swarmDir, 'swarm.json'),
+      JSON.stringify({ version: 1, backend: 'acp', swarm_id: 'sw-ov', created_at: '2026-11-23T00:00:00Z' }),
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Release Hardening',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'api-dev': { role: 'worker', phase: 'RUNNING', wake_mode: 'none', killed: false },
+          'ui-dev': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'qa-verify': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+          'docs-dev': { role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', killed: false },
+        },
+      }),
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      [
+        JSON.stringify({ seq: 1, agent: 'ui-dev', text: '[done] UI overview finished', time: '2026-11-23 00:01:00' }),
+        JSON.stringify({ seq: 2, agent: 'qa-verify', text: '[blocked] Waiting on test fixture', time: '2026-11-23 00:02:00' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(swarmDir, 'plan.json'),
+      JSON.stringify({
+        goal: {
+          title: 'Ship agy 1.5.14 parity',
+          line: 'Align Swarm Overview, Orchestrator planner capsule, and /thinking stream.',
+        },
+        tasks: {
+          'api-dev': 'Wire controller & ACP handlers',
+          'ui-dev': 'Build Swarm Overview pane',
+          'qa-verify': 'Run E2E verification',
+          'docs-dev': 'Update docs',
+        },
+        threads: [
+          { id: 't1', title: 'Backend', goal: 'Controller + Store', tasks: ['api-dev'] },
+          { id: 't2', title: 'Frontend', goal: 'Overview UI', tasks: ['ui-dev'] },
+          { id: 't3', title: 'QA', goal: 'Verify regressions', tasks: ['qa-verify'] },
+          { id: 't4', title: 'Docs', goal: 'Notes', tasks: ['docs-dev'] },
+          { id: 't5', title: 'Extra 5', goal: 'Five', tasks: [] },
+          { id: 't6', title: 'Extra 6', goal: 'Six', tasks: [] },
+          { id: 't7', title: 'Overflow 7', goal: 'Should cap at 6', tasks: [] },
+        ],
+      }),
+      'utf8',
+    );
+
+    const snap = await loadSwarmBoard(sessionId, { baseBrainDir });
+    expect(snap).not.toBeNull();
+    expect(snap!.overview).toBeDefined();
+    expect(snap!.overview!.goalTitle).toBe('Ship agy 1.5.14 parity');
+    expect(snap!.overview!.goalLine).toContain('Orchestrator planner capsule');
+    expect(snap!.overview!.totalTasks).toBe(4);
+    expect(snap!.overview!.doneCount).toBe(1);
+    expect(snap!.overview!.workingCount).toBe(1);
+    expect(snap!.overview!.blockedCount).toBe(1);
+    expect(snap!.overview!.threads).toHaveLength(6);
+    expect(snap!.overview!.threads[0]!.status).toBe('working');
+    expect(snap!.overview!.threads[1]!.status).toBe('done');
+    expect(snap!.overview!.threads[2]!.status).toBe('blocked');
+    expect(snap!.overview!.threads[3]!.status).toBe('waiting');
+
+    // watchSwarmBoard must detect plan.json edits
+    const events: SwarmBoardSnapshot[] = [];
+    const watcher = watchSwarmBoard(
+      sessionId,
+      (s) => {
+        if (s) events.push(s);
+      },
+      { baseBrainDir, intervalMs: 30, emitInitial: true },
+    );
+    try {
+      expect(await waitUntil(() => events.length >= 1, 1500)).toBe(true);
+      const countBefore = events.length;
+      await fs.writeFile(
+        path.join(swarmDir, 'plan.json'),
+        JSON.stringify({
+          goal: { title: 'Updated Goal Title', line: 'Updated line' },
+          tasks: { 'ui-dev': 'Done' },
+          threads: [{ id: 't2', title: 'Frontend', goal: 'Done', tasks: ['ui-dev'] }],
+        }),
+        'utf8',
+      );
+      expect(await waitUntil(() => events.length > countBefore, 1500)).toBe(true);
+      expect(events[events.length - 1]!.overview?.goalTitle).toBe('Updated Goal Title');
+    } finally {
+      watcher.stop();
+    }
+  });
 });

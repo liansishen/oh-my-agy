@@ -3,8 +3,11 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 
+export type ToolDisplayMode = 'all' | 'compact' | 'hidden';
+
 export interface OmaUiConfig {
   readonly auto_collapse_thought: boolean;
+  readonly tool_display: ToolDisplayMode;
   readonly tool_preview_lines: number;
   readonly osc_7501: boolean;
   readonly reopen_anchor: boolean;
@@ -34,6 +37,7 @@ export const DEFAULT_CONFIG: OmaConfig = Object.freeze({
   recent_models: Object.freeze([]) as unknown as string[],
   ui: Object.freeze({
     auto_collapse_thought: true,
+    tool_display: 'all' as ToolDisplayMode,
     tool_preview_lines: 8,
     osc_7501: true,
     reopen_anchor: true,
@@ -57,6 +61,8 @@ export interface LoadConfigOptions extends ConfigPathOptions {
 export interface ParseConfigResult {
   readonly config: OmaConfig;
   readonly warnings: readonly string[];
+  /** Non-empty when config.toml failed to parse or read (used to prevent overwriting broken user config). */
+  readonly parseError?: string;
 }
 
 export interface LoadConfigResult extends ParseConfigResult {
@@ -76,10 +82,21 @@ const KNOWN_TOP_KEYS = new Set([
 
 const KNOWN_UI_KEYS = new Set([
   'auto_collapse_thought',
+  'tool_display',
   'tool_preview_lines',
   'osc_7501',
   'reopen_anchor',
 ]);
+
+const KNOWN_TOOL_DISPLAY_MODES = new Set<ToolDisplayMode>(['all', 'compact', 'hidden']);
+
+export function normalizeToolDisplayMode(value: unknown): ToolDisplayMode {
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase() as ToolDisplayMode;
+    if (KNOWN_TOOL_DISPLAY_MODES.has(lower)) return lower;
+  }
+  return DEFAULT_CONFIG.ui.tool_display;
+}
 
 const KNOWN_APPROVAL_KEYS = new Set(['auto_allow_tools']);
 
@@ -266,13 +283,15 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
     parsed = Bun.TOML.parse(tomlText);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    warnings.push(`Failed to parse config.toml: ${message}`);
-    return { config: DEFAULT_CONFIG, warnings };
+    const parseError = `Failed to parse config.toml: ${message}`;
+    warnings.push(parseError);
+    return { config: DEFAULT_CONFIG, warnings, parseError };
   }
 
   if (!isRecord(parsed)) {
-    warnings.push('config.toml root must be a table, using defaults');
-    return { config: DEFAULT_CONFIG, warnings };
+    const parseError = 'config.toml root must be a table, using defaults';
+    warnings.push(parseError);
+    return { config: DEFAULT_CONFIG, warnings, parseError };
   }
 
   for (const key of Object.keys(parsed)) {
@@ -342,6 +361,22 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
     }
   }
 
+  const rawToolDisplay = readStringField(
+    uiTable,
+    'tool_display',
+    DEFAULT_CONFIG.ui.tool_display,
+    warnings,
+    'ui.',
+  );
+  const tool_display = KNOWN_TOOL_DISPLAY_MODES.has(rawToolDisplay as ToolDisplayMode)
+    ? (rawToolDisplay as ToolDisplayMode)
+    : (() => {
+        warnings.push(
+          `ui.tool_display: unrecognized value "${rawToolDisplay}" (expected all|compact|hidden), using "${DEFAULT_CONFIG.ui.tool_display}"`,
+        );
+        return DEFAULT_CONFIG.ui.tool_display;
+      })();
+
   const config: OmaConfig = {
     agy_bin,
     default_model,
@@ -356,6 +391,7 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
         warnings,
         'ui.',
       ),
+      tool_display,
       tool_preview_lines: readPreviewLinesField(
         uiTable,
         'tool_preview_lines',
@@ -404,6 +440,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
       exists: true,
       config: parsed.config,
       warnings: parsed.warnings,
+      ...(parsed.parseError ? { parseError: parsed.parseError } : {}),
     };
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
@@ -416,11 +453,13 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
       };
     }
     const message = err instanceof Error ? err.message : String(err);
+    const parseError = `Failed to read ${filePath}: ${message}`;
     return {
       path: filePath,
       exists: existsSync(filePath),
       config: DEFAULT_CONFIG,
-      warnings: [`Failed to read ${filePath}: ${message}`],
+      warnings: [parseError],
+      parseError,
     };
   }
 }
@@ -446,14 +485,17 @@ export function loadConfigSync(options: LoadConfigOptions = {}): LoadConfigResul
       exists: true,
       config: parsed.config,
       warnings: parsed.warnings,
+      ...(parsed.parseError ? { parseError: parsed.parseError } : {}),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const parseError = `Failed to read ${filePath}: ${message}`;
     return {
       path: filePath,
       exists: true,
       config: DEFAULT_CONFIG,
-      warnings: [`Failed to read ${filePath}: ${message}`],
+      warnings: [parseError],
+      parseError,
     };
   }
 }
@@ -493,6 +535,7 @@ function normalizeConfigForSave(config: OmaConfig): OmaConfig {
     recent_models: normalizeRecentModels(config.recent_models, MAX_RECENT_MODELS),
     ui: {
       auto_collapse_thought: Boolean(config.ui.auto_collapse_thought),
+      tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: clampedLines,
       osc_7501: Boolean(config.ui.osc_7501),
       reopen_anchor: Boolean(config.ui.reopen_anchor),
@@ -520,6 +563,7 @@ export function formatConfigToml(config: OmaConfig): string {
     '',
     '[ui]',
     `auto_collapse_thought = ${String(norm.ui.auto_collapse_thought)}`,
+    `tool_display = ${formatTomlString(norm.ui.tool_display)}`,
     `tool_preview_lines = ${norm.ui.tool_preview_lines}`,
     `osc_7501 = ${String(norm.ui.osc_7501)}`,
     `reopen_anchor = ${String(norm.ui.reopen_anchor)}`,

@@ -1,6 +1,47 @@
-import type { GoneEvent, Renderable, Surface } from '@stencil-hq/tern';
+import { Node, type GoneEvent, type Renderable, type Surface, type ViewInput } from '@stencil-hq/tern';
 
-export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'>;
+function extractMainChildIds(view: Renderable): string[] {
+  if (!view || typeof view !== 'object') return [];
+  const mainRoot =
+    view instanceof Node
+      ? view
+      : 'main' in (view as ViewInput)
+        ? (view as ViewInput).main
+        : undefined;
+  if (!(mainRoot instanceof Node)) return [];
+  const ids: string[] = [];
+  mainRoot.children.forEach((child, i) => {
+    const key = child.props['key'];
+    const name =
+      typeof key === 'string' ? key : typeof key === 'number' ? String(key) : String(i);
+    ids.push(`main.${name}`);
+  });
+  return ids;
+}
+
+function indexMainChildIdsByTurn(ids: readonly string[]): Map<number, string[]> {
+  const byTurn = new Map<number, string[]>();
+  for (const id of ids) {
+    const match = /^main\.t(\d+)-/.exec(id);
+    if (!match) continue;
+    const turnIdx = Number(match[1]);
+    let bucket = byTurn.get(turnIdx);
+    if (!bucket) {
+      bucket = [];
+      byTurn.set(turnIdx, bucket);
+    }
+    bucket.push(id);
+  }
+  return byTurn;
+}
+
+export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'> & {
+  readonly blocked?: boolean;
+  renderDeferred?: (build: () => Renderable | undefined) => void;
+  cancelDeferred?: () => void;
+  evictNodes?: (ids: readonly string[]) => void;
+  resetEvicted?: () => void;
+};
 
 export interface RenderSchedulerOptions {
   /** Frame coalescing interval in ms for streaming updates (default: 33ms / ~30fps). */
@@ -27,8 +68,13 @@ export class RenderScheduler {
   #dirty = false;
   #suspended = false;
   #disposed = false;
+  #renderEpoch = 0;
+  #hasPendingDeferredRender = false;
   #settledIds = new Set<string>();
   #evictedIds = new Set<string>();
+  #pendingSettleTurns = new Set<number>();
+  #lastMainChildIds: string[] = [];
+  #lastMainChildIdsByTurn = new Map<number, string[]>();
 
   constructor(
     surface: SchedulerSurface,
@@ -73,12 +119,37 @@ export class RenderScheduler {
     }
     this.#clearTimer();
     this.#dirty = false;
-    this.#surface.render(this.#buildView());
+    const epoch = this.#renderEpoch;
+    const buildAndIndex = (fromDeferred: boolean): Renderable | undefined => {
+      if (this.#disposed || this.#surface.closed) return undefined;
+      if (fromDeferred && (this.#suspended || epoch !== this.#renderEpoch)) {
+        return undefined;
+      }
+      this.#hasPendingDeferredRender = false;
+      const view = this.#buildView();
+      this.#lastMainChildIds = extractMainChildIds(view);
+      this.#lastMainChildIdsByTurn = indexMainChildIdsByTurn(this.#lastMainChildIds);
+      this.#flushPendingSettleTurns();
+      return view;
+    };
+    if (!force && this.#surface.blocked && this.#surface.renderDeferred) {
+      this.#hasPendingDeferredRender = true;
+      this.#surface.renderDeferred(() => buildAndIndex(true));
+      return;
+    }
+    const built = buildAndIndex(false);
+    if (built !== undefined) {
+      this.#surface.render(built);
+    }
   }
 
   /** Suspends intermediate renders while replaying history during `session/load`. */
   suspendForReplay(): void {
     this.#suspended = true;
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
+    this.#surface.cancelDeferred?.();
     this.#clearTimer();
   }
 
@@ -92,12 +163,42 @@ export class RenderScheduler {
   }
 
   /**
-   * Marks a completed turn (`main.turn-<index>`) as settled so Tern can reduce diff overhead
-   * and consider it for scrollback memory eviction.
+   * Marks all top-level nodes belonging to a completed turn (`main.t<index>-*`) as settled
+   * so Tern can reduce diff overhead and consider them for scrollback memory eviction.
    */
   settleTurn(turnIndex: number): boolean {
-    const id = `main.turn-${turnIndex}`;
-    return this.settleNode(id);
+    if (this.#disposed || this.#surface.closed) return false;
+    // When a deferred render is waiting for flow-control credit, defer turn settlement until
+    // the actual frame builds and indexes the turn's `main.t<index>-*` nodes so we never emit
+    // a stale fallback `settle main.turn-<index>` for a turn whose real nodes haven't flushed yet.
+    if (this.#hasPendingDeferredRender) {
+      this.#pendingSettleTurns.add(turnIndex);
+      return true;
+    }
+    return this.#settleIndexedTurn(turnIndex);
+  }
+
+  #settleIndexedTurn(turnIndex: number): boolean {
+    const matching = this.#lastMainChildIdsByTurn.get(turnIndex);
+    if (matching && matching.length > 0) {
+      let settledAny = false;
+      for (const id of matching) {
+        if (this.settleNode(id)) {
+          settledAny = true;
+        }
+      }
+      return settledAny;
+    }
+    return this.settleNode(`main.turn-${turnIndex}`);
+  }
+
+  #flushPendingSettleTurns(): void {
+    if (this.#pendingSettleTurns.size === 0) return;
+    const turns = [...this.#pendingSettleTurns];
+    this.#pendingSettleTurns.clear();
+    for (const turnIndex of turns) {
+      this.#settleIndexedTurn(turnIndex);
+    }
   }
 
   settleNode(nodeId: string): boolean {
@@ -120,6 +221,7 @@ export class RenderScheduler {
       }
     }
     if (newlyEvicted.length > 0) {
+      this.#surface.evictNodes?.(newlyEvicted);
       this.#onEvicted?.(newlyEvicted);
     }
     return newlyEvicted;
@@ -143,12 +245,23 @@ export class RenderScheduler {
 
   /** Resets settled/evicted tracking when switching or starting a fresh session. */
   resetSession(): void {
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
     this.#settledIds.clear();
     this.#evictedIds.clear();
+    this.#surface.cancelDeferred?.();
+    this.#surface.resetEvicted?.();
+    this.#lastMainChildIds = [];
+    this.#lastMainChildIdsByTurn.clear();
   }
 
   dispose(): void {
     this.#disposed = true;
+    this.#renderEpoch += 1;
+    this.#hasPendingDeferredRender = false;
+    this.#pendingSettleTurns.clear();
+    this.#surface.cancelDeferred?.();
     this.#clearTimer();
   }
 

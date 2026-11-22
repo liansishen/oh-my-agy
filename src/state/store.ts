@@ -13,13 +13,19 @@
  */
 
 import {
+  clampThoughtLevelForChoices,
   extractSessionControlState,
+  filterOrchestratorRoleModels,
+  isOrchestratorModelId,
+  ORCHESTRATOR_PICKER_ID,
+  resolveThoughtLevelsForModel,
   type SessionControlState,
 } from '../acp/model';
 import { normalizeDisplayPath } from '../acp/path';
 import type {
   AuthMethod,
   ConfigOption,
+  ConfigOptionChoice,
   ElicitationCreateParams,
   ElicitationCreateResult,
   ImplementationInfo,
@@ -32,6 +38,11 @@ import type {
 } from '../acp/protocol';
 import type { SettingsPageId } from '../commands/handlers';
 import { CommandRegistry, fuzzyMatchText, type SlashCommandDef } from '../commands/registry';
+import {
+  parseOrchestratorModelSpec,
+  type AgyOrchestratorSettings,
+} from '../config/agy_settings';
+import type { ToolDisplayMode } from '../config/config';
 import { DraftEngine, type DraftEngineOptions } from '../editor/draft';
 import { InputHistory, type InputHistoryOptions } from '../editor/history';
 import {
@@ -183,6 +194,8 @@ export interface AgySafeSettingsSnapshot {
   readonly allowNonWorkspaceAccess?: boolean;
   readonly artifactReviewPolicy?: string;
   readonly useG1Credits?: boolean;
+  readonly showThinking?: boolean;
+  readonly orchestrator?: AgyOrchestratorSettings;
 }
 
 export interface SettingsEditingState {
@@ -259,6 +272,8 @@ export interface AgentItem {
 export type ModalPickerKind =
   | 'resume'
   | 'model'
+  | 'planner'
+  | 'executor'
   | 'thought'
   | 'mode'
   | 'log'
@@ -452,6 +467,7 @@ export interface AppState {
   readonly recentModels: readonly string[];
   readonly hour12: boolean;
   readonly supportsAside: boolean;
+  readonly supportsPrefs: boolean;
   readonly welcomeLogoBlobId?: string;
   /** Pixel bee SVG blob IDs for HUD pill, swarm animation, and member cards. */
   readonly beeHudBlobId?: string;
@@ -459,12 +475,21 @@ export interface AppState {
   readonly beeSleepBlobId?: string;
   readonly beeMemberBlobs?: Readonly<Record<string, BeeMemberBlobPair>>;
   readonly showThinking: boolean;
+  readonly autoCollapseThought: boolean;
   readonly expandAllTools: boolean;
+  readonly toolDisplayMode: ToolDisplayMode;
+  readonly expandedToolGroups: Readonly<Record<string, boolean>>;
   readonly promptCapabilities: Readonly<PromptCapabilities>;
   readonly configOptions: readonly ConfigOption[];
   readonly models?: SessionModelState;
   readonly modes?: SessionModeState;
   readonly controls: SessionControlState;
+  /** Authoritative per-model thought_level options observed from ACP `configOptions` in this session. */
+  readonly modelThoughtLevels: Readonly<Record<string, readonly ConfigOptionChoice[]>>;
+  /** Persisted `agy` Orchestrator Planner / Executor configuration from `settings.json`. */
+  readonly orchestratorSettings: AgyOrchestratorSettings;
+  /** Current terminal viewport height in rows (used e.g. for Swarm Overview >= 28-row threshold). */
+  readonly terminalRows: number;
   readonly usage: ContextUsageState | null;
   readonly sessionMetrics: SessionMetricsSnapshot | null;
   readonly gitStatus: GitStatusSnapshot | null;
@@ -491,9 +516,13 @@ export interface AppStoreOptions {
   readonly recentModels?: readonly string[];
   readonly hour12?: boolean;
   readonly supportsAside?: boolean;
+  readonly supportsPrefs?: boolean;
   readonly welcomeLogoBlobId?: string;
   readonly showThinking?: boolean;
   readonly expandAllTools?: boolean;
+  readonly toolDisplayMode?: ToolDisplayMode;
+  readonly orchestratorSettings?: AgyOrchestratorSettings;
+  readonly terminalRows?: number;
   readonly draft?: DraftEngineOptions;
   readonly history?: InputHistoryOptions;
   readonly traffic?: TrafficBufferOptions;
@@ -594,6 +623,7 @@ export class AppStore {
   private _recentModels: string[];
   private _hour12: boolean;
   private _supportsAside: boolean;
+  private _supportsPrefs: boolean;
   private _welcomeLogoBlobId: string | undefined;
   private _beeHudBlobId: string | undefined;
   private _beeActiveBlobId: string | undefined;
@@ -601,12 +631,18 @@ export class AppStore {
   private _beeMemberBlobs: Readonly<Record<string, BeeMemberBlobPair>> | undefined;
   private _showThinking: boolean;
   private _expandAllTools: boolean;
+  private _toolDisplayMode: ToolDisplayMode;
+  private _lastVisibleToolDisplayMode: Exclude<ToolDisplayMode, 'hidden'>;
+  private _expandedToolGroups: Record<string, boolean> = {};
   private _promptCapabilities: PromptCapabilities = {};
 
   private _configOptions: ConfigOption[] = [];
   private _models: SessionModelState | undefined;
   private _modes: SessionModeState | undefined;
   private _controls: SessionControlState;
+  private _modelThoughtLevels: Record<string, readonly ConfigOptionChoice[]> = {};
+  private _orchestratorSettings: AgyOrchestratorSettings;
+  private _terminalRows: number;
   private _usage: ContextUsageState | null = null;
   private _sessionMetrics: SessionMetricsSnapshot | null = null;
   private _gitStatus: GitStatusSnapshot | null = null;
@@ -635,9 +671,22 @@ export class AppStore {
     this._recentModels = normalizeRecentModels(options.recentModels);
     this._hour12 = options.hour12 ?? false;
     this._supportsAside = options.supportsAside ?? false;
+    this._supportsPrefs = options.supportsPrefs ?? true;
     this._welcomeLogoBlobId = options.welcomeLogoBlobId;
     this._showThinking = options.showThinking ?? true;
     this._expandAllTools = options.expandAllTools ?? false;
+    this._toolDisplayMode = options.toolDisplayMode ?? 'all';
+    this._lastVisibleToolDisplayMode =
+      this._toolDisplayMode === 'hidden' ? 'compact' : this._toolDisplayMode;
+    this._orchestratorSettings = options.orchestratorSettings ?? {};
+    this._terminalRows =
+      typeof options.terminalRows === 'number' &&
+      Number.isFinite(options.terminalRows) &&
+      options.terminalRows > 0
+        ? Math.round(options.terminalRows)
+        : typeof process.stdout?.rows === 'number' && process.stdout.rows > 0
+          ? process.stdout.rows
+          : 40;
 
     this.draft = new DraftEngine({
       now: this._now,
@@ -672,7 +721,39 @@ export class AppStore {
   }
 
   setAutoCollapseThought(enabled: boolean): void {
+    if (this._autoCollapseThought === enabled) return;
     this._autoCollapseThought = enabled;
+    this.emit();
+  }
+
+  setOrchestratorSettings(orchestrator: AgyOrchestratorSettings): void {
+    const nextPlanner = orchestrator.planner?.trim() || undefined;
+    const nextExecutor = orchestrator.executor?.trim() || undefined;
+    if (
+      this._orchestratorSettings.planner === nextPlanner &&
+      this._orchestratorSettings.executor === nextExecutor
+    ) {
+      return;
+    }
+    this._orchestratorSettings = {
+      ...(nextPlanner ? { planner: nextPlanner } : {}),
+      ...(nextExecutor ? { executor: nextExecutor } : {}),
+    };
+    if (this._settings) {
+      this._settings.agySettings = {
+        ...this._settings.agySettings,
+        orchestrator: this._orchestratorSettings,
+      };
+    }
+    this.emit();
+  }
+
+  setTerminalRows(rows: number): void {
+    if (!Number.isFinite(rows) || rows <= 0) return;
+    const normalized = Math.round(rows);
+    if (this._terminalRows === normalized) return;
+    this._terminalRows = normalized;
+    this.emit();
   }
 
   setHour12(hour12: boolean): void {
@@ -685,6 +766,15 @@ export class AppStore {
     if (this._supportsAside === supportsAside) return;
     this._supportsAside = supportsAside;
     if (!supportsAside && this._settings !== null) {
+      this._settingsFocused = true;
+    }
+    this.emit();
+  }
+
+  setSupportsPrefs(supportsPrefs: boolean): void {
+    if (this._supportsPrefs === supportsPrefs) return;
+    this._supportsPrefs = supportsPrefs;
+    if (!supportsPrefs && this._settings !== null) {
       this._settingsFocused = true;
     }
     this.emit();
@@ -740,7 +830,6 @@ export class AppStore {
     if (this._expandAllTools === expand) return;
     this._expandAllTools = expand;
     this.transcript.setAllToolsCollapsed(!expand);
-    this.transcript.setAllThoughtsOpen(expand && this._showThinking);
     this.emit();
   }
 
@@ -748,9 +837,60 @@ export class AppStore {
     const next = !this._expandAllTools;
     this._expandAllTools = next;
     this.transcript.setAllToolsCollapsed(!next);
-    this.transcript.setAllThoughtsOpen(next && this._showThinking);
     this.emit();
     return next;
+  }
+
+  setToolDisplayMode(mode: ToolDisplayMode): void {
+    if (this._toolDisplayMode === mode) return;
+    if (mode !== 'hidden') {
+      this._lastVisibleToolDisplayMode = mode;
+    }
+    this._toolDisplayMode = mode;
+    this.emit();
+  }
+
+  cycleToolDisplayMode(): ToolDisplayMode {
+    const order: readonly ToolDisplayMode[] = ['all', 'compact', 'hidden'];
+    const idx = order.indexOf(this._toolDisplayMode);
+    const next = order[(idx + 1) % order.length] ?? 'all';
+    if (next !== 'hidden') {
+      this._lastVisibleToolDisplayMode = next;
+    }
+    this._toolDisplayMode = next;
+    this.emit();
+    return next;
+  }
+
+  /**
+   * Toggle tool activity visibility (`Ctrl+Shift+O`, aligned with `omp` `app.tools.toggleVisibility`):
+   * flips between `'hidden'` and the last non-hidden display mode (`'all'` or `'compact'`).
+   */
+  toggleToolVisibility(): ToolDisplayMode {
+    const next: ToolDisplayMode =
+      this._toolDisplayMode === 'hidden' ? this._lastVisibleToolDisplayMode : 'hidden';
+    this._toolDisplayMode = next;
+    this.emit();
+    return next;
+  }
+
+  toggleToolGroup(groupId: string, expanded?: boolean): boolean {
+    const hasExplicit = Object.prototype.hasOwnProperty.call(this._expandedToolGroups, groupId);
+    const cur = hasExplicit ? Boolean(this._expandedToolGroups[groupId]) : this._expandAllTools;
+    const next = expanded !== undefined ? expanded : !cur;
+    if (hasExplicit && cur === next) return next;
+    this._expandedToolGroups = {
+      ...this._expandedToolGroups,
+      [groupId]: next,
+    };
+    this.emit();
+    return next;
+  }
+
+  clearExpandedToolGroups(): void {
+    if (Object.keys(this._expandedToolGroups).length === 0) return;
+    this._expandedToolGroups = {};
+    this.emit();
   }
 
   setTier(tier: TierInfo | undefined): void {
@@ -963,18 +1103,25 @@ export class AppStore {
       recentModels: this._recentModels,
       hour12: this._hour12,
       supportsAside: this._supportsAside,
+      supportsPrefs: this._supportsPrefs,
       ...(this._welcomeLogoBlobId ? { welcomeLogoBlobId: this._welcomeLogoBlobId } : {}),
       ...(this._beeHudBlobId ? { beeHudBlobId: this._beeHudBlobId } : {}),
       ...(this._beeActiveBlobId ? { beeActiveBlobId: this._beeActiveBlobId } : {}),
       ...(this._beeSleepBlobId ? { beeSleepBlobId: this._beeSleepBlobId } : {}),
       ...(this._beeMemberBlobs ? { beeMemberBlobs: this._beeMemberBlobs } : {}),
       showThinking: this._showThinking,
+      autoCollapseThought: this._autoCollapseThought,
       expandAllTools: this._expandAllTools,
+      toolDisplayMode: this._toolDisplayMode,
+      expandedToolGroups: this._expandedToolGroups,
       promptCapabilities: this._promptCapabilities,
       configOptions: this._configOptions,
       ...(this._models ? { models: this._models } : {}),
       ...(this._modes ? { modes: this._modes } : {}),
       controls: this._controls,
+      modelThoughtLevels: this._modelThoughtLevels,
+      orchestratorSettings: this._orchestratorSettings,
+      terminalRows: this._terminalRows,
       usage: this._usage,
       sessionMetrics: this._sessionMetrics,
       gitStatus: this._gitStatus,
@@ -1196,6 +1343,7 @@ export class AppStore {
    * Reset session-scoped state for `/new` or switching to another session.
    */
   resetSessionState(options: { keepCommands?: boolean } = {}): void {
+    this._sessionId = null;
     this.approvals.cancelAll();
     this.cancelActiveQuestion();
     this.transcript.clear();
@@ -1225,6 +1373,14 @@ export class AppStore {
       models: this._models,
       modes: this._modes,
     });
+    if (this._controls.useConfigOptions && this._controls.currentModelId) {
+      this._modelThoughtLevels = {
+        ...this._modelThoughtLevels,
+        [this._controls.currentModelId]: this._controls.supportsThoughtLevel
+          ? [...this._controls.availableThoughtLevels]
+          : [],
+      };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1387,12 +1543,14 @@ export class AppStore {
     } = {},
   ): PickerModalState {
     const query = options.initialQuery ?? '';
+    const isModelLikePicker =
+      kind === 'model' || kind === 'planner' || kind === 'executor';
     const defaultScope =
       kind === 'resume'
         ? 'this-folder'
         : kind === 'log' ||
             kind === 'swarm' ||
-            kind === 'model' ||
+            isModelLikePicker ||
             kind === 'mcp' ||
             kind === 'plugins' ||
             kind === 'skills' ||
@@ -1400,10 +1558,21 @@ export class AppStore {
           ? 'all'
           : 'default';
 
-    const defaultModelThinking =
-      options.modelPickerThinking ??
-      this._controls.currentThoughtLevel ??
-      this._controls.availableThoughtLevels[0]?.value;
+    const targetModelId =
+      options.selectedId ?? (kind === 'model' ? this._controls.currentModelId : null);
+    const targetThoughtChoices = isModelLikePicker
+      ? resolveThoughtLevelsForModel(targetModelId, this._controls, this._modelThoughtLevels)
+      : [];
+    const currentEffectiveThought =
+      kind === 'model' && !isOrchestratorModelId(targetModelId)
+        ? this._controls.currentThoughtLevel
+        : undefined;
+    const defaultModelThinking = isModelLikePicker
+      ? clampThoughtLevelForChoices(
+          options.modelPickerThinking ?? currentEffectiveThought,
+          targetThoughtChoices
+        )
+      : undefined;
 
     this._swarmBoardOpen = false;
     this._gitOverlay = null;
@@ -1433,7 +1602,7 @@ export class AppStore {
             swarmFollow: options.swarmFollow ?? true,
           }
         : {}),
-      ...(kind === 'model'
+      ...(isModelLikePicker
         ? {
             ...(defaultModelThinking ? { modelPickerThinking: defaultModelThinking } : {}),
             modelPickerThinkingDirty: false,
@@ -1469,23 +1638,61 @@ export class AppStore {
   }
 
   setModelPickerThinking(level: string | undefined): void {
-    if (!this._picker || this._picker.kind !== 'model') return;
-    this._picker.modelPickerThinking = level;
+    if (
+      !this._picker ||
+      (this._picker.kind !== 'model' &&
+        this._picker.kind !== 'planner' &&
+        this._picker.kind !== 'executor')
+    ) {
+      return;
+    }
+    if (level !== undefined) {
+      const targetModelId =
+        this._picker.selectedId ??
+        (this._picker.kind === 'model' ? this._controls.currentModelId : null);
+      const choices = resolveThoughtLevelsForModel(
+        targetModelId,
+        this._controls,
+        this._modelThoughtLevels
+      );
+      if (choices.length === 0) return;
+      this._picker.modelPickerThinking = clampThoughtLevelForChoices(level, choices);
+    } else {
+      this._picker.modelPickerThinking = undefined;
+    }
     this._picker.modelPickerThinkingDirty = true;
     this.emit();
   }
 
   /**
-   * Step the inline thinking effort slider inside the compact model picker by `delta` (`-1` or `+1`).
+   * Step the inline thinking effort slider inside the compact model / planner / executor picker
+   * by `delta` (`-1` or `+1`), strictly bounded to the currently highlighted model's real levels.
    */
   stepModelPickerThinking(delta: number): string | null {
-    if (!this._picker || this._picker.kind !== 'model') return null;
-    const choices = this._controls.availableThoughtLevels;
+    if (
+      !this._picker ||
+      (this._picker.kind !== 'model' &&
+        this._picker.kind !== 'planner' &&
+        this._picker.kind !== 'executor')
+    ) {
+      return null;
+    }
+    const targetModelId =
+      this._picker.selectedId ??
+      (this._picker.kind === 'model' ? this._controls.currentModelId : null);
+    const choices = resolveThoughtLevelsForModel(
+      targetModelId,
+      this._controls,
+      this._modelThoughtLevels
+    );
     if (choices.length === 0) return null;
-    const current =
-      this._picker.modelPickerThinking ??
-      this._controls.currentThoughtLevel ??
-      choices[0]!.value;
+    const defaultActive =
+      this._picker.kind === 'model' && !isOrchestratorModelId(targetModelId)
+        ? this._controls.currentThoughtLevel
+        : undefined;
+    const rawCurrent =
+      this._picker.modelPickerThinking ?? defaultActive ?? choices[0]!.value;
+    const current = clampThoughtLevelForChoices(rawCurrent, choices) ?? choices[0]!.value;
     const idx = Math.max(
       0,
       choices.findIndex((c) => c.value === current),
@@ -1516,10 +1723,20 @@ export class AppStore {
       this.emit();
       return next;
     }
-    if (this._picker.kind === 'model') {
+    if (
+      this._picker.kind === 'model' ||
+      this._picker.kind === 'planner' ||
+      this._picker.kind === 'executor'
+    ) {
       const seen = new Set<string>();
       const order: string[] = ['all'];
-      for (const m of this._controls.availableModels) {
+      const models =
+        this._picker.kind === 'model'
+          ? this._controls.availableModels.map((m) =>
+              isOrchestratorModelId(m.value) ? { ...m, value: ORCHESTRATOR_PICKER_ID } : m
+            )
+          : filterOrchestratorRoleModels(this._picker.kind, this._controls.availableModels);
+      for (const m of models) {
         const providerScope = `provider:${inferModelProvider(m.value)}`;
         if (!seen.has(providerScope)) {
           seen.add(providerScope);
@@ -1847,6 +2064,32 @@ export class AppStore {
   setPickerSelected(selectedId: string | null): void {
     if (!this._picker) return;
     this._picker.selectedId = selectedId;
+    if (
+      this._picker.kind === 'model' ||
+      this._picker.kind === 'planner' ||
+      this._picker.kind === 'executor'
+    ) {
+      const choices = resolveThoughtLevelsForModel(
+        selectedId,
+        this._controls,
+        this._modelThoughtLevels
+      );
+      if (choices.length === 0) {
+        this._picker.modelPickerThinking = undefined;
+      } else {
+        const currentThoughtForSelected =
+          this._picker.kind === 'model' &&
+          !isOrchestratorModelId(selectedId) &&
+          selectedId === this._controls.currentModelId
+            ? this._controls.currentThoughtLevel
+            : undefined;
+        const preferred =
+          !this._picker.modelPickerThinkingDirty && currentThoughtForSelected !== undefined
+            ? currentThoughtForSelected
+            : (this._picker.modelPickerThinking ?? currentThoughtForSelected);
+        this._picker.modelPickerThinking = clampThoughtLevelForChoices(preferred, choices);
+      }
+    }
     this.emit();
   }
 
@@ -1857,10 +2100,13 @@ export class AppStore {
     this.emit();
   }
 
-  setResumeSessions(sessions: ResumeSessionEntry[]): void {
+  setResumeSessions(
+    sessions: ResumeSessionEntry[],
+    options: { readonly loading?: boolean } = {},
+  ): void {
     if (!this._picker || this._picker.kind !== 'resume') return;
     this._picker.sessions = sessions;
-    this._picker.loading = false;
+    this._picker.loading = options.loading ?? false;
     this._picker.error = undefined;
     if (
       !this._picker.selectedId ||
@@ -2230,12 +2476,19 @@ export class AppStore {
       case 'model':
         return this._controls.currentModelName ?? this._controls.currentModelId ?? undefined;
       case 'thought':
+        if (isOrchestratorModelId(this._controls.currentModelId)) {
+          const lvl =
+            parseOrchestratorModelSpec(this._orchestratorSettings.planner)?.thoughtLevel ?? 'high';
+          return lvl === 'xhigh' ? 'Extra' : lvl.charAt(0).toUpperCase() + lvl.slice(1);
+        }
         if (!this._controls.supportsThoughtLevel) return 'n/a';
         return (
           this._controls.currentThoughtLevelName ??
           this._controls.currentThoughtLevel ??
           undefined
         );
+      case 'thinking':
+        return this._showThinking && !this._autoCollapseThought ? 'on' : 'off';
       case 'mode':
         return this._controls.currentModeName ?? this._controls.currentModeId ?? undefined;
       case 'context':

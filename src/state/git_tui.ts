@@ -12,6 +12,7 @@ export type GitChangeKind =
   | 'added'
   | 'deleted'
   | 'renamed'
+  | 'copied'
   | 'untracked'
   | 'conflicted';
 
@@ -44,6 +45,8 @@ export interface GitHeadCommit {
 
 export interface GitRepoSnapshot {
   readonly cwd: string;
+  /** Resolved absolute Git path env (e.g. `GIT_DIR`, `GIT_WORK_TREE`) captured before changing cwd. */
+  readonly gitEnv?: Readonly<Record<string, string>>;
   readonly branch: string | null;
   readonly detached: boolean;
   readonly clean: boolean;
@@ -105,17 +108,34 @@ export function gitFileKey(area: GitChangeArea, filePath: string): string {
 
 async function runDefaultGit(
   args: readonly string[],
-  options: { readonly cwd: string; readonly timeoutMs: number },
+  options: {
+    readonly cwd: string;
+    readonly timeoutMs: number;
+    readonly env?: Readonly<Record<string, string | undefined>>;
+  },
 ): Promise<GitExecResult> {
   let proc: ReturnType<typeof Bun.spawn> | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    // Strip inherited Git pathspec env overrides (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+    // `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`) so explicit `--literal-pathspecs` CLI flags
+    // always behave deterministically regardless of caller shell environment.
+    const cleanEnv: Record<string, string | undefined> = {
+      ...process.env,
+      ...(options.env ?? {}),
+      GIT_OPTIONAL_LOCKS: '0',
+    };
+    delete cleanEnv['GIT_LITERAL_PATHSPECS'];
+    delete cleanEnv['GIT_GLOB_PATHSPECS'];
+    delete cleanEnv['GIT_NOGLOB_PATHSPECS'];
+    delete cleanEnv['GIT_ICASE_PATHSPECS'];
+
     proc = Bun.spawn(['git', ...args], {
       cwd: options.cwd,
       stdout: 'pipe',
       stderr: 'pipe',
       stdin: 'ignore',
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+      env: cleanEnv,
       windowsHide: true,
     });
     const stdoutPromise = proc.stdout
@@ -162,8 +182,9 @@ function kindFromCode(code: string): GitChangeKind {
     case 'D':
       return 'deleted';
     case 'R':
-    case 'C':
       return 'renamed';
+    case 'C':
+      return 'copied';
     case 'U':
       return 'conflicted';
     case '?':
@@ -171,6 +192,30 @@ function kindFromCode(code: string): GitChangeKind {
     default:
       return 'modified';
   }
+}
+
+/**
+ * Compute exact repository-relative paths to pass for staging or unstaging one entry:
+ * - Unstaging a staged **rename** (`R`) must reset both destination and `origPath` so
+ *   `D <origPath>` does not remain stranded in the index.
+ * - Staging an unstaged modification on a renamed file (`RM`), or unstaging a **copy** (`C`),
+ *   must touch ONLY `file.path` so unrelated/recreated source files or source modifications
+ *   are never altered.
+ */
+export function resolveGitStageActionPaths(
+  file: GitChangedFile,
+  op: 'stage' | 'unstage',
+): string[] {
+  if (
+    op === 'unstage' &&
+    file.area === 'staged' &&
+    file.kind === 'renamed' &&
+    file.origPath &&
+    file.origPath !== file.path
+  ) {
+    return [file.path, file.origPath];
+  }
+  return [file.path];
 }
 
 /**
@@ -221,17 +266,19 @@ export function parsePorcelainV1Z(stdout: string): {
     }
 
     if (x !== ' ' && x !== '?') {
+      const xHasOrig = (x === 'R' || x === 'C') && Boolean(origPath);
       staged.push({
         path: filePath,
-        ...(origPath ? { origPath } : {}),
+        ...(xHasOrig ? { origPath } : {}),
         kind: kindFromCode(x),
         area: 'staged',
       });
     }
     if (y !== ' ' && y !== '?') {
+      const yHasOrig = (y === 'R' || y === 'C') && Boolean(origPath);
       unstaged.push({
         path: filePath,
-        ...(origPath ? { origPath } : {}),
+        ...(yHasOrig ? { origPath } : {}),
         kind: kindFromCode(y),
         area: 'unstaged',
       });
@@ -250,6 +297,34 @@ export function parsePorcelainV1Z(stdout: string): {
 export function parseNumstatMap(stdout: string): Map<string, { additions: number; deletions: number }> {
   const map = new Map<string, { additions: number; deletions: number }>();
   if (!stdout) return map;
+
+  // Handle NUL-delimited `-z --numstat` output so non-ASCII and special-char paths
+  // (e.g. `中文.txt`, spaces, quotes) are parsed verbatim without C-style escaping.
+  if (stdout.includes('\0')) {
+    const tokens = stdout.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const entry = tokens[i++];
+      if (!entry) continue;
+      const parts = entry.split('\t');
+      if (parts.length < 2) continue;
+      const rawAdd = parts[0]!;
+      const rawDel = parts[1]!;
+      let filePath = parts.length >= 3 ? parts.slice(2).join('\t') : '';
+      if (filePath.length === 0) {
+        // Rename/copy entry in `-z --numstat`: `<add>\t<del>\t\0<origPath>\0<newPath>\0`
+        const _orig = tokens[i++];
+        const nextPath = tokens[i++] ?? '';
+        filePath = nextPath || _orig || '';
+      }
+      if (!filePath) continue;
+      const additions = rawAdd === '-' ? 0 : Number.parseInt(rawAdd, 10) || 0;
+      const deletions = rawDel === '-' ? 0 : Number.parseInt(rawDel, 10) || 0;
+      map.set(filePath, { additions, deletions });
+    }
+    return map;
+  }
+
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trimEnd();
     if (!line) continue;
@@ -308,6 +383,43 @@ function parseCommitNameStatus(
   numstat: Map<string, { additions: number; deletions: number }>,
 ): GitChangedFile[] {
   const files: GitChangedFile[] = [];
+
+  // Handle NUL-delimited `-z --name-status` output for unquoted verbatim paths (e.g. `中文.txt`).
+  if (stdout.includes('\0')) {
+    const tokens = stdout.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const statusTok = tokens[i++];
+      if (!statusTok) continue;
+      const code = statusTok[0];
+      if (!code) continue;
+      if (code === 'R' || code === 'C') {
+        const origPath = tokens[i++] ?? '';
+        const nextPath = tokens[i++] ?? '';
+        if (!nextPath) continue;
+        const st = numstat.get(nextPath);
+        files.push({
+          path: nextPath,
+          ...(origPath ? { origPath } : {}),
+          kind: kindFromCode(code),
+          area: 'commit',
+          ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
+        });
+      } else {
+        const filePath = tokens[i++] ?? '';
+        if (!filePath) continue;
+        const st = numstat.get(filePath);
+        files.push({
+          path: filePath,
+          kind: kindFromCode(code),
+          area: 'commit',
+          ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
+        });
+      }
+    }
+    return files;
+  }
+
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -321,7 +433,7 @@ function parseCommitNameStatus(
       files.push({
         path: nextPath,
         origPath,
-        kind: 'renamed',
+        kind: kindFromCode(code),
         area: 'commit',
         ...(st ? { additions: st.additions, deletions: st.deletions } : {}),
       });
@@ -339,6 +451,385 @@ function parseCommitNameStatus(
   return files;
 }
 
+const RELATIVE_GIT_PATH_ENV_KEYS = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_COMMON_DIR',
+] as const;
+
+/**
+ * Strip only the single line terminator Git appends to stdout:
+ * - On POSIX, strips ONLY a trailing `\n` so a directory name containing a literal
+ *   trailing `\r` or space is preserved verbatim.
+ * - On Windows, strips a trailing `\r\n` or `\n`.
+ */
+export function stripGitLineEnding(
+  stdout: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === 'win32') {
+    return stdout.replace(/\r?\n$/, '');
+  }
+  return stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
+}
+
+function hasCustomGitPathEnv(
+  sourceEnv: Readonly<Record<string, string | undefined>>,
+): boolean {
+  for (const key of RELATIVE_GIT_PATH_ENV_KEYS) {
+    const val = sourceEnv[key];
+    if (typeof val === 'string' && val.length > 0) return true;
+  }
+  const altDirs = sourceEnv['GIT_ALTERNATE_OBJECT_DIRECTORIES'];
+  return typeof altDirs === 'string' && altDirs.length > 0;
+}
+
+interface ParsedGitAltEntry {
+  readonly raw: string;
+  readonly decoded: string;
+  readonly quoted: boolean;
+  readonly malformed: boolean;
+}
+
+/**
+ * Parse `GIT_ALTERNATE_OBJECT_DIRECTORIES` following Git's `link_alt_odb_entries()`
+ * and `unquote_c_style()` semantics: entries starting with `"` are C-style quoted
+ * and may contain the path delimiter (`:` on POSIX, `;` on Windows) without being split.
+ */
+export function parseGitAlternateObjectDirectories(
+  raw: string,
+  delimiter: string = path.delimiter,
+): ParsedGitAltEntry[] {
+  const entries: ParsedGitAltEntry[] = [];
+  let i = 0;
+  const len = raw.length;
+
+  while (i < len) {
+    if (raw[i] === delimiter) {
+      entries.push({ raw: '', decoded: '', quoted: false, malformed: false });
+      i += 1;
+      continue;
+    }
+
+    const start = i;
+    if (raw[i] === '"') {
+      i += 1;
+      const bytes: number[] = [];
+      let closed = false;
+      while (i < len) {
+        const ch = raw[i]!;
+        if (ch === '"') {
+          i += 1;
+          closed = true;
+          break;
+        }
+        if (ch === '\\' && i + 1 < len) {
+          const next = raw[i + 1]!;
+          if (next >= '0' && next <= '7') {
+            let oct = next;
+            let k = i + 2;
+            while (k < len && oct.length < 3 && raw[k]! >= '0' && raw[k]! <= '7') {
+              oct += raw[k]!;
+              k += 1;
+            }
+            bytes.push(Number.parseInt(oct, 8) & 0xff);
+            i = k;
+            continue;
+          }
+          const escMap: Record<string, number> = {
+            a: 0x07,
+            b: 0x08,
+            f: 0x0c,
+            n: 0x0a,
+            r: 0x0d,
+            t: 0x09,
+            v: 0x0b,
+            '\\': 0x5c,
+            '"': 0x22,
+          };
+          const mapped = escMap[next];
+          if (mapped !== undefined) {
+            bytes.push(mapped);
+            i += 2;
+            continue;
+          }
+          for (const b of Buffer.from(next, 'utf8')) bytes.push(b);
+          i += 2;
+          continue;
+        }
+        const cp = raw.codePointAt(i)!;
+        const step = cp > 0xffff ? 2 : 1;
+        for (const b of Buffer.from(raw.slice(i, i + step), 'utf8')) {
+          bytes.push(b);
+        }
+        i += step;
+      }
+
+      let trailing = '';
+      while (i < len && raw[i] !== delimiter) {
+        trailing += raw[i]!;
+        i += 1;
+      }
+      const rawToken = raw.slice(start, i);
+      const decoded = Buffer.from(bytes).toString('utf8') + trailing;
+      entries.push({
+        raw: rawToken,
+        decoded,
+        quoted: true,
+        malformed: !closed,
+      });
+      if (i < len && raw[i] === delimiter) {
+        i += 1;
+      }
+      continue;
+    }
+
+    while (i < len && raw[i] !== delimiter) {
+      i += 1;
+    }
+    const token = raw.slice(start, i);
+    entries.push({ raw: token, decoded: token, quoted: false, malformed: false });
+    if (i < len && raw[i] === delimiter) {
+      i += 1;
+    }
+  }
+
+  return entries;
+}
+
+/**
+ * Format a resolved path for `GIT_ALTERNATE_OBJECT_DIRECTORIES`, applying Git C-style
+ * quoting whenever the path contains the platform delimiter, quotes, or control chars.
+ */
+export function formatGitAlternateObjectPath(
+  entryPath: string,
+  delimiter: string = path.delimiter,
+): string {
+  const needsQuote =
+    entryPath.startsWith('"') ||
+    entryPath.includes(delimiter) ||
+    entryPath.includes('"') ||
+    /[\x00-\x1f\x7f]/.test(entryPath);
+  if (!needsQuote) return entryPath;
+
+  let out = '"';
+  for (let i = 0; i < entryPath.length; i++) {
+    const ch = entryPath[i]!;
+    const code = ch.charCodeAt(0);
+    if (ch === '\\') out += '\\\\';
+    else if (ch === '"') out += '\\"';
+    else if (ch === '\n') out += '\\n';
+    else if (ch === '\r') out += '\\r';
+    else if (ch === '\t') out += '\\t';
+    else if (ch === '\b') out += '\\b';
+    else if (ch === '\f') out += '\\f';
+    else if (code < 0x20 || code === 0x7f) out += `\\${code.toString(8).padStart(3, '0')}`;
+    else out += ch;
+  }
+  out += '"';
+  return out;
+}
+
+function isPathInsideDir(
+  candidate: string,
+  parent: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const normCandidate =
+    platform === 'win32' ? pathApi.resolve(candidate).toLowerCase() : pathApi.resolve(candidate);
+  const normParent =
+    platform === 'win32' ? pathApi.resolve(parent).toLowerCase() : pathApi.resolve(parent);
+  const rel = pathApi.relative(normParent, normCandidate);
+  const isOutside = rel === '..' || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel);
+  return !isOutside;
+}
+
+/**
+ * Normalize `GIT_ALTERNATE_OBJECT_DIRECTORIES` while preserving Git's C-style quoting
+ * semantics for paths containing delimiters (`:` / `;`). Absolute entries keep their
+ * original quoting intact; relative entries are resolved against `baseDir` and re-quoted
+ * if needed.
+ */
+export function normalizeGitAlternateObjectDirectories(
+  raw: string,
+  baseDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const delimiter = pathApi.delimiter;
+  const parsed = parseGitAlternateObjectDirectories(raw, delimiter);
+  return parsed
+    .map(entry => {
+      if (entry.malformed || entry.decoded.length === 0) {
+        return entry.raw;
+      }
+      if (pathApi.isAbsolute(entry.decoded)) {
+        return entry.raw;
+      }
+      const resolved = pathApi.resolve(baseDir, entry.decoded);
+      return formatGitAlternateObjectPath(resolved, delimiter);
+    })
+    .join(delimiter);
+}
+
+export interface GitRepoContext {
+  readonly repoRoot: string;
+  readonly gitEnv?: Readonly<Record<string, string>>;
+}
+
+/**
+ * Resolve the Git working tree top-level root for `cwd`.
+ * Strips only the trailing line terminator (preserving legitimate trailing spaces
+ * and POSIX trailing `\r`). Falls back to `cwd` when `rev-parse` is unavailable.
+ */
+export async function resolveGitRepoRoot(
+  cwd: string,
+  options?: {
+    readonly timeoutMs?: number;
+    readonly exec?: GitExecFn;
+    readonly env?: Readonly<Record<string, string | undefined>>;
+    readonly platform?: NodeJS.Platform;
+  },
+): Promise<string> {
+  const exec = options?.exec ?? runDefaultGit;
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
+  const res = await exec(['rev-parse', '--show-toplevel'], {
+    cwd,
+    timeoutMs,
+    ...(options?.env ? { env: options.env } : {}),
+  });
+  if (res.exitCode === 0) {
+    const raw = stripGitLineEnding(res.stdout, options?.platform);
+    if (raw.length > 0) {
+      return path.resolve(raw);
+    }
+  }
+  return cwd;
+}
+
+/**
+ * Resolve the repository root AND let Git itself resolve any custom/relative Git path
+ * environment variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, etc.) in the
+ * original launch `cwd` and original environment BEFORE switching to `repoRoot`.
+ *
+ * - Relative `GIT_INDEX_FILE` is resolved by Git (`rev-parse --git-path index`), matching
+ *   native Git's repo-root semantics rather than prematurely resolving against a subdir.
+ * - Bare repositories (where `rev-parse --show-toplevel` fails) never receive a synthetic
+ *   `GIT_WORK_TREE`, so `git status` fails cleanly just like native Git.
+ */
+export async function resolveGitRepoContext(
+  cwd: string,
+  options?: {
+    readonly timeoutMs?: number;
+    readonly exec?: GitExecFn;
+    readonly sourceEnv?: Readonly<Record<string, string | undefined>>;
+    readonly platform?: NodeJS.Platform;
+  },
+): Promise<GitRepoContext> {
+  const exec = options?.exec ?? runDefaultGit;
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
+  const sourceEnv = options?.sourceEnv ?? process.env;
+  const platform = options?.platform;
+  const customEnvPresent = hasCustomGitPathEnv(sourceEnv);
+  const hasIndexEnv =
+    typeof sourceEnv['GIT_INDEX_FILE'] === 'string' && sourceEnv['GIT_INDEX_FILE'].length > 0;
+  const hasObjectDirEnv =
+    typeof sourceEnv['GIT_OBJECT_DIRECTORY'] === 'string' &&
+    sourceEnv['GIT_OBJECT_DIRECTORY'].length > 0;
+  const hasCommonDirEnv =
+    typeof sourceEnv['GIT_COMMON_DIR'] === 'string' && sourceEnv['GIT_COMMON_DIR'].length > 0;
+
+  const probeOpts = { cwd, timeoutMs };
+  const [topRes, gitDirRes, indexRes, objDirRes, commonDirRes] = await Promise.all([
+    exec(['rev-parse', '--show-toplevel'], probeOpts),
+    customEnvPresent
+      ? exec(['rev-parse', '--absolute-git-dir'], probeOpts)
+      : Promise.resolve<GitExecResult>({ exitCode: 1, stdout: '' }),
+    hasIndexEnv
+      ? exec(['rev-parse', '--git-path', 'index'], probeOpts)
+      : Promise.resolve<GitExecResult>({ exitCode: 1, stdout: '' }),
+    hasObjectDirEnv
+      ? exec(['rev-parse', '--git-path', 'objects'], probeOpts)
+      : Promise.resolve<GitExecResult>({ exitCode: 1, stdout: '' }),
+    hasCommonDirEnv
+      ? exec(['rev-parse', '--git-common-dir'], probeOpts)
+      : Promise.resolve<GitExecResult>({ exitCode: 1, stdout: '' }),
+  ]);
+
+  const rawTop = topRes.exitCode === 0 ? stripGitLineEnding(topRes.stdout, platform) : '';
+  const hasWorkTree = rawTop.length > 0;
+  const repoRoot = hasWorkTree ? path.resolve(rawTop) : cwd;
+
+  if (!customEnvPresent) {
+    return { repoRoot };
+  }
+
+  const pinnedEnv: Record<string, string> = {};
+
+  const rawGitDir = gitDirRes.exitCode === 0 ? stripGitLineEnding(gitDirRes.stdout, platform) : '';
+  if (rawGitDir.length > 0) {
+    pinnedEnv['GIT_DIR'] = path.resolve(cwd, rawGitDir);
+  } else if (typeof sourceEnv['GIT_DIR'] === 'string' && sourceEnv['GIT_DIR'].length > 0) {
+    pinnedEnv['GIT_DIR'] = path.resolve(cwd, sourceEnv['GIT_DIR']);
+  }
+
+  // Only pin `GIT_WORK_TREE` when Git actually detected a working tree (never for bare repos).
+  if (hasWorkTree) {
+    pinnedEnv['GIT_WORK_TREE'] = repoRoot;
+  }
+
+  if (hasIndexEnv) {
+    const rawIdx = indexRes.exitCode === 0 ? stripGitLineEnding(indexRes.stdout, platform) : '';
+    if (rawIdx.length > 0) {
+      pinnedEnv['GIT_INDEX_FILE'] = path.resolve(cwd, rawIdx);
+    } else {
+      pinnedEnv['GIT_INDEX_FILE'] = path.resolve(repoRoot, sourceEnv['GIT_INDEX_FILE']!);
+    }
+  }
+
+  if (hasObjectDirEnv) {
+    const rawObj = objDirRes.exitCode === 0 ? stripGitLineEnding(objDirRes.stdout, platform) : '';
+    if (rawObj.length > 0) {
+      pinnedEnv['GIT_OBJECT_DIRECTORY'] = path.resolve(cwd, rawObj);
+    } else {
+      pinnedEnv['GIT_OBJECT_DIRECTORY'] = path.resolve(cwd, sourceEnv['GIT_OBJECT_DIRECTORY']!);
+    }
+  }
+
+  if (hasCommonDirEnv) {
+    const rawCommon =
+      commonDirRes.exitCode === 0 ? stripGitLineEnding(commonDirRes.stdout, platform) : '';
+    if (rawCommon.length > 0) {
+      pinnedEnv['GIT_COMMON_DIR'] = path.resolve(cwd, rawCommon);
+    } else {
+      pinnedEnv['GIT_COMMON_DIR'] = path.resolve(cwd, sourceEnv['GIT_COMMON_DIR']!);
+    }
+  }
+
+  const altDirs = sourceEnv['GIT_ALTERNATE_OBJECT_DIRECTORIES'];
+  if (typeof altDirs === 'string' && altDirs.length > 0) {
+    const effectivePlatform = platform ?? process.platform;
+    // Native Git resolves relative `GIT_ALTERNATE_OBJECT_DIRECTORIES` against `repoRoot`
+    // when invoked inside the working tree (since Git chdirs to the work-tree root first),
+    // and against the original `cwd` when invoked outside the working tree via `GIT_DIR`.
+    const altBaseDir =
+      hasWorkTree && isPathInsideDir(cwd, repoRoot, effectivePlatform) ? repoRoot : cwd;
+    pinnedEnv['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = normalizeGitAlternateObjectDirectories(
+      altDirs,
+      altBaseDir,
+      effectivePlatform,
+    );
+  }
+
+  return {
+    repoRoot,
+    ...(Object.keys(pinnedEnv).length > 0 ? { gitEnv: pinnedEnv } : {}),
+  };
+}
+
 /**
  * Load a full `GitRepoSnapshot` for `cwd` (branch, unstaged/staged file lists with
  * line stats, and HEAD commit metadata + files when clean).
@@ -350,14 +841,13 @@ export async function loadGitRepoSnapshot(
 ): Promise<GitRepoSnapshot> {
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
+  const { repoRoot, gitEnv } = await resolveGitRepoContext(cwd, { exec, timeoutMs });
+  const execOpts = gitEnv ? { cwd: repoRoot, timeoutMs, env: gitEnv } : { cwd: repoRoot, timeoutMs };
 
   const [statusRes, branchRes, headRes] = await Promise.all([
-    exec(['status', '--porcelain=v1', '-z', '-uall'], { cwd, timeoutMs }),
-    exec(['symbolic-ref', '--short', 'HEAD'], { cwd, timeoutMs }),
-    exec(['log', '-1', '--format=%H%x1f%h%x1f%s%x1f%b%x1f%an%x1f%ae%x1f%aI%x1f%P'], {
-      cwd,
-      timeoutMs,
-    }),
+    exec(['status', '--porcelain=v1', '-z', '-uall'], execOpts),
+    exec(['symbolic-ref', '--short', 'HEAD'], execOpts),
+    exec(['log', '-1', '--format=%H%x1f%h%x1f%s%x1f%b%x1f%an%x1f%ae%x1f%aI%x1f%P'], execOpts),
   ]);
 
   if (statusRes.exitCode !== 0) {
@@ -383,10 +873,10 @@ export async function loadGitRepoSnapshot(
   if (!clean) {
     const [unstagedStatRes, stagedStatRes] = await Promise.all([
       unstaged.length > 0
-        ? exec(['diff', '--numstat'], { cwd, timeoutMs })
+        ? exec(['diff', '-z', '--numstat'], execOpts)
         : Promise.resolve<GitExecResult>({ exitCode: 0, stdout: '' }),
       staged.length > 0
-        ? exec(['diff', '--cached', '--numstat'], { cwd, timeoutMs })
+        ? exec(['diff', '-z', '--cached', '--numstat'], execOpts)
         : Promise.resolve<GitExecResult>({ exitCode: 0, stdout: '' }),
     ]);
     if (unstagedStatRes.exitCode === 0) {
@@ -396,10 +886,25 @@ export async function loadGitRepoSnapshot(
       staged = attachStats(staged, parseNumstatMap(stagedStatRes.stdout));
     }
   } else if (headMeta) {
-    const [nameStatusRes, numstatRes] = await Promise.all([
-      exec(['show', '--format=', '--name-status', '--root', headMeta.sha], { cwd, timeoutMs }),
-      exec(['show', '--format=', '--numstat', '--root', headMeta.sha], { cwd, timeoutMs }),
-    ]);
+    // Use the first-parent baseline for commits with parents (including merges), and Git's
+    // native `--root` for root commits so both SHA-1 and SHA-256 repositories work verbatim.
+    // Always pass `-z` so non-ASCII paths (e.g. `中文.txt`) are never C-escaped.
+    const firstParent = headMeta.parents[0];
+    const [nameStatusRes, numstatRes] = firstParent
+      ? await Promise.all([
+          exec(['diff', '-z', '--name-status', '-M', '-C', firstParent, headMeta.sha], execOpts),
+          exec(['diff', '-z', '--numstat', '-M', '-C', firstParent, headMeta.sha], execOpts),
+        ])
+      : await Promise.all([
+          exec(
+            ['diff-tree', '--root', '-r', '-z', '--no-commit-id', '--name-status', '-M', '-C', headMeta.sha],
+            execOpts,
+          ),
+          exec(
+            ['diff-tree', '--root', '-r', '-z', '--no-commit-id', '--numstat', '-M', '-C', headMeta.sha],
+            execOpts,
+          ),
+        ]);
     const statsMap = numstatRes.exitCode === 0 ? parseNumstatMap(numstatRes.stdout) : new Map();
     const headFiles =
       nameStatusRes.exitCode === 0
@@ -409,7 +914,8 @@ export async function loadGitRepoSnapshot(
   }
 
   return {
-    cwd,
+    cwd: repoRoot,
+    ...(gitEnv ? { gitEnv } : {}),
     branch,
     detached,
     clean,
@@ -417,6 +923,56 @@ export async function loadGitRepoSnapshot(
     staged,
     headCommit,
   };
+}
+
+function buildFullContextDiffFromText(text: string): {
+  readonly unifiedDiff: string;
+  readonly lineCount: number;
+} {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  if (lines.length === 0) {
+    return { unifiedDiff: '', lineCount: 0 };
+  }
+  return {
+    unifiedDiff: [`@@ -1,${lines.length} +1,${lines.length} @@`, ...lines.map(l => ` ${l}`)].join(
+      '\n',
+    ),
+    lineCount: lines.length,
+  };
+}
+
+async function readFullDocumentForFileMode(
+  cwd: string,
+  file: GitChangedFile,
+  exec: GitExecFn,
+  execOpts: { readonly cwd: string; readonly timeoutMs: number; readonly env?: Readonly<Record<string, string>> },
+  headRev: string,
+): Promise<string | null> {
+  if (file.kind === 'deleted') return null;
+  if (file.area === 'unstaged') {
+    try {
+      const absPath = path.resolve(cwd, file.path);
+      const st = await fs.lstat(absPath);
+      if (st.isSymbolicLink()) return await fs.readlink(absPath);
+      if (!st.isFile() || st.size > MAX_UNTRACKED_DIFF_BYTES) return null;
+      const bytes = await fs.readFile(absPath);
+      const checkLen = Math.min(bytes.byteLength, 8192);
+      for (let i = 0; i < checkLen; i++) {
+        if (bytes[i] === 0) return null;
+      }
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+  const spec = file.area === 'staged' ? `:${file.path}` : `${headRev}:${file.path}`;
+  const res = await exec(['show', spec], execOpts);
+  if (res.exitCode !== 0) return null;
+  if (res.stdout.includes('\0')) return null;
+  return res.stdout;
 }
 
 function countUnifiedDiffStats(diffText: string): { additions: number; deletions: number } {
@@ -448,19 +1004,62 @@ export async function loadGitFileDiff(
   options?: {
     readonly wholeFile?: boolean;
     readonly headSha?: string;
+    readonly parentSha?: string;
     readonly timeoutMs?: number;
     readonly exec?: GitExecFn;
+    readonly gitEnv?: Readonly<Record<string, string>>;
   },
 ): Promise<GitFileDiffResult> {
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
   const key = gitFileKey(file.area, file.path);
-  const contextArg = options?.wholeFile ? '-U99999' : '-U3';
+  const execOpts = {
+    cwd,
+    timeoutMs,
+    ...(options?.gitEnv ? { env: options.gitEnv } : {}),
+  };
+  const headRev = options?.headSha || 'HEAD';
+  const fullDoc = options?.wholeFile
+    ? await readFullDocumentForFileMode(cwd, file, exec, execOpts, headRev)
+    : null;
+  const fullDocLineCount = fullDoc ? fullDoc.split(/\r?\n/).length : 0;
+  const contextArg = options?.wholeFile ? `-U${Math.max(99999, fullDocLineCount + 10)}` : '-U3';
 
   if (file.area === 'unstaged' && file.kind === 'untracked') {
     const absPath = path.resolve(cwd, file.path);
     try {
-      const st = await fs.stat(absPath);
+      // Use `lstat` so untracked symlinks are previewed as symlink targets (matching Git)
+      // instead of dereferencing and reading arbitrary files outside the repository.
+      const st = await fs.lstat(absPath);
+      if (st.isSymbolicLink()) {
+        const linkTarget = await fs.readlink(absPath);
+        const targetLines = linkTarget.replace(/\r\n/g, '\n').split('\n');
+        const unified = [
+          `@@ -0,0 +1,${targetLines.length} @@`,
+          ...targetLines.map(l => `+${l}`),
+        ].join('\n');
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'diff',
+          unifiedDiff: unified,
+          additions: targetLines.length,
+          deletions: 0,
+        };
+      }
+      if (!st.isFile()) {
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'empty',
+          unifiedDiff: '',
+          additions: 0,
+          deletions: 0,
+          message: 'Untracked non-regular file.',
+        };
+      }
       if (st.size > MAX_UNTRACKED_DIFF_BYTES) {
         return {
           fileKey: key,
@@ -533,17 +1132,68 @@ export async function loadGitFileDiff(
     }
   }
 
-  let args: string[];
-  if (file.area === 'staged') {
-    args = ['diff', '--cached', '--no-color', contextArg, '--', file.path];
-  } else if (file.area === 'commit') {
-    const rev = options?.headSha || 'HEAD';
-    args = ['show', '--format=', '--no-color', '--root', contextArg, rev, '--', file.path];
-  } else {
-    args = ['diff', '--no-color', contextArg, '--', file.path];
-  }
+  const isRenameOrCopy =
+    (file.kind === 'renamed' || file.kind === 'copied') &&
+    Boolean(file.origPath && file.origPath !== file.path);
 
-  const res = await exec(args, { cwd, timeoutMs });
+  let res: GitExecResult;
+  if (file.area === 'staged') {
+    if (isRenameOrCopy && file.origPath) {
+      // Compare exact dual endpoints (`HEAD:<origPath>` vs index `:<path>`) so 100% renames
+      // report 0 additions/deletions instead of `+N / -0` and modified renames show only actual edits.
+      const dualRes = await exec(
+        ['--literal-pathspecs', 'diff', '--no-color', '--no-ext-diff', contextArg, `HEAD:${file.origPath}`, `:${file.path}`],
+        execOpts,
+      );
+      if (dualRes.exitCode === 0) {
+        res = dualRes;
+      } else {
+        res = await exec(
+          ['--literal-pathspecs', 'diff', '--cached', '--no-color', '-M', '-C', contextArg, '--', file.origPath, file.path],
+          execOpts,
+        );
+      }
+    } else {
+      res = await exec(
+        ['--literal-pathspecs', 'diff', '--cached', '--no-color', contextArg, '--', file.path],
+        execOpts,
+      );
+    }
+  } else if (file.area === 'commit') {
+    const firstParent = options?.parentSha;
+    if (firstParent) {
+      if (isRenameOrCopy && file.origPath) {
+        const dualRes = await exec(
+          ['--literal-pathspecs', 'diff', '--no-color', '--no-ext-diff', contextArg, `${firstParent}:${file.origPath}`, `${headRev}:${file.path}`],
+          execOpts,
+        );
+        if (dualRes.exitCode === 0) {
+          res = dualRes;
+        } else {
+          res = await exec(
+            ['--literal-pathspecs', 'diff', '--no-color', '-M', '-C', contextArg, firstParent, headRev, '--', file.origPath, file.path],
+            execOpts,
+          );
+        }
+      } else {
+        res = await exec(
+          ['--literal-pathspecs', 'diff', '--no-color', '-M', '-C', contextArg, firstParent, headRev, '--', file.path],
+          execOpts,
+        );
+      }
+    } else {
+      // Root commit (works identically for both SHA-1 and SHA-256 repositories)
+      res = await exec(
+        ['--literal-pathspecs', 'show', '--format=', '--no-color', '--root', '-M', '-C', contextArg, headRev, '--', file.path],
+        execOpts,
+      );
+    }
+  } else {
+    res = await exec(
+      ['--literal-pathspecs', 'diff', '--no-color', contextArg, '--', file.path],
+      execOpts,
+    );
+  }
   if (res.exitCode !== 0) {
     return {
       fileKey: key,
@@ -559,6 +1209,25 @@ export async function loadGitFileDiff(
 
   const raw = res.stdout;
   if (!raw.trim()) {
+    // In whole-file (`File`) view mode, render the full document even when there are no textual edits
+    // (e.g., 100% identical renames or mode-only changes).
+    if (options?.wholeFile && fullDoc !== null) {
+      const ctx = buildFullContextDiffFromText(fullDoc);
+      if (ctx.lineCount > 0) {
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'diff',
+          unifiedDiff: ctx.unifiedDiff,
+          additions: 0,
+          deletions: 0,
+        };
+      }
+    }
+    const emptyMsg = isRenameOrCopy && file.origPath
+      ? `${file.kind === 'copied' ? 'Copied' : 'Renamed'} from ${file.origPath} (100% identical).`
+      : 'No textual differences.';
     return {
       fileKey: key,
       filePath: file.path,
@@ -567,7 +1236,7 @@ export async function loadGitFileDiff(
       unifiedDiff: '',
       additions: 0,
       deletions: 0,
-      message: 'No textual differences.',
+      message: emptyMsg,
     };
   }
   if (/^Binary files .+ differ$/m.test(raw) || /^GIT binary patch$/m.test(raw)) {
@@ -581,6 +1250,38 @@ export async function loadGitFileDiff(
       deletions: 0,
       message: 'Binary file changed.',
     };
+  }
+
+  // Handle patches with no textual hunks (e.g. 100% rename/copy or mode-only chmod changes).
+  // In whole-file (`File`) view mode, always synthesize full document context when readable!
+  const hasHunk = raw.split(/\r?\n/).some(l => l.startsWith('@@ '));
+  if (!hasHunk) {
+    if (options?.wholeFile && fullDoc !== null) {
+      const ctx = buildFullContextDiffFromText(fullDoc);
+      if (ctx.lineCount > 0) {
+        return {
+          fileKey: key,
+          filePath: file.path,
+          area: file.area,
+          kind: 'diff',
+          unifiedDiff: ctx.unifiedDiff,
+          additions: 0,
+          deletions: 0,
+        };
+      }
+    }
+    if (isRenameOrCopy && file.origPath) {
+      return {
+        fileKey: key,
+        filePath: file.path,
+        area: file.area,
+        kind: 'empty',
+        unifiedDiff: '',
+        additions: 0,
+        deletions: 0,
+        message: `${file.kind === 'copied' ? 'Copied' : 'Renamed'} from ${file.origPath} (100% identical).`,
+      };
+    }
   }
 
   const unifiedDiff = stripDiffPreamble(raw);
@@ -599,12 +1300,21 @@ export async function loadGitFileDiff(
 export async function stageGitFiles(
   cwd: string,
   paths: readonly string[] | 'all',
-  options?: { readonly timeoutMs?: number; readonly exec?: GitExecFn },
+  options?: {
+    readonly timeoutMs?: number;
+    readonly exec?: GitExecFn;
+    readonly gitEnv?: Readonly<Record<string, string>>;
+  },
 ): Promise<GitActionResult> {
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
-  const args = paths === 'all' ? ['add', '-A'] : ['add', '--', ...paths];
-  const res = await exec(args, { cwd, timeoutMs });
+  const args =
+    paths === 'all' ? ['add', '-A'] : ['--literal-pathspecs', 'add', '--', ...paths];
+  const res = await exec(args, {
+    cwd,
+    timeoutMs,
+    ...(options?.gitEnv ? { env: options.gitEnv } : {}),
+  });
   if (res.exitCode !== 0) {
     return { ok: false, message: res.stderr?.trim() || 'git add failed' };
   }
@@ -620,16 +1330,26 @@ export async function stageGitFiles(
 export async function unstageGitFiles(
   cwd: string,
   paths: readonly string[] | 'all',
-  options?: { readonly timeoutMs?: number; readonly exec?: GitExecFn },
+  options?: {
+    readonly timeoutMs?: number;
+    readonly exec?: GitExecFn;
+    readonly gitEnv?: Readonly<Record<string, string>>;
+  },
 ): Promise<GitActionResult> {
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
-  // Use `git reset HEAD -- ...` which also works on repos with commits; fallback to `git rm --cached` if unborn HEAD
-  const args = paths === 'all' ? ['reset', 'HEAD'] : ['reset', 'HEAD', '--', ...paths];
-  let res = await exec(args, { cwd, timeoutMs });
+  const execOpts = options?.gitEnv ? { cwd, timeoutMs, env: options.gitEnv } : { cwd, timeoutMs };
+  // Use `--literal-pathspecs` with raw paths so inherited `GIT_LITERAL_PATHSPECS=1`
+  // or glob characters like `[1]` never misinterpret pathspec prefixes or wildcards.
+  const args =
+    paths === 'all' ? ['reset', 'HEAD'] : ['--literal-pathspecs', 'reset', 'HEAD', '--', ...paths];
+  let res = await exec(args, execOpts);
   if (res.exitCode !== 0 && /ambiguous argument 'HEAD'|unknown revision/i.test(res.stderr ?? '')) {
-    const rmArgs = paths === 'all' ? ['rm', '--cached', '-r', '.'] : ['rm', '--cached', '--', ...paths];
-    res = await exec(rmArgs, { cwd, timeoutMs });
+    const rmArgs =
+      paths === 'all'
+        ? ['rm', '--cached', '-r', '.']
+        : ['--literal-pathspecs', 'rm', '--cached', '--', ...paths];
+    res = await exec(rmArgs, execOpts);
   }
   if (res.exitCode !== 0) {
     return { ok: false, message: res.stderr?.trim() || 'git reset failed' };
@@ -651,7 +1371,11 @@ export async function commitGitChanges(
     readonly amend?: boolean;
     readonly stageAllIfEmpty?: boolean;
   },
-  options?: { readonly timeoutMs?: number; readonly exec?: GitExecFn },
+  options?: {
+    readonly timeoutMs?: number;
+    readonly exec?: GitExecFn;
+    readonly gitEnv?: Readonly<Record<string, string>>;
+  },
 ): Promise<GitActionResult> {
   const exec = options?.exec ?? runDefaultGit;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_GIT_TUI_TIMEOUT_MS;
@@ -663,7 +1387,11 @@ export async function commitGitChanges(
   }
 
   if (params.stageAllIfEmpty) {
-    const stageRes = await stageGitFiles(cwd, 'all', { timeoutMs, exec });
+    const stageRes = await stageGitFiles(cwd, 'all', {
+      timeoutMs,
+      exec,
+      ...(options?.gitEnv ? { gitEnv: options.gitEnv } : {}),
+    });
     if (!stageRes.ok) return stageRes;
   }
 
@@ -676,7 +1404,11 @@ export async function commitGitChanges(
     args.push('--no-edit');
   }
 
-  const res = await exec(args, { cwd, timeoutMs });
+  const res = await exec(args, {
+    cwd,
+    timeoutMs,
+    ...(options?.gitEnv ? { env: options.gitEnv } : {}),
+  });
   if (res.exitCode !== 0) {
     return { ok: false, message: res.stderr?.trim() || res.stdout.trim() || 'git commit failed' };
   }

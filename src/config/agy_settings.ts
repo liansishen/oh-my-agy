@@ -16,9 +16,16 @@ export const AGY_SAFE_SETTING_KEYS = [
   'allowNonWorkspaceAccess',
   'artifactReviewPolicy',
   'useG1Credits',
+  'showThinking',
+  'orchestrator',
 ] as const;
 
 export type AgySafeSettingKey = (typeof AGY_SAFE_SETTING_KEYS)[number];
+
+export interface AgyOrchestratorSettings {
+  readonly planner?: string;
+  readonly executor?: string;
+}
 
 export const AGY_TOOL_PERMISSION_VALUES = [
   'request-review',
@@ -42,6 +49,8 @@ export interface AgySafeSettings {
   readonly allowNonWorkspaceAccess: boolean;
   readonly artifactReviewPolicy: AgyArtifactReviewPolicy;
   readonly useG1Credits: boolean;
+  readonly showThinking: boolean;
+  readonly orchestrator: AgyOrchestratorSettings;
 }
 
 export const DEFAULT_AGY_SAFE_SETTINGS: AgySafeSettings = Object.freeze({
@@ -50,7 +59,54 @@ export const DEFAULT_AGY_SAFE_SETTINGS: AgySafeSettings = Object.freeze({
   allowNonWorkspaceAccess: false,
   artifactReviewPolicy: 'asks-for-review',
   useG1Credits: false,
+  showThinking: false,
+  orchestrator: Object.freeze({}),
 });
+
+/**
+ * Parse an `agy` Orchestrator model spec string such as `"Gemini 4 Carbon (High)"`
+ * or `"Gemini 4 Neon (Extra)"` into `{ modelName, thoughtLevel }`.
+ */
+export function parseOrchestratorModelSpec(raw: string | undefined): {
+  readonly modelName: string;
+  readonly thoughtLevel?: string;
+} | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  const m = /^(.*?)\s*\((Low|Medium|High|XHigh|Extra|Minimal|Max)\)$/i.exec(trimmed);
+  if (!m) {
+    return { modelName: trimmed };
+  }
+  const base = (m[1] ?? '').trim();
+  const rawLvl = (m[2] ?? '').trim().toLowerCase();
+  const normalizedLevel = rawLvl === 'extra' ? 'xhigh' : rawLvl;
+  return base ? { modelName: base, thoughtLevel: normalizedLevel } : { modelName: trimmed };
+}
+
+/**
+ * Format a model display name + optional thought level into `agy` `settings.json`
+ * orchestrator format (e.g. `"Gemini 4 Carbon (High)"`, `"Gemini 4 Neon (Extra)"`).
+ */
+export function formatOrchestratorModelSpec(
+  modelName: string,
+  thoughtLevel?: string | null,
+): string {
+  const cleanName = modelName.trim();
+  if (!cleanName) return '';
+  const lvl = thoughtLevel?.trim().toLowerCase();
+  if (!lvl || lvl === 'off') return cleanName;
+  const labelMap: Record<string, string> = {
+    minimal: 'Minimal',
+    low: 'Low',
+    medium: 'Medium',
+    high: 'High',
+    xhigh: 'Extra',
+    extra: 'Extra',
+    max: 'Max',
+  };
+  const displayLvl = labelMap[lvl] ?? lvl.charAt(0).toUpperCase() + lvl.slice(1);
+  return `${cleanName} (${displayLvl})`;
+}
 
 export interface AgySettingsPathOptions {
   /** Explicit path override for unit tests. */
@@ -194,6 +250,37 @@ function extractSafeSettings(
     }
   }
 
+  let showThinking = DEFAULT_AGY_SAFE_SETTINGS.showThinking;
+  if ('showThinking' in raw && raw['showThinking'] !== undefined) {
+    presentKeys.push('showThinking');
+    const v = raw['showThinking'];
+    if (typeof v === 'boolean') {
+      showThinking = v;
+    } else {
+      warnings.push('showThinking: expected boolean, using default');
+    }
+  }
+
+  let orchestrator: AgyOrchestratorSettings = DEFAULT_AGY_SAFE_SETTINGS.orchestrator;
+  if ('orchestrator' in raw && raw['orchestrator'] !== undefined) {
+    presentKeys.push('orchestrator');
+    const v = raw['orchestrator'];
+    if (isPlainObject(v)) {
+      const planner = typeof v['planner'] === 'string' && v['planner'].trim().length > 0
+        ? v['planner'].trim()
+        : undefined;
+      const executor = typeof v['executor'] === 'string' && v['executor'].trim().length > 0
+        ? v['executor'].trim()
+        : undefined;
+      orchestrator = {
+        ...(planner ? { planner } : {}),
+        ...(executor ? { executor } : {}),
+      };
+    } else {
+      warnings.push('orchestrator: expected object, using default');
+    }
+  }
+
   return {
     settings: {
       toolPermission,
@@ -201,6 +288,8 @@ function extractSafeSettings(
       allowNonWorkspaceAccess,
       artifactReviewPolicy,
       useG1Credits,
+      showThinking,
+      orchestrator,
     },
     presentKeys,
   };
@@ -215,7 +304,16 @@ function validateSafeSettingValue(key: AgySafeSettingKey, value: unknown): boole
     case 'enableTerminalSandbox':
     case 'allowNonWorkspaceAccess':
     case 'useG1Credits':
+    case 'showThinking':
       return typeof value === 'boolean';
+    case 'orchestrator': {
+      if (!isPlainObject(value)) return false;
+      for (const [k, v] of Object.entries(value)) {
+        if (k !== 'planner' && k !== 'executor') return false;
+        if (v !== undefined && typeof v !== 'string') return false;
+      }
+      return true;
+    }
   }
 }
 
@@ -327,6 +425,32 @@ export async function saveAgySettings(
       continue;
     }
     const defaultValue = DEFAULT_AGY_SAFE_SETTINGS[key];
+    if (key === 'orchestrator') {
+      if (value === null) {
+        if (key in existing) delete existing[key];
+        deletedKeys.push(key);
+        continue;
+      }
+      if (!validateSafeSettingValue(key, value)) {
+        throw new Error(`Invalid value for agy setting "${key}": ${String(value)}`);
+      }
+      const nextOrch = value as AgyOrchestratorSettings;
+      const cleaned: Record<string, string> = {};
+      if (typeof nextOrch.planner === 'string' && nextOrch.planner.trim().length > 0) {
+        cleaned['planner'] = nextOrch.planner.trim();
+      }
+      if (typeof nextOrch.executor === 'string' && nextOrch.executor.trim().length > 0) {
+        cleaned['executor'] = nextOrch.executor.trim();
+      }
+      if (Object.keys(cleaned).length === 0) {
+        if (key in existing) delete existing[key];
+        deletedKeys.push(key);
+      } else {
+        existing[key] = cleaned;
+        updatedKeys.push(key);
+      }
+      continue;
+    }
     if (value === null || value === defaultValue) {
       if (key in existing) {
         delete existing[key];

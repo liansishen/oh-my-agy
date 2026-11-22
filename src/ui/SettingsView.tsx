@@ -7,9 +7,14 @@ import type {
 } from '@stencil-hq/tern';
 import type { SettingsPageId } from '../commands/handlers';
 import {
+  isOrchestratorModelId,
+  resolveOrchestratorRoleThoughtLevels,
+} from '../acp/model';
+import {
   AGY_ARTIFACT_REVIEW_POLICY_VALUES,
   AGY_TOOL_PERMISSION_VALUES,
   DEFAULT_AGY_SAFE_SETTINGS,
+  parseOrchestratorModelSpec,
 } from '../config/agy_settings';
 import { DEFAULT_CONFIG, type OmaConfig } from '../config/config';
 import type { AppState, SettingsPanelState } from '../state/store';
@@ -134,7 +139,25 @@ function buildPageSections(
       label: m.name,
       ...(m.value !== m.name ? { detail: m.value } : {}),
     }));
-    const thoughtOptions: PrefsOption[] = controls.availableThoughtLevels.map(t => ({
+    const isOrchestratorActive = isOrchestratorModelId(controls.currentModelId);
+    const parsedPlanner = isOrchestratorActive
+      ? parseOrchestratorModelSpec(state.orchestratorSettings.planner ?? agy.orchestrator?.planner)
+      : null;
+    const effectiveThoughtChoices = isOrchestratorActive
+      ? resolveOrchestratorRoleThoughtLevels(
+          'planner',
+          controls,
+          state.modelThoughtLevels,
+          parsedPlanner?.modelName
+        )
+      : controls.availableThoughtLevels;
+    const effectiveCurrentThought = isOrchestratorActive
+      ? (parsedPlanner?.thoughtLevel ?? 'high')
+      : controls.currentThoughtLevel;
+    const effectiveSupportsThought = isOrchestratorActive
+      ? effectiveThoughtChoices.length > 0
+      : controls.supportsThoughtLevel;
+    const thoughtOptions: PrefsOption[] = effectiveThoughtChoices.map(t => ({
       value: t.value,
       label: t.name,
       ...(t.description ? { detail: t.description } : {}),
@@ -165,14 +188,16 @@ function buildPageSections(
       {
         id: 'session.thought',
         label: 'Thinking Level',
-        hint: 'Reasoning depth for models that support thought_level',
+        hint: isOrchestratorActive
+          ? 'Reasoning depth for Orchestrator Planner (saved to agy settings.json)'
+          : 'Reasoning depth for models that support thought_level',
         disabled:
-          !controls.supportsThoughtLevel || thoughtOptions.length === 0
+          !effectiveSupportsThought || thoughtOptions.length === 0
             ? 'Not supported by current model'
             : undefined,
         control: {
           k: 'choice',
-          value: controls.currentThoughtLevel ?? thoughtOptions[0]?.value ?? '',
+          value: effectiveCurrentThought ?? thoughtOptions[0]?.value ?? '',
           options: thoughtOptions,
           style: 'segmented',
         },
@@ -200,7 +225,42 @@ function buildPageSections(
       },
     ];
 
-    return [{ id: 'session-current', title: 'Current Session', rows }];
+    const plannerSpec = state.orchestratorSettings.planner ?? agy.orchestrator?.planner;
+    const executorSpec = state.orchestratorSettings.executor ?? agy.orchestrator?.executor;
+
+    const orchestratorRows: PrefsRow[] = [
+      {
+        id: 'session.orchestrator.planner',
+        label: 'Orchestrator Planner',
+        hint: 'Planner model & effort for Orchestrator sessions (saved to agy settings.json)',
+        changed: Boolean(plannerSpec),
+        defaultLabel: 'Default',
+        disabled: modelOptions.length === 0 ? 'Waiting for session models' : undefined,
+        control: {
+          k: 'action',
+          act: 'pick-planner',
+          label: plannerSpec || 'Choose planner…',
+        },
+      },
+      {
+        id: 'session.orchestrator.executor',
+        label: 'Orchestrator Executor',
+        hint: 'Executor model & effort for Orchestrator sessions (saved to agy settings.json)',
+        changed: Boolean(executorSpec),
+        defaultLabel: 'Default',
+        disabled: modelOptions.length === 0 ? 'Waiting for session models' : undefined,
+        control: {
+          k: 'action',
+          act: 'pick-executor',
+          label: executorSpec || 'Choose executor…',
+        },
+      },
+    ];
+
+    return [
+      { id: 'session-current', title: 'Current Session', rows },
+      { id: 'session-orchestrator', title: 'Orchestrator', rows: orchestratorRows },
+    ];
   }
 
   if (pageId === 'interface') {
@@ -214,6 +274,23 @@ function buildPageSections(
         control: {
           k: 'switch',
           on: config.ui.auto_collapse_thought,
+        },
+      },
+      {
+        id: 'ui.tool_display',
+        label: 'Tool Call Display',
+        hint: 'Show full previews (All), single-line inline rows (Compact), or hide completed runs (Alt+O / Ctrl+Shift+O)',
+        changed: config.ui.tool_display !== DEFAULT_CONFIG.ui.tool_display,
+        defaultLabel: 'All',
+        control: {
+          k: 'choice',
+          value: state.toolDisplayMode,
+          options: [
+            { value: 'all', label: 'All' },
+            { value: 'compact', label: 'Compact' },
+            { value: 'hidden', label: 'Hidden' },
+          ],
+          style: 'segmented',
         },
       },
       {
@@ -234,7 +311,7 @@ function buildPageSections(
       {
         id: 'ui.show_thinking',
         label: 'Show Thinking Blocks',
-        hint: 'Display reasoning blocks in transcript (Ctrl+T)',
+        hint: 'Display reasoning blocks in transcript (/thinking or Ctrl+T)',
         changed: !state.showThinking,
         defaultLabel: 'On',
         control: {
@@ -739,6 +816,8 @@ export function SettingsView(props: SettingsViewProps): JSX.Element {
           }
         },
         edit: ev => callbacks.onAction('edit', ev.value ?? ev.item),
+        'pick-planner': forwardAction('pick-planner'),
+        'pick-executor': forwardAction('pick-executor'),
         'save-defaults': forwardAction('save-defaults'),
         reconnect: forwardAction('reconnect'),
         'open-mcp': forwardAction('open-mcp'),
@@ -751,6 +830,85 @@ export function SettingsView(props: SettingsViewProps): JSX.Element {
       }}
     />
   );
+
+  // Degrade gracefully when the connected terminal does not advertise the native `prefs` kind
+  if (!state.supportsPrefs) {
+    return (
+      <overlay key="settings" anchor="center" size="lg" modal>
+        <card
+          key="fallback-card"
+          head="Settings"
+          meta={computed.lead ? [{ t: computed.lead, s: 'muted' }] : undefined}
+          end={
+            <button
+              key="close"
+              text="Close"
+              size="sm"
+              variant="quiet"
+              onClick={() => callbacks.onClose()}
+            />
+          }
+        >
+          <col key="body" gap="sm">
+            <tabs
+              key="pages"
+              active={computed.page}
+              items={computed.pages.map(p => ({ id: p.id, label: p.label ?? p.id }))}
+              onSelect={ev => callbacks.onPageChange(ev.item as SettingsPageId)}
+            />
+            {computed.sections.map((section, sIdx) => (
+              <col key={`sec-${sIdx}`} gap="xs">
+                {section.title ? (
+                  <text key="title" spans={[{ t: section.title, s: 'strong muted' }]} />
+                ) : null}
+                {section.rows.map(row => {
+                  const ctrl = row.control;
+                  const valueText =
+                    ctrl?.k === 'switch'
+                      ? ctrl.on
+                        ? 'On'
+                        : 'Off'
+                      : ctrl?.k === 'choice'
+                        ? ctrl.options?.find(o => o.value === ctrl.value)?.label ?? String(ctrl.value ?? '')
+                        : ctrl?.k === 'number'
+                          ? String(ctrl.value ?? '')
+                          : ctrl?.k === 'text'
+                            ? String(ctrl.value || ctrl.placeholder || '')
+                            : ctrl?.k === 'action'
+                              ? ctrl.label
+                              : '';
+                  return (
+                    <row key={`row-${row.id}`} gap="sm" align="center" justify="between">
+                      <col key="info">
+                        <text
+                          key="lbl"
+                          spans={[{ t: row.label ?? row.id, s: row.id === settings.focus ? 'accent strong' : 'strong' }]}
+                        />
+                        {row.hint ? (
+                          <text key="hint" spans={[{ t: row.hint, s: 'muted' }]} wrap="word" />
+                        ) : null}
+                      </col>
+                      {ctrl && !row.disabled ? (
+                        <button
+                          key="act"
+                          text={valueText || 'Toggle'}
+                          size="sm"
+                          variant={row.id === settings.focus ? 'primary' : 'quiet'}
+                          onClick={() => callbacks.onActivate(row.id)}
+                        />
+                      ) : valueText ? (
+                        <text key="val" spans={[{ t: valueText, s: 'muted' }]} />
+                      ) : null}
+                    </row>
+                  );
+                })}
+              </col>
+            ))}
+          </col>
+        </card>
+      </overlay>
+    );
+  }
 
   if (state.supportsAside) {
     return prefsNode;

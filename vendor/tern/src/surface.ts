@@ -3,7 +3,7 @@
  * under credit-based flow control, with view ops, stylesheets and event
  * routing to node handlers.
  */
-import { View, type Renderable } from './reconcile.js';
+import { isEvictedId, View, type Renderable } from './reconcile.js';
 import type {
    OutMessage,
    Op,
@@ -13,6 +13,35 @@ import type {
    SurfaceMode,
    TspEvent,
 } from './wire.js';
+
+function opTargetsEvicted(op: Op, evicted: ReadonlySet<string>): boolean {
+   if (evicted.size === 0) return false;
+   switch (op[0]) {
+      case 'add':
+         return (
+            isEvictedId(op[1], evicted) ||
+            isEvictedId(op[2], evicted) ||
+            (typeof op[3] === 'string' && isEvictedId(op[3], evicted))
+         );
+      case 'move':
+         return (
+            isEvictedId(op[1], evicted) ||
+            isEvictedId(op[2], evicted) ||
+            (typeof op[3] === 'string' && isEvictedId(op[3], evicted))
+         );
+      case 'del':
+      case 'set':
+      case 'text':
+      case 'settle':
+      case 'reveal':
+      case 'scroll':
+         return isEvictedId(op[1], evicted);
+      case 'focus':
+         return typeof op[1] === 'string' && isEvictedId(op[1], evicted);
+      default:
+         return false;
+   }
+}
 
 /** What `open` takes. */
 export interface OpenOptions {
@@ -80,10 +109,16 @@ export class Surface implements AsyncDisposable {
    #sent = new View();
    /** A view rendered while blocked. */
    #pending: View | undefined;
+   /** Deferred view builder queued while blocked so we skip View construction until credit returns. */
+   #pendingBuilder: (() => Renderable | undefined) | undefined;
+   /** True while `#flush` is running so ops queued during deferred build join the same frame. */
+   #flushing = false;
    /** The view last rendered: events route to its nodes. */
    #latest = new View();
    /** View and raw ops waiting for credit. */
    #queue: Op[] = [];
+   /** Node IDs evicted by Tern (`Gone` event) that must never receive subsequent ops. */
+   #evicted = new Set<string>();
    #closed = false;
    #resetMain = false;
    readonly forwardActions: readonly string[];
@@ -122,10 +157,89 @@ export class Surface implements AsyncDisposable {
    /** Shows `view`: a view by region, or nodes for `main`. Throws a `ViewError` for a bad view. */
    render(view: Renderable): void {
       if (this.#closed) return;
-      const next = View.from(view);
+      this.#pendingBuilder = undefined;
+      const next = View.from(view).prune(this.#evicted);
       this.#latest = next;
       this.#pending = next;
       this.#pump();
+   }
+
+   /**
+    * Credit-aware render: when flow-control credit is available, builds and sends
+    * immediately; while blocked, records only the builder callback so no intermediate
+    * `View` trees are constructed until an `ack` restores credit. Returning `undefined`
+    * from `build` cancels the deferred frame (e.g. when suspended or superseded).
+    */
+   renderDeferred(build: () => Renderable | undefined): void {
+      if (this.#closed) return;
+      if (!this.blocked) {
+         const built = build();
+         if (built !== undefined) {
+            this.render(built);
+         }
+         return;
+      }
+      this.#pending = undefined;
+      this.#pendingBuilder = build;
+   }
+
+   /**
+    * Cancels any pending un-flushed view or deferred builder (e.g. on replay suspend /
+    * session reset), restores event routing to the last sent view (`#sent`), and drops
+    * queued ops that depended on the cancelled pending view or target nodes absent from `#sent`.
+    */
+   cancelDeferred(): void {
+      this.#pending = undefined;
+      this.#pendingBuilder = undefined;
+      this.#latest = this.#sent;
+      if (this.#queue.length > 0) {
+         this.#queue = this.#queue.filter(op => {
+            switch (op[0]) {
+               case 'settle':
+               case 'reveal':
+               case 'scroll':
+                  return false;
+               case 'focus':
+                  return op[1] === null || this.#sent.find(op[1]) !== undefined;
+               case 'del':
+               case 'set':
+               case 'text':
+                  return this.#sent.find(op[1]) !== undefined;
+               case 'add':
+               case 'move':
+                  return this.#sent.find(op[2]) !== undefined;
+               default:
+                  return true;
+            }
+         });
+      }
+   }
+
+   /**
+    * Records node IDs evicted by Tern (`Gone` event), pruning them from the last-sent
+    * view, any pending view, and any queued ops BEFORE the next `ack` can flush.
+    */
+   evictNodes(ids: readonly string[]): void {
+      if (this.#closed || ids.length === 0) return;
+      let added = false;
+      for (const id of ids) {
+         if (id && !this.#evicted.has(id)) {
+            this.#evicted.add(id);
+            added = true;
+         }
+      }
+      if (!added) return;
+      this.#sent = this.#sent.prune(this.#evicted);
+      if (this.#pending) this.#pending = this.#pending.prune(this.#evicted);
+      this.#latest = this.#latest.prune(this.#evicted);
+      if (this.#queue.length > 0) {
+         this.#queue = this.#queue.filter(op => !opTargetsEvicted(op, this.#evicted));
+      }
+   }
+
+   /** Clears evicted node tracking when resetting/switching to a fresh transcript session. */
+   resetEvicted(): void {
+      this.#evicted.clear();
    }
 
    /** Installs (or with `null` removes) stylesheet `name`. */
@@ -298,27 +412,48 @@ export class Surface implements AsyncDisposable {
 
    /** Sends one frame when credit allows and there is anything to send. */
    #pump(): void {
-      if (this.#closed || this.blocked) return;
+      if (this.#closed || this.blocked || this.#flushing) return;
       this.#flush();
    }
 
    /** Sends the pending difference and queued ops as one frame, when there are any. */
    #flush(): void {
-      const ops: Op[] = [];
-      const next = this.#pending;
-      if (this.#resetMain && (next || this.#queue.length > 0)) ops.push(['del', 'main']);
-      if (next) ops.push(...this.#sent.ops(next, this.id));
-      ops.push(...this.#queue);
-      if (ops.length > 0) {
-         const seq = this.#seq + 1;
-         this.#link.send({ verb: 'f', body: { sf: this.id, s: seq, ops } });
-         this.#seq = seq;
-         this.#resetMain = false;
-      }
-      this.#queue = [];
-      if (next) {
-         this.#sent = next;
-         this.#pending = undefined;
+      if (this.#flushing) return;
+      this.#flushing = true;
+      try {
+         let next = this.#pending;
+         if (!next && this.#pendingBuilder) {
+            const builder = this.#pendingBuilder;
+            this.#pendingBuilder = undefined;
+            const built = builder();
+            if (built !== undefined) {
+               next = View.from(built).prune(this.#evicted);
+               this.#latest = next;
+            }
+         } else if (next && this.#evicted.size > 0) {
+            next = next.prune(this.#evicted);
+         }
+         const ops: Op[] = [];
+         if (this.#resetMain && (next || this.#queue.length > 0)) ops.push(['del', 'main']);
+         if (next) ops.push(...this.#sent.ops(next, this.id));
+         ops.push(...this.#queue);
+         const filteredOps =
+            this.#evicted.size > 0
+               ? ops.filter(op => !opTargetsEvicted(op, this.#evicted))
+               : ops;
+         if (filteredOps.length > 0) {
+            const seq = this.#seq + 1;
+            this.#link.send({ verb: 'f', body: { sf: this.id, s: seq, ops: filteredOps } });
+            this.#seq = seq;
+            this.#resetMain = false;
+         }
+         this.#queue = [];
+         if (next) {
+            this.#sent = next;
+            this.#pending = undefined;
+         }
+      } finally {
+         this.#flushing = false;
       }
    }
 }

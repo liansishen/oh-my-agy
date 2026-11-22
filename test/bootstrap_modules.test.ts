@@ -281,6 +281,7 @@ auto_allow_tools = ["read_file", "list_dir", "read_file", "  "]
       recent_models: [],
       ui: {
         auto_collapse_thought: false,
+        tool_display: 'all',
         tool_preview_lines: 16,
         osc_7501: false,
         reopen_anchor: true,

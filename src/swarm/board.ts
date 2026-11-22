@@ -97,6 +97,48 @@ export interface SwarmBoardCounts {
   readonly skippedCorruptLines: number;
 }
 
+export interface SwarmPlanGoal {
+  readonly title: string;
+  readonly line: string;
+}
+
+export interface SwarmPlanThread {
+  readonly id: string;
+  readonly title: string;
+  readonly goal: string;
+  readonly tasks: readonly string[];
+}
+
+export interface SwarmPlan {
+  readonly goal?: SwarmPlanGoal;
+  readonly tasks: Readonly<Record<string, string>>;
+  readonly threads: readonly SwarmPlanThread[];
+}
+
+export type SwarmOverviewThreadStatus = 'done' | 'working' | 'blocked' | 'waiting';
+
+export interface SwarmOverviewThread {
+  readonly id: string;
+  readonly title: string;
+  readonly goal: string;
+  readonly tasks: readonly string[];
+  readonly status: SwarmOverviewThreadStatus;
+  readonly doneCount: number;
+  readonly workingCount: number;
+  readonly blockedCount: number;
+  readonly totalCount: number;
+}
+
+export interface SwarmOverviewSummary {
+  readonly goalTitle: string;
+  readonly goalLine: string;
+  readonly totalTasks: number;
+  readonly doneCount: number;
+  readonly workingCount: number;
+  readonly blockedCount: number;
+  readonly threads: readonly SwarmOverviewThread[];
+}
+
 export interface SwarmBoardSnapshot {
   readonly sessionId: string;
   readonly swarmDir: string;
@@ -113,6 +155,10 @@ export interface SwarmBoardSnapshot {
   /** Highest message `seq` present in `board.jsonl` (0 if empty). */
   readonly latestSeq: number;
   readonly counts: SwarmBoardCounts;
+  /** Parsed `plan.json` written by the swarm coordinator for the Overview pane, if present. */
+  readonly plan?: SwarmPlan | null;
+  /** Aggregated real-time Overview (goal, task progress, up to 6 parallel workflow threads). */
+  readonly overview?: SwarmOverviewSummary | null;
   /** True when the swarm has at least one non-killed, non-stopped member in `working` status. */
   readonly isSwarmActive: boolean;
   /** Roster names of members currently in `working` status (in sorted member order). */
@@ -551,10 +597,11 @@ export async function loadSwarmBoard(
     return null;
   }
 
-  const [swarmText, membersText, boardText] = await Promise.all([
+  const [swarmText, membersText, boardText, planText] = await Promise.all([
     readOptionalUtf8(path.join(swarmDir, SWARM_FILE_NAME)),
     readOptionalUtf8(path.join(swarmDir, MEMBERS_FILE_NAME)),
     readOptionalUtf8(path.join(swarmDir, BOARD_FILE_NAME)),
+    readOptionalUtf8(path.join(swarmDir, 'plan.json')),
   ]);
 
   const rawSwarm = parseJsonObject<RawSwarmMeta & Record<string, unknown>>(swarmText);
@@ -693,6 +740,9 @@ export async function loadSwarmBoard(
     (m) => m.status === 'working' && m.role !== 'coordinator' && m.name !== 'coordinator',
   );
 
+  const plan = parseSwarmPlan(planText);
+  const overview = buildSwarmOverview(plan, title, membersList, memberByName, messages);
+
   return {
     sessionId,
     swarmDir,
@@ -704,9 +754,176 @@ export async function loadSwarmBoard(
     messages,
     latestSeq,
     counts,
+    ...(plan ? { plan } : {}),
+    ...(overview ? { overview } : {}),
     isSwarmActive,
     workingMembers: workingMemberNames,
     loadedAt: Date.now(),
+  };
+}
+
+function parseSwarmPlan(planText: string | null): SwarmPlan | null {
+  const raw = parseJsonObject<Record<string, unknown>>(planText);
+  if (!raw) return null;
+
+  let goal: SwarmPlanGoal | undefined;
+  if (isPlainObject(raw['goal'])) {
+    const gTitle = typeof raw['goal']['title'] === 'string' ? raw['goal']['title'].trim() : '';
+    const gLine = typeof raw['goal']['line'] === 'string' ? raw['goal']['line'].trim() : '';
+    if (gTitle || gLine) {
+      goal = { title: gTitle, line: gLine };
+    }
+  }
+
+  const tasks: Record<string, string> = {};
+  if (isPlainObject(raw['tasks'])) {
+    for (const [k, v] of Object.entries(raw['tasks'])) {
+      if (typeof v === 'string' && v.trim().length > 0) {
+        tasks[k] = v.trim();
+      }
+    }
+  }
+
+  const threads: SwarmPlanThread[] = [];
+  if (Array.isArray(raw['threads'])) {
+    for (let idx = 0; idx < raw['threads'].length && threads.length < 6; idx++) {
+      const entry = raw['threads'][idx];
+      if (!isPlainObject(entry)) continue;
+      const id =
+        typeof entry['id'] === 'string' && entry['id'].trim().length > 0
+          ? entry['id'].trim()
+          : `thread-${idx + 1}`;
+      const title =
+        typeof entry['title'] === 'string' && entry['title'].trim().length > 0
+          ? entry['title'].trim()
+          : id;
+      const tGoal = typeof entry['goal'] === 'string' ? entry['goal'].trim() : '';
+      const tTasks = Array.isArray(entry['tasks'])
+        ? entry['tasks'].filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+        : [];
+      threads.push({ id, title, goal: tGoal, tasks: tTasks });
+    }
+  }
+
+  if (!goal && Object.keys(tasks).length === 0 && threads.length === 0) {
+    return null;
+  }
+  return { ...(goal ? { goal } : {}), tasks, threads };
+}
+
+function deriveWorkerOverviewState(
+  workerName: string,
+  memberByName: Readonly<Record<string, SwarmMember>>,
+  latestBadgeByAgent: ReadonlyMap<string, string>,
+): SwarmOverviewThreadStatus {
+  const member = memberByName[workerName];
+  const latestBadge = latestBadgeByAgent.get(workerName);
+  if (latestBadge === 'blocked' || latestBadge === 'stall' || latestBadge === 'quota') {
+    return 'blocked';
+  }
+  if (latestBadge === 'done') {
+    return 'done';
+  }
+  if (member?.status === 'working') {
+    return 'working';
+  }
+  if (member?.killed) {
+    return 'done';
+  }
+  return 'waiting';
+}
+
+function buildSwarmOverview(
+  plan: SwarmPlan | null,
+  fallbackTitle: string,
+  members: readonly SwarmMember[],
+  memberByName: Readonly<Record<string, SwarmMember>>,
+  messages: readonly SwarmBoardMessage[],
+): SwarmOverviewSummary | null {
+  if (!plan) return null;
+
+  // Track latest status badge posted by each agent (messages are sorted ascending by seq)
+  const latestBadgeByAgent = new Map<string, string>();
+  for (const msg of messages) {
+    for (const badge of msg.badges) {
+      if (
+        badge.tag === 'done' ||
+        badge.tag === 'blocked' ||
+        badge.tag === 'stall' ||
+        badge.tag === 'quota'
+      ) {
+        latestBadgeByAgent.set(msg.agent, badge.tag);
+      }
+    }
+  }
+
+  const allTaskWorkers = new Set<string>();
+  for (const name of Object.keys(plan.tasks)) {
+    allTaskWorkers.add(name);
+  }
+  for (const th of plan.threads) {
+    for (const w of th.tasks) {
+      allTaskWorkers.add(w);
+    }
+  }
+  if (allTaskWorkers.size === 0) {
+    for (const m of members) {
+      if (m.role !== 'coordinator' && m.name !== 'coordinator') {
+        allTaskWorkers.add(m.name);
+      }
+    }
+  }
+
+  let doneCount = 0;
+  let workingCount = 0;
+  let blockedCount = 0;
+  for (const w of allTaskWorkers) {
+    const st = deriveWorkerOverviewState(w, memberByName, latestBadgeByAgent);
+    if (st === 'done') doneCount += 1;
+    else if (st === 'blocked') blockedCount += 1;
+    else if (st === 'working') workingCount += 1;
+  }
+
+  const threads: SwarmOverviewThread[] = plan.threads.slice(0, 6).map((th) => {
+    let tDone = 0;
+    let tWorking = 0;
+    let tBlocked = 0;
+    for (const w of th.tasks) {
+      const st = deriveWorkerOverviewState(w, memberByName, latestBadgeByAgent);
+      if (st === 'done') tDone += 1;
+      else if (st === 'blocked') tBlocked += 1;
+      else if (st === 'working') tWorking += 1;
+    }
+    const total = th.tasks.length;
+    const status: SwarmOverviewThreadStatus =
+      tBlocked > 0
+        ? 'blocked'
+        : tWorking > 0
+          ? 'working'
+          : total > 0 && tDone === total
+            ? 'done'
+            : 'waiting';
+    return {
+      id: th.id,
+      title: th.title,
+      goal: th.goal,
+      tasks: th.tasks,
+      status,
+      doneCount: tDone,
+      workingCount: tWorking,
+      blockedCount: tBlocked,
+      totalCount: total,
+    };
+  });
+
+  return {
+    goalTitle: plan.goal?.title || fallbackTitle || 'Swarm Overview',
+    goalLine: plan.goal?.line || '',
+    totalTasks: allTaskWorkers.size,
+    doneCount,
+    workingCount,
+    blockedCount,
+    threads,
   };
 }
 
@@ -741,12 +958,13 @@ async function computeFingerprintAsync(swarmDir: string): Promise<string> {
     return 'dir-missing';
   }
 
-  const [a, b, c] = await Promise.all([
+  const [a, b, c, d] = await Promise.all([
     statTokenAsync(path.join(swarmDir, SWARM_FILE_NAME)),
     statTokenAsync(path.join(swarmDir, MEMBERS_FILE_NAME)),
     statTokenAsync(path.join(swarmDir, BOARD_FILE_NAME)),
+    statTokenAsync(path.join(swarmDir, 'plan.json')),
   ]);
-  return `${a}|${b}|${c}`;
+  return `${a}|${b}|${c}|${d}`;
 }
 
 function computeFingerprintSync(swarmDir: string): string {
@@ -760,7 +978,8 @@ function computeFingerprintSync(swarmDir: string): string {
   const a = statTokenSync(path.join(swarmDir, SWARM_FILE_NAME));
   const b = statTokenSync(path.join(swarmDir, MEMBERS_FILE_NAME));
   const c = statTokenSync(path.join(swarmDir, BOARD_FILE_NAME));
-  return `${a}|${b}|${c}`;
+  const d = statTokenSync(path.join(swarmDir, 'plan.json'));
+  return `${a}|${b}|${c}|${d}`;
 }
 
 /**

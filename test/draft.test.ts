@@ -541,7 +541,7 @@ describe('CommandRegistry & Handlers', () => {
     expect(registry.resolve('sessions')?.name).toBe('resume');
     expect(registry.resolve('/clear')?.name).toBe('new');
     expect(registry.resolve('m')?.name).toBe('model');
-    expect(registry.resolve('thinking')?.name).toBe('thought');
+    expect(registry.resolve('thinking')?.name).toBe('thinking');
     expect(registry.resolve('t')?.name).toBe('thought');
     expect(registry.resolve('?')?.name).toBe('help');
     expect(registry.resolve('exit')?.name).toBe('quit');
@@ -668,6 +668,45 @@ describe('CommandRegistry & Handlers', () => {
       'quit',
       'pass:agy:plan:/plan build feature',
       'unknown:nonexistent',
+    ]);
+  });
+
+  test('routes /thinking [on|off] to set_thinking_display while keeping /thinking <level> backward compatible', async () => {
+    const registry = new CommandRegistry();
+    const events: string[] = [];
+    const executor: CommandActionExecutor = {
+      openPicker: () => {},
+      newSession: () => {},
+      setModel: () => {},
+      setThought: (l) => {
+        events.push(`thought:${l}`);
+      },
+      setThinkingDisplay: (m) => {
+        events.push(`thinking:${m}`);
+      },
+      setMode: () => {},
+      copyLastReply: () => {},
+      openHelp: () => {},
+      quit: () => {},
+      passthroughPrompt: () => {},
+      unknownCommand: () => {},
+    };
+
+    for (const input of ['/thinking', '/thinking on', '/thinking off', '/thinking true', '/thinking false', '/thinking high']) {
+      const res = dispatchSlashCommand(input, registry);
+      expect(res.isCommand).toBe(true);
+      if (res.isCommand) {
+        await executeCommandAction(res.action, executor);
+      }
+    }
+
+    expect(events).toEqual([
+      'thinking:toggle',
+      'thinking:on',
+      'thinking:off',
+      'thinking:on',
+      'thinking:off',
+      'thought:high',
     ]);
   });
 });
@@ -1312,10 +1351,12 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
       'tool',
     ]);
 
-    // Global thinking & tool collapse helpers
+    // Global thinking & tool collapse helpers (aligned with omp: expandAllTools is decoupled from thoughts)
     const thought0 = t0.thoughts[0]!;
     expect(store.isThoughtOpen(thought0, { showThinking: false, expandAllTools: true })).toBe(false);
-    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: true })).toBe(true);
+    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: true })).toBe(false);
+    store.toggleThought(thought0.id, true);
+    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: false })).toBe(true);
     expect(store.isToolCollapsed(t1.toolCalls[0]!, false)).toBe(false);
     store.setAllToolsCollapsed(true);
     expect(t1.toolCalls[0]?.collapsed).toBe(true);
@@ -1750,18 +1791,20 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
 
     const replayedTurn = replayStore.turns[0]!;
     expect(replayedTurn.status).toBe('done');
+    expect(replayedTurn.replayed).toBe(true);
     expect(replayedTurn.thoughts).toHaveLength(2);
     for (const th of replayedTurn.thoughts) {
       expect(th.status).toBe('done');
       expect(th.endedAt).toBeDefined();
-      expect(th.tookMs).toBeDefined();
+      expect(th.replayed).toBe(true);
+      // Replayed thoughts must NOT synthesize fake wall-clock durations (avoids `Thought for 0ms`)
+      expect(th.tookMs).toBeUndefined();
       expect(th.open).toBe(false);
     }
-    expect(replayedTurn.thoughts[0]?.tookMs).toBe(500);
-    expect(replayedTurn.thoughts[1]?.tookMs).toBe(200);
     expect(replayedTurn.toolCalls[0]?.status).toBe('done');
     expect(replayedTurn.toolCalls[0]?.endedAt).toBeDefined();
-    expect(replayedTurn.toolCalls[0]?.tookMs).toBeDefined();
+    expect(replayedTurn.toolCalls[0]?.replayed).toBe(true);
+    expect(replayedTurn.toolCalls[0]?.tookMs).toBeUndefined();
   });
 
   test('TranscriptStore.getBackgroundJobsSnapshot, /jobs (/tasks) dispatch, and AppStore jobs overlay state', async () => {

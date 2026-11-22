@@ -18,8 +18,58 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Resolve release tag & checkout ref
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          RELEASE_TAG="${INPUT_TAG:-$REF_NAME}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          # On tag push, pin checkout to the immutable triggering event SHA (`github.sha`)
+          # rather than a mutable tag ref. Protect `v*` tags via GitHub Repository Rulesets
+          # (disallow force-updates and deletions) so tags remain immutable after push.
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "checkout_ref=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=refs/tags/$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout target commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      - name: Verify tag commit and version consistency
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          git fetch --no-tags --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          TAG_COMMIT="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$EVENT_NAME" = "push" ] && [ "$HEAD_COMMIT" != "$EVENT_SHA" ]; then
+            echo "HEAD ($HEAD_COMMIT) does not match triggering push SHA ($EVENT_SHA)" >&2
+            exit 1
+          fi
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "HEAD ($HEAD_COMMIT) does not match tag $RELEASE_TAG ($TAG_COMMIT)" >&2
+            exit 1
+          fi
+          EXPECTED_VER="${RELEASE_TAG#v}"
+          PKG_VER="$(node -p "require('./package.json').version")"
+          if [ "$PKG_VER" != "$EXPECTED_VER" ]; then
+            echo "Version mismatch: tag is $RELEASE_TAG ($EXPECTED_VER) but package.json is $PKG_VER" >&2
+            exit 1
+          fi
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -35,6 +85,8 @@ jobs:
           bun test
 
       - name: Cross-compile release binaries
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
           mkdir -p release-assets
           bun build --compile --target=bun-windows-x64 src/bin/oma.ts --outfile release-assets/oma-windows-x64.exe
@@ -42,18 +94,37 @@ jobs:
           bun build --compile --target=bun-linux-arm64 src/bin/oma.ts --outfile release-assets/oma-linux-arm64
           bun build --compile --target=bun-darwin-arm64 src/bin/oma.ts --outfile release-assets/oma-darwin-arm64
           bun build --compile --target=bun-darwin-x64   src/bin/oma.ts --outfile release-assets/oma-darwin-x64
+          BUILT_VER="$(./release-assets/oma-linux-x64 --version)"
+          echo "Built binary version: $BUILT_VER"
+          if [[ "$BUILT_VER" != "oma ${RELEASE_TAG#v} "* ]]; then
+            echo "Built binary version does not match release tag $RELEASE_TAG: $BUILT_VER" >&2
+            exit 1
+          fi
           (cd release-assets && sha256sum oma-* > SHA256SUMS.txt)
+          for asset in oma-windows-x64.exe oma-linux-x64 oma-linux-arm64 oma-darwin-arm64 oma-darwin-x64; do
+            grep -qE "^[0-9a-f]{64}  ${asset}$" release-assets/SHA256SUMS.txt
+          done
           ls -lh release-assets
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber
-          else
-            gh release create "$RELEASE_TAG" release-assets/* \
-              --title "Oh My Agy $RELEASE_TAG" \
-              --generate-notes
+          BUILT_COMMIT="$(git rev-parse HEAD)"
+          REMOTE_DEREF="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk '{print $1}')"
+          REMOTE_TAG="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk '{print $1}')"
+          REMOTE_COMMIT="${REMOTE_DEREF:-$REMOTE_TAG}"
+          if [ -z "$REMOTE_COMMIT" ] || [ "$REMOTE_COMMIT" != "$BUILT_COMMIT" ]; then
+            echo "Remote tag $RELEASE_TAG ($REMOTE_COMMIT) no longer matches built commit ($BUILT_COMMIT); aborting." >&2
+            exit 1
           fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite published release assets." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag \
+            --target "$BUILT_COMMIT" \
+            --title "Oh My Agy $RELEASE_TAG" \
+            --generate-notes
