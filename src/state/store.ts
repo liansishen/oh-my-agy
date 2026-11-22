@@ -32,6 +32,7 @@ import type {
 } from '../acp/protocol';
 import type { SettingsPageId } from '../commands/handlers';
 import { CommandRegistry, fuzzyMatchText, type SlashCommandDef } from '../commands/registry';
+import type { ToolDisplayMode } from '../config/config';
 import { DraftEngine, type DraftEngineOptions } from '../editor/draft';
 import { InputHistory, type InputHistoryOptions } from '../editor/history';
 import {
@@ -460,6 +461,8 @@ export interface AppState {
   readonly beeMemberBlobs?: Readonly<Record<string, BeeMemberBlobPair>>;
   readonly showThinking: boolean;
   readonly expandAllTools: boolean;
+  readonly toolDisplayMode: ToolDisplayMode;
+  readonly expandedToolGroups: Readonly<Record<string, boolean>>;
   readonly promptCapabilities: Readonly<PromptCapabilities>;
   readonly configOptions: readonly ConfigOption[];
   readonly models?: SessionModelState;
@@ -494,6 +497,7 @@ export interface AppStoreOptions {
   readonly welcomeLogoBlobId?: string;
   readonly showThinking?: boolean;
   readonly expandAllTools?: boolean;
+  readonly toolDisplayMode?: ToolDisplayMode;
   readonly draft?: DraftEngineOptions;
   readonly history?: InputHistoryOptions;
   readonly traffic?: TrafficBufferOptions;
@@ -601,6 +605,8 @@ export class AppStore {
   private _beeMemberBlobs: Readonly<Record<string, BeeMemberBlobPair>> | undefined;
   private _showThinking: boolean;
   private _expandAllTools: boolean;
+  private _toolDisplayMode: ToolDisplayMode;
+  private _expandedToolGroups: Record<string, boolean> = {};
   private _promptCapabilities: PromptCapabilities = {};
 
   private _configOptions: ConfigOption[] = [];
@@ -638,6 +644,7 @@ export class AppStore {
     this._welcomeLogoBlobId = options.welcomeLogoBlobId;
     this._showThinking = options.showThinking ?? true;
     this._expandAllTools = options.expandAllTools ?? false;
+    this._toolDisplayMode = options.toolDisplayMode ?? 'all';
 
     this.draft = new DraftEngine({
       now: this._now,
@@ -751,6 +758,39 @@ export class AppStore {
     this.transcript.setAllThoughtsOpen(next && this._showThinking);
     this.emit();
     return next;
+  }
+
+  setToolDisplayMode(mode: ToolDisplayMode): void {
+    if (this._toolDisplayMode === mode) return;
+    this._toolDisplayMode = mode;
+    this.emit();
+  }
+
+  cycleToolDisplayMode(): ToolDisplayMode {
+    const order: readonly ToolDisplayMode[] = ['all', 'compact', 'hidden'];
+    const idx = order.indexOf(this._toolDisplayMode);
+    const next = order[(idx + 1) % order.length] ?? 'all';
+    this._toolDisplayMode = next;
+    this.emit();
+    return next;
+  }
+
+  toggleToolGroup(groupId: string, expanded?: boolean): boolean {
+    const cur = Boolean(this._expandedToolGroups[groupId]);
+    const next = expanded !== undefined ? expanded : !cur;
+    if (cur === next) return next;
+    this._expandedToolGroups = {
+      ...this._expandedToolGroups,
+      [groupId]: next,
+    };
+    this.emit();
+    return next;
+  }
+
+  clearExpandedToolGroups(): void {
+    if (Object.keys(this._expandedToolGroups).length === 0) return;
+    this._expandedToolGroups = {};
+    this.emit();
   }
 
   setTier(tier: TierInfo | undefined): void {
@@ -970,6 +1010,8 @@ export class AppStore {
       ...(this._beeMemberBlobs ? { beeMemberBlobs: this._beeMemberBlobs } : {}),
       showThinking: this._showThinking,
       expandAllTools: this._expandAllTools,
+      toolDisplayMode: this._toolDisplayMode,
+      expandedToolGroups: this._expandedToolGroups,
       promptCapabilities: this._promptCapabilities,
       configOptions: this._configOptions,
       ...(this._models ? { models: this._models } : {}),

@@ -3,8 +3,11 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 
+export type ToolDisplayMode = 'all' | 'compact' | 'hidden';
+
 export interface OmaUiConfig {
   readonly auto_collapse_thought: boolean;
+  readonly tool_display: ToolDisplayMode;
   readonly tool_preview_lines: number;
   readonly osc_7501: boolean;
   readonly reopen_anchor: boolean;
@@ -34,6 +37,7 @@ export const DEFAULT_CONFIG: OmaConfig = Object.freeze({
   recent_models: Object.freeze([]) as unknown as string[],
   ui: Object.freeze({
     auto_collapse_thought: true,
+    tool_display: 'all' as ToolDisplayMode,
     tool_preview_lines: 8,
     osc_7501: true,
     reopen_anchor: true,
@@ -76,10 +80,21 @@ const KNOWN_TOP_KEYS = new Set([
 
 const KNOWN_UI_KEYS = new Set([
   'auto_collapse_thought',
+  'tool_display',
   'tool_preview_lines',
   'osc_7501',
   'reopen_anchor',
 ]);
+
+const KNOWN_TOOL_DISPLAY_MODES = new Set<ToolDisplayMode>(['all', 'compact', 'hidden']);
+
+export function normalizeToolDisplayMode(value: unknown): ToolDisplayMode {
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase() as ToolDisplayMode;
+    if (KNOWN_TOOL_DISPLAY_MODES.has(lower)) return lower;
+  }
+  return DEFAULT_CONFIG.ui.tool_display;
+}
 
 const KNOWN_APPROVAL_KEYS = new Set(['auto_allow_tools']);
 
@@ -342,6 +357,22 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
     }
   }
 
+  const rawToolDisplay = readStringField(
+    uiTable,
+    'tool_display',
+    DEFAULT_CONFIG.ui.tool_display,
+    warnings,
+    'ui.',
+  );
+  const tool_display = KNOWN_TOOL_DISPLAY_MODES.has(rawToolDisplay as ToolDisplayMode)
+    ? (rawToolDisplay as ToolDisplayMode)
+    : (() => {
+        warnings.push(
+          `ui.tool_display: unrecognized value "${rawToolDisplay}" (expected all|compact|hidden), using "${DEFAULT_CONFIG.ui.tool_display}"`,
+        );
+        return DEFAULT_CONFIG.ui.tool_display;
+      })();
+
   const config: OmaConfig = {
     agy_bin,
     default_model,
@@ -356,6 +387,7 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
         warnings,
         'ui.',
       ),
+      tool_display,
       tool_preview_lines: readPreviewLinesField(
         uiTable,
         'tool_preview_lines',
@@ -493,6 +525,7 @@ function normalizeConfigForSave(config: OmaConfig): OmaConfig {
     recent_models: normalizeRecentModels(config.recent_models, MAX_RECENT_MODELS),
     ui: {
       auto_collapse_thought: Boolean(config.ui.auto_collapse_thought),
+      tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: clampedLines,
       osc_7501: Boolean(config.ui.osc_7501),
       reopen_anchor: Boolean(config.ui.reopen_anchor),
@@ -520,6 +553,7 @@ export function formatConfigToml(config: OmaConfig): string {
     '',
     '[ui]',
     `auto_collapse_thought = ${String(norm.ui.auto_collapse_thought)}`,
+    `tool_display = ${formatTomlString(norm.ui.tool_display)}`,
     `tool_preview_lines = ${norm.ui.tool_preview_lines}`,
     `osc_7501 = ${String(norm.ui.osc_7501)}`,
     `reopen_anchor = ${String(norm.ui.reopen_anchor)}`,

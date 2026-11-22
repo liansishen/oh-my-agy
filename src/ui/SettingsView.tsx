@@ -217,6 +217,23 @@ function buildPageSections(
         },
       },
       {
+        id: 'ui.tool_display',
+        label: 'Tool Call Display',
+        hint: 'Show all routine tools, group into a collapsible summary, or hide completed runs (Alt+O)',
+        changed: config.ui.tool_display !== DEFAULT_CONFIG.ui.tool_display,
+        defaultLabel: 'All',
+        control: {
+          k: 'choice',
+          value: state.toolDisplayMode,
+          options: [
+            { value: 'all', label: 'All' },
+            { value: 'compact', label: 'Compact' },
+            { value: 'hidden', label: 'Hidden' },
+          ],
+          style: 'segmented',
+        },
+      },
+      {
         id: 'ui.tool_preview_lines',
         label: 'Tool Output Preview Lines',
         hint: 'Maximum preview lines shown before expanding tool outputs (1–200)',

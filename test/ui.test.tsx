@@ -3431,20 +3431,26 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
-        sessionUpdate: 'tool_call_update',
-        toolCallId: 'tc-wf-live',
-        status: 'completed',
-        rawOutput: { output: '0 lint issues' },
+        sessionId: 'sess-hud-jobs',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-wf-live',
+          status: 'completed',
+          rawOutput: { output: '0 lint issues' },
+        },
       },
     });
     acp.send({
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
-        sessionUpdate: 'tool_call_update',
-        toolCallId: 'tc-sub-live',
-        status: 'completed',
-        rawOutput: { output: 'HUD verified' },
+        sessionId: 'sess-hud-jobs',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-sub-live',
+          status: 'completed',
+          rawOutput: { output: 'HUD verified' },
+        },
       },
     });
     acp.send({ jsonrpc: '2.0', id: activePromptId, result: { stopReason: 'end_turn' } });
@@ -3886,7 +3892,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => cancelCount >= 1);
 
     // When all swarm workers transition to `waiting` + post `[done]` (and workers retired leaving 2 active members):
-    // - OSC 7501 `state=done` is emitted automatically
+    // - Swarm workers finishing on their own MUST NOT emit a spurious OSC 7501 `state=done`
+    //   before the coordinator emits a user-facing reply (avoids false finish notifications on
+    //   worker pauses, subtask handoffs, or monitor checks!)
     // - bottom button switches back to Send!
     // - because session is STILL in swarm mode (`hasSwarm`), perimeter bee animation STAYS visible with 2 idle bees!
     writeFileSync(
@@ -3908,6 +3916,21 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
 
     await waitFor(() => controller.store.isSwarmWorking === false);
+    await Bun.sleep(60);
+    expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
+
+    // Once the coordinator actually posts its user-facing final reply via ACP, OSC 7501 `state=done` fires cleanly
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'All swarm tasks finished and verified!' },
+        },
+      },
+    });
     await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
 
     current = replayCurrentWireNodes();
@@ -4438,7 +4461,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await Bun.sleep(140);
     expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
 
-    // Now coordinator finishes (transitions to waiting) -> quiet grace period expires -> state=done fires
+    // Now coordinator transitions to waiting WITHOUT having sent any user-facing reply ->
+    // MUST NOT emit spurious state=done (e.g. worker pause / monitor wake-sleep cycle)
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4450,9 +4474,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }),
       'utf8'
     );
-    await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
+    await waitFor(
+      () => controller.store.getState().swarmSnapshot?.memberByName['coordinator']?.status === 'waiting'
+    );
+    await Bun.sleep(140);
+    expect(host.osc7501.slice(oscLenBeforeSwarm)).not.toContain('state=done');
 
-    // --- Case 3: Late agent_message_chunk arriving during quiet grace period resets debounce & renders BEFORE state=done ---
+    // --- Case 3: Coordinator emits user-facing summary via ACP after workers finish -> renders BEFORE state=done ---
     const oscLenBeforeLate = host.osc7501.length;
     writeFileSync(
       join(swarmDir, 'members.json'),
@@ -4467,7 +4495,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     await waitFor(() => controller.store.isSwarmWorking === true);
 
-    // All members go waiting -> enters 80ms quiet grace window
+    // All members go waiting (worker finished its subtask) -> still NO premature state=done!
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4481,9 +4509,11 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     await waitFor(() => controller.store.isSwarmWorking === false);
 
-    // 40ms into the 80ms grace window, inject a late coordinator summary chunk via ACP
-    await Bun.sleep(40);
+    // Wait longer than backgroundDoneGraceMs -> still NO state=done until coordinator actually replies
+    await Bun.sleep(120);
     expect(host.osc7501.slice(oscLenBeforeLate)).not.toContain('state=done');
+
+    // Coordinator wakes up and emits user-facing summary via ACP -> debounce waits then fires state=done STRICTLY AFTER render
     const streamBeforeLateChunk = host.rawStream.length;
     acp.send({
       jsonrpc: '2.0',
@@ -4497,8 +4527,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       },
     });
 
-    // Another 50ms later (90ms since worker finished, only 50ms since chunk), debounce reset must still hold off state=done
-    await Bun.sleep(50);
+    await Bun.sleep(40);
     expect(host.osc7501.slice(oscLenBeforeLate)).not.toContain('state=done');
 
     // Once quiet window after chunk completes, state=done fires STRICTLY AFTER the late summary is rendered
@@ -4911,7 +4940,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         q2_other: 'homebrew',
       },
     });
-    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !controller.store.getState().isBusy);
 
     // 3. Round 2: Single-select answered via Other write-in writes ONLY `q1_other` (never invalid enum value in `q1`)
     void controller.submitInput('ask single question with other');
@@ -4929,6 +4958,737 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     });
     await waitFor(() => !controller.store.getState().isStreaming);
     expect(controller.currentSurfaceFocus).toBe(EDITOR_NODE_ID);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('Tool Call Display modes (all / compact / hidden) via Alt+O & /settings: groups routine tools, hides completed tools while keeping running & ask tools visible, and persists to config.toml', async () => {
+    const tmp = makeTempDir();
+    const configPath = join(tmp, 'config.toml');
+    const host = new FakeTernHost({
+      features: ['blobs', 'styles', 'settle', 'dock', 'scroll', 'font', 'aside'],
+    });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let turnCounter = 0;
+    const releaseRunningTurn = Promise.withResolvers<void>();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-tool-display', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        turnCounter += 1;
+        if (turnCounter === 1) {
+          // Turn 1: 3 completed routine tools (2 bash + 1 read) + final answer
+          const tools = [
+            { id: 'tc-bash-1', name: 'run_command', kind: 'execute', title: 'python -c "print(1)"' },
+            { id: 'tc-bash-2', name: 'run_command', kind: 'execute', title: 'python -c "print(2)"' },
+            { id: 'tc-read-1', name: 'read_file', kind: 'read', title: 'README.md' },
+          ];
+          for (const t of tools) {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: t.id,
+                  name: t.name,
+                  kind: t.kind,
+                  title: t.title,
+                  status: 'in_progress',
+                },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: t.id,
+                  status: 'completed',
+                  rawOutput: { output: 'ok', exit_code: 0 },
+                },
+              },
+            });
+          }
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-tool-display',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'All checks finished.' },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else {
+          // Turn 2: an actively running bash tool to verify `hidden` keeps running tools visible
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-tool-display',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-live-bash',
+                name: 'run_command',
+                kind: 'execute',
+                title: 'sleep 10',
+                status: 'in_progress',
+              },
+            },
+          });
+          void releaseRunningTurn.promise.then(() => {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-live-bash',
+                  status: 'completed',
+                  rawOutput: { output: 'done', exit_code: 0 },
+                },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-tool-display',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Second turn done.' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      configPath,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: join(tmp, 'brain'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (node: WireNode): void => {
+        nodes.set(node.id, { k: node.k, p: { ...(node.p ?? {}) } });
+        if (Array.isArray(node.c)) {
+          for (const child of node.c) addSubtree(child);
+        }
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const hasNodeSuffix = (
+      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
+      suffix: string
+    ): boolean => {
+      for (const key of nodes.keys()) {
+        if (key === suffix || key.endsWith(`.${suffix}`)) return true;
+      }
+      return false;
+    };
+
+    // 1. Default mode = 'all': all 3 routine tools render individually (no folded-tools group)
+    await controller.submitInput('run checks');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => {
+      const n = replayNodes();
+      return (
+        hasNodeSuffix(n, 'tc-bash-1') &&
+        hasNodeSuffix(n, 'tc-bash-2') &&
+        hasNodeSuffix(n, 'tc-read-1') &&
+        !n.has('main.turn-0.folded-tc-bash-1')
+      );
+    });
+
+    // 2. Press Alt+O (`\x1bo`) -> switches to 'compact': merges 3 routine tools into a single collapsible `oma.tool.group`
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'compact');
+    await waitFor(() => replayNodes().has('main.turn-0.folded-tc-bash-1'));
+    const foldedGroup = replayNodes().get('main.turn-0.folded-tc-bash-1');
+    expect(foldedGroup?.p['role']).toBe('oma.tool.group');
+    expect(foldedGroup?.p['collapsed']).toBe(true);
+    const groupLabel = replayNodes().get('main.turn-0.folded-tc-bash-1.head.lbl');
+    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('3 tool calls');
+    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('2 Bash');
+    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('1 Read');
+
+    // Toggle the folded group open via Tern toggle event
+    host.input.emitTspEvent({
+      ev: 'toggle',
+      sf: 'oma',
+      id: 'main.turn-0.folded-tc-bash-1',
+      collapsed: false,
+    });
+    await waitFor(() => replayNodes().get('main.turn-0.folded-tc-bash-1')?.p['collapsed'] === false);
+
+    // 3. Press Alt+O again -> switches to 'hidden': hides completed routine tools AND persists `tool_display = "hidden"` to config.toml
+    host.input.emit('\x1bo');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'hidden');
+    await waitFor(() => {
+      const n = replayNodes();
+      return (
+        !n.has('main.turn-0.folded-tc-bash-1') &&
+        !hasNodeSuffix(n, 'tc-bash-1') &&
+        !hasNodeSuffix(n, 'tc-read-1')
+      );
+    });
+    await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('tool_display = "hidden"'));
+    const parsedSaved = parseConfigToml(readFileSync(configPath, 'utf8'));
+    expect(parsedSaved.warnings).toEqual([]);
+    expect(parsedSaved.config.ui.tool_display).toBe('hidden');
+
+    // 4. In 'hidden' mode, actively running tools stay visible while streaming, then hide once completed
+    void controller.submitInput('run live command');
+    await waitFor(() => hasNodeSuffix(replayNodes(), 'tc-live-bash'));
+    releaseRunningTurn.resolve();
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !hasNodeSuffix(replayNodes(), 'tc-live-bash'));
+
+    // 5. `/settings` `ui.tool_display` choice switches back to 'all' and restores individual tool rows
+    await controller.submitInput('/settings');
+    await waitFor(() => controller.store.getState().settings !== null);
+    host.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.tool_display',
+      value: 'all',
+    });
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'all');
+    await waitFor(() => hasNodeSuffix(replayNodes(), 'tc-bash-1'));
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('regression: resumed thoughts omit fake 0ms, pre-tool text finalizes immediately (stream=false), and in-flight background tool at end_turn defers OSC done until tool_call_update + final reply', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 500_000;
+    const resumeSessionId = 'sess-resume-bg-regression';
+    const releaseToolFinish = Promise.withResolvers<void>();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        // Replay a historical turn instantaneously (0ms wall-clock gap)
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Historical prompt' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Historical reasoning' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-hist-bash',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'completed',
+              title: 'echo hist',
+              args: { CommandLine: 'echo hist' },
+              content: [
+                {
+                  type: 'content',
+                  content: {
+                    type: 'text',
+                    text: 'Created At: 2026-11-22T12:41:22+08:00\nCompleted At: 2026-11-22T12:41:25+08:00\nCommand exited with code 0.\n\nhist',
+                  },
+                },
+              ],
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-hist-read',
+              name: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              title: 'README.md',
+              args: { Path: 'README.md' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Historical done.' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: resumeSessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        // Real agy acp pattern: text before tool -> in_progress run_command -> status msg -> end_turn while tool still running -> later completed + final reply
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Starting migration now...' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-bg-migrate',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'in_progress',
+              title: 'python migrate.py',
+              args: { CommandLine: 'python migrate.py', WaitMsBeforeAsync: 500 },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: resumeSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Migrating in background, waiting for completion.' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { stopReason: 'end_turn', usage: { inputTokens: 1000, outputTokens: 120 } },
+        });
+
+        void releaseToolFinish.promise.then(() => {
+          clock += 2000;
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: resumeSessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-bg-migrate',
+                name: 'run_command',
+                status: 'completed',
+                rawOutput: { output: 'Command exited with code 0.\n\nOK', exit_code: 0 },
+              },
+            },
+          });
+          setTimeout(() => {
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: resumeSessionId,
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\n\nMigration finished cleanly!' } },
+              },
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: resumeSessionId,
+                update: { sessionUpdate: 'usage_update', used: 2000, size: 1048576 },
+              },
+            });
+          }, 25);
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', resumeSessionId]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      backgroundDoneGraceMs: 60,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Resumed session: thought renders as plain 'Thought' (NO 'Thought for 0ms' and NO took=0)
+    const nodesAfterResume = replayNodes();
+    const replayedThought = [...nodesAfterResume.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(replayedThought).toBeDefined();
+    expect(JSON.stringify(replayedThought?.p['head'])).toContain('Thought');
+    expect(JSON.stringify(replayedThought?.p['head'])).not.toContain('0ms');
+    expect(replayedThought?.p['took']).toBeUndefined();
+
+    // Resumed bash tool with Created At/Completed At recovers real 3000ms duration; read tool without timestamps has undefined took
+    const histBash = [...nodesAfterResume.entries()].find(
+      ([id, n]) => n.k === 'tool' && id.endsWith('.tc-hist-bash')
+    )?.[1];
+    const histRead = [...nodesAfterResume.entries()].find(
+      ([id, n]) => n.k === 'tool' && id.endsWith('.tc-hist-read')
+    )?.[1];
+    expect(histBash?.p['took']).toBe(3000);
+    expect(histRead?.p['took']).toBeUndefined();
+
+    // Resumed turn footer must NOT display fake '0ms'
+    const turn0Usage = [...nodesAfterResume.entries()].find(
+      ([id]) => id.startsWith('main.turn-0.') && id.endsWith('.turn-usage.text')
+    )?.[1];
+    expect(String(turn0Usage?.p['text'] ?? '')).toBe('2 tools');
+
+    // 2. Live prompt with in-flight background tool at end_turn:
+    const oscLenBefore = host.osc7501.length;
+    await controller.submitInput('Migrate now');
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // Pre-tool text segment MUST already have stream=false (not held in streaming buffer while tool runs)
+    const nodesWhileRunning = replayNodes();
+    const preToolMd = [...nodesWhileRunning.values()].find(
+      n => n.k === 'md' && n.p['text'] === 'Starting migration now...'
+    );
+    expect(preToolMd).toBeDefined();
+    expect(preToolMd?.p['stream']).toBe(false);
+
+    // Tool MUST stay running, turn-1 MUST NOT settle prematurely, and OSC 7501 state=done MUST NOT fire!
+    const bgTool = controller.store.transcript.getToolById('tc-bg-migrate');
+    expect(bgTool?.status).toBe('running');
+    expect(bgTool?.endedAt).toBeUndefined();
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    await Bun.sleep(100);
+    expect(host.osc7501.slice(oscLenBefore)).not.toContain('state=done');
+    expect(host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-1')).toBe(false);
+
+    // 3. Complete background tool + deliver post-tool final reply -> appended to SAME turn-1, settled, THEN state=done fires!
+    releaseToolFinish.resolve();
+    await waitFor(() => host.osc7501.slice(oscLenBefore).includes('state=done'));
+
+    expect(controller.store.transcript.turns).toHaveLength(2);
+    expect(controller.store.transcript.turns[1]?.assistantText).toContain('Migration finished cleanly!');
+    expect(controller.store.transcript.getToolById('tc-bg-migrate')?.status).toBe('done');
+    expect(host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-1')).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('session/load drains trailing async replay updates emitted after RPC response without splitting turns, losing footer, or misplacing edits', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const resumeSessionId = 'sess-trailing-replay-1';
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = String((msg.params as { sessionId?: string })?.sessionId ?? resumeSessionId);
+        // Batch 1 arrives BEFORE session/load RPC response
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'First historical question' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'First historical answer.' },
+            },
+          },
+        });
+
+        // Resolve session/load EARLY while trailing historical updates are still in flight (real agy acp behavior)
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid },
+        });
+
+        // Batch 2 arrives AFTER session/load RPC response in staggered async chunks
+        setTimeout(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: 'Second historical question' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'Trailing replay thought' },
+              },
+            },
+          });
+        }, 15);
+
+        setTimeout(() => {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-trailing-edit',
+                name: 'edit_file',
+                kind: 'edit',
+                title: 'File /work/src/app/controller.ts',
+                status: 'completed',
+                locations: [{ path: '/work/src/app/controller.ts' }],
+                content: [
+                  {
+                    type: 'diff',
+                    path: '/work/src/app/controller.ts',
+                    oldText: 'line1\nline2\n',
+                    newText: 'line1\nline2\nline3\n',
+                  },
+                ],
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-trailing-bash',
+                name: 'run_command',
+                kind: 'execute',
+                title: 'bun test',
+                status: 'completed',
+                rawOutput: { output: '162 pass', exit_code: 0 },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Final trailing historical summary.' },
+              },
+            },
+          });
+        }, 35);
+      } else if (msg.method === 'session/close') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        server.crash(0);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', resumeSessionId]),
+      config: {
+        ...DEFAULT_CONFIG,
+        ui: { ...DEFAULT_CONFIG.ui, tool_display: 'compact' },
+      },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      replayDrainQuietMs: 60,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Both turns must be cleanly separated, marked replayed & finalized as done (not merged into a streaming turn!)
+    const turns = controller.store.transcript.turns;
+    expect(turns).toHaveLength(2);
+    expect(turns[0]?.user?.text).toBe('First historical question');
+    expect(turns[0]?.status).toBe('done');
+    expect(turns[0]?.replayed).toBe(true);
+
+    expect(turns[1]?.user?.text).toBe('Second historical question');
+    expect(turns[1]?.status).toBe('done');
+    expect(turns[1]?.replayed).toBe(true);
+    expect(turns[1]?.thoughts[0]?.replayed).toBe(true);
+    expect(turns[1]?.thoughts[0]?.tookMs).toBeUndefined();
+    expect(turns[1]?.toolCalls.map(t => t.toolCallId)).toEqual([
+      'tc-trailing-edit',
+      'tc-trailing-bash',
+    ]);
+    expect(turns[1]?.assistantText).toBe('Final trailing historical summary.');
+
+    // 2. Trailing replay must NOT trigger live TPS or spurious OSC 7501 state=done
+    expect(controller.store.getState().sessionMetrics?.isStreamingTps ?? false).toBe(false);
+    expect(host.osc7501).not.toContain('state=done');
+
+    // 3. In compact mode, edit + bash fold together BEFORE the final assistant reply, and the reply keeps its footer
+    const lastTurnIdx = turns[1]!.index;
+    const turnNodeOps = host.allOps.filter(
+      op => op[0] === 'add' && op[1] === `main.turn-${lastTurnIdx}`
+    );
+    expect(turnNodeOps.length).toBeGreaterThan(0);
+    const turnWire = turnNodeOps[turnNodeOps.length - 1]![4] as WireNode;
+    const childIds = (turnWire.c ?? []).map(c => c.id);
+    const foldedIdx = childIds.findIndex(id => id.includes('folded-tc-trailing-edit'));
+    const finalReplyIdx = childIds.findIndex(id => id.includes('.assistant-msg-'));
+    expect(foldedIdx).toBeGreaterThanOrEqual(0);
+    expect(finalReplyIdx).toBeGreaterThan(foldedIdx);
+    // No orphan edit tool after the final assistant reply
+    expect(childIds.slice(finalReplyIdx + 1).some(id => id.includes('tc-trailing-edit'))).toBe(
+      false
+    );
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

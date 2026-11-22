@@ -1,5 +1,6 @@
 import { node, type EditEvent, type JSX, type SpanData } from '@stencil-hq/tern';
 import { toFileUri } from '../acp/path';
+import type { ToolDisplayMode } from '../config/config';
 import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
@@ -19,6 +20,7 @@ import {
 export interface TranscriptCallbacks {
   readonly onToggleThought: (thoughtId: string, open: boolean) => void;
   readonly onToggleTool: (toolCallId: string, collapsed: boolean) => void;
+  readonly onToggleToolGroup?: (groupId: string, expanded: boolean) => void;
   readonly onToggleNotice: (noticeId: string, collapsed: boolean) => void;
   readonly onToggleAgent: (agentId: string, collapsed: boolean) => void;
   readonly onApproveTool: (toolCallId: string, action: ApprovalAction) => void;
@@ -68,7 +70,7 @@ function formatShortDuration(ms: number): string {
 
 function formatTurnUsageLabel(turn: TranscriptTurn): string {
   const parts: string[] = [];
-  if (turn.endedAt !== undefined) {
+  if (!turn.replayed && turn.endedAt !== undefined) {
     parts.push(formatShortDuration(Math.max(0, turn.endedAt - turn.startedAt)));
   }
   const toolCount = turn.toolCalls.length;
@@ -78,51 +80,80 @@ function formatTurnUsageLabel(turn: TranscriptTurn): string {
   return parts.length > 0 ? parts.join(' · ') : 'done';
 }
 
+const formattedDiffCache = new WeakMap<ToolDiffItem, string>();
+const diffLineStatsCache = new WeakMap<
+  ToolDiffItem,
+  { readonly added: number; readonly removed: number }
+>();
+
 function formatUnifiedDiff(diff: ToolDiffItem): string {
+  const cached = formattedDiffCache.get(diff);
+  if (cached !== undefined) return cached;
+
+  let result: string;
   if (diff.patchText && diff.patchText.trim().length > 0) {
-    return diff.patchText;
-  }
-  const oldLines = diff.oldText ? diff.oldText.split(/\r?\n/) : [];
-  const newLines = diff.newText ? diff.newText.split(/\r?\n/) : [];
+    result = diff.patchText;
+  } else {
+    const oldLines = diff.oldText ? diff.oldText.split(/\r?\n/) : [];
+    const newLines = diff.newText ? diff.newText.split(/\r?\n/) : [];
 
-  const header = [
-    `--- a/${diff.path}`,
-    `+++ b/${diff.path}`,
-    `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
-  ];
+    const header = [
+      `--- a/${diff.path}`,
+      `+++ b/${diff.path}`,
+      `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
+    ];
 
-  let prefix = 0;
-  const maxPrefix = Math.min(oldLines.length, newLines.length);
-  while (prefix < maxPrefix && oldLines[prefix] === newLines[prefix]) {
-    prefix++;
+    let prefix = 0;
+    const maxPrefix = Math.min(oldLines.length, newLines.length);
+    while (prefix < maxPrefix && oldLines[prefix] === newLines[prefix]) {
+      prefix++;
+    }
+
+    let suffix = 0;
+    while (
+      suffix < oldLines.length - prefix &&
+      suffix < newLines.length - prefix &&
+      oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+    ) {
+      suffix++;
+    }
+
+    const body: string[] = [];
+    const ctxBefore = Math.max(0, prefix - 3);
+    for (let i = ctxBefore; i < prefix; i++) {
+      body.push(` ${oldLines[i] ?? ''}`);
+    }
+    for (let i = prefix; i < oldLines.length - suffix; i++) {
+      body.push(`-${oldLines[i] ?? ''}`);
+    }
+    for (let i = prefix; i < newLines.length - suffix; i++) {
+      body.push(`+${newLines[i] ?? ''}`);
+    }
+    const ctxAfterEnd = Math.min(oldLines.length, oldLines.length - suffix + 3);
+    for (let i = oldLines.length - suffix; i < ctxAfterEnd; i++) {
+      body.push(` ${oldLines[i] ?? ''}`);
+    }
+
+    result = [...header, ...body].join('\n');
   }
 
-  let suffix = 0;
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-  ) {
-    suffix++;
-  }
+  formattedDiffCache.set(diff, result);
+  return result;
+}
 
-  const body: string[] = [];
-  const ctxBefore = Math.max(0, prefix - 3);
-  for (let i = ctxBefore; i < prefix; i++) {
-    body.push(` ${oldLines[i] ?? ''}`);
+function getDiffLineStats(diff: ToolDiffItem): { readonly added: number; readonly removed: number } {
+  const cached = diffLineStatsCache.get(diff);
+  if (cached !== undefined) return cached;
+  let added = 0;
+  let removed = 0;
+  const patch = formatUnifiedDiff(diff);
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith('+') && !line.startsWith('+++')) added++;
+    else if (line.startsWith('-') && !line.startsWith('---')) removed++;
   }
-  for (let i = prefix; i < oldLines.length - suffix; i++) {
-    body.push(`-${oldLines[i] ?? ''}`);
-  }
-  for (let i = prefix; i < newLines.length - suffix; i++) {
-    body.push(`+${newLines[i] ?? ''}`);
-  }
-  const ctxAfterEnd = Math.min(oldLines.length, oldLines.length - suffix + 3);
-  for (let i = oldLines.length - suffix; i < ctxAfterEnd; i++) {
-    body.push(` ${oldLines[i] ?? ''}`);
-  }
-
-  return [...header, ...body].join('\n');
+  const stats = { added, removed };
+  diffLineStatsCache.set(diff, stats);
+  return stats;
 }
 
 function safeFormatInput(raw: unknown): string {
@@ -198,11 +229,9 @@ function computeToolMeta(tool: ToolCallItem): readonly (readonly SpanData[])[] |
     let added = 0;
     let removed = 0;
     for (const d of tool.diffs) {
-      const patch = formatUnifiedDiff(d);
-      for (const line of patch.split(/\r?\n/)) {
-        if (line.startsWith('+') && !line.startsWith('+++')) added++;
-        else if (line.startsWith('-') && !line.startsWith('---')) removed++;
-      }
+      const stats = getDiffLineStats(d);
+      added += stats.added;
+      removed += stats.removed;
     }
     const spans: SpanData[] = [];
     if (added > 0) spans.push({ t: `+${added}`, s: 'ins mono' });
@@ -267,7 +296,7 @@ function renderBashRunBody(
   const stoppedMs =
     tool.tookMs !== undefined
       ? tool.tookMs
-      : tool.endedAt !== undefined
+      : !tool.replayed && tool.endedAt !== undefined
         ? Math.max(0, tool.endedAt - tool.startedAt)
         : undefined;
   const stateLabel =
@@ -461,7 +490,7 @@ function renderToolItem(
     ? undefined
     : tool.tookMs !== undefined
       ? tool.tookMs
-      : tool.endedAt !== undefined
+      : !tool.replayed && tool.endedAt !== undefined
         ? Math.max(0, tool.endedAt - tool.startedAt)
         : undefined;
   const approvalHandlers = isAsk
@@ -719,14 +748,106 @@ function renderQuestionCard(
 type TimelineGroup =
   | { readonly kind: 'assistant'; readonly key: string; readonly refs: TurnTimelineRef[] }
   | { readonly kind: 'compact-tools'; readonly key: string; readonly tools: ToolCallItem[] }
+  | { readonly kind: 'folded-tools'; readonly key: string; readonly tools: ToolCallItem[] }
   | { readonly kind: 'tool'; readonly tool: ToolCallItem }
   | { readonly kind: 'notice'; readonly notice: NoticeItem };
 
-function groupTurnTimeline(turn: TranscriptTurn): TimelineGroup[] {
+function isRoutineCollapsibleTool(
+  tool: ToolCallItem,
+  relatedAgents: readonly SubagentEntry[],
+  turnStatus: TranscriptTurn['status'],
+): boolean {
+  if (relatedAgents.length > 0) return false;
+  if (tool.status === 'ask') return false;
+  if (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming') {
+    return false;
+  }
+  return true;
+}
+
+function formatToolGroupCategory(tool: ToolCallItem): string {
+  switch (tool.displayName) {
+    case 'bash':
+      return 'Bash';
+    case 'read':
+      return 'Read';
+    case 'edit':
+      return 'Edit';
+    case 'write':
+      return 'Write';
+    case 'find':
+      return 'Find';
+    case 'grep':
+      return 'Grep';
+    case 'web':
+      return 'Web';
+    default: {
+      const label = tool.rawName?.trim() || tool.displayName?.trim() || tool.title?.trim() || 'Tool';
+      return label.replace(/^Run\s+/i, '').trim() || 'Tool';
+    }
+  }
+}
+
+function summarizeFoldedTools(tools: readonly ToolCallItem[]): {
+  readonly summary: string;
+  readonly totalTookMs: number;
+  readonly errorCount: number;
+} {
+  const counts = new Map<string, number>();
+  let totalTookMs = 0;
+  let errorCount = 0;
+
+  for (const tool of tools) {
+    const cat = formatToolGroupCategory(tool);
+    counts.set(cat, (counts.get(cat) ?? 0) + 1);
+    const ms =
+      tool.tookMs !== undefined
+        ? tool.tookMs
+        : tool.endedAt !== undefined
+          ? Math.max(0, tool.endedAt - tool.startedAt)
+          : 0;
+    totalTookMs += ms;
+    if (tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)) {
+      errorCount += 1;
+    }
+  }
+
+  const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const topParts = ordered.slice(0, 4).map(([cat, n]) => `${n} ${cat}`);
+  if (ordered.length > 4) {
+    const rest = ordered.slice(4).reduce((sum, [, n]) => sum + n, 0);
+    topParts.push(`+${rest} more`);
+  }
+
+  return {
+    summary: `${tools.length} tool calls (${topParts.join(' · ')})`,
+    totalTookMs,
+    errorCount,
+  };
+}
+
+function groupTurnTimeline(
+  turn: TranscriptTurn,
+  options: { readonly showThinking: boolean; readonly toolDisplayMode: ToolDisplayMode } = {
+    showThinking: true,
+    toolDisplayMode: 'all',
+  },
+): TimelineGroup[] {
   const groups: TimelineGroup[] = [];
 
   for (const ref of turn.timeline) {
-    if (ref.kind === 'thought' || ref.kind === 'assistant') {
+    if (ref.kind === 'thought') {
+      if (!options.showThinking) continue;
+      const prev = groups[groups.length - 1];
+      if (prev && prev.kind === 'assistant') {
+        prev.refs.push(ref);
+      } else {
+        groups.push({ kind: 'assistant', key: `assistant-${ref.id}`, refs: [ref] });
+      }
+      continue;
+    }
+
+    if (ref.kind === 'assistant') {
       const prev = groups[groups.length - 1];
       if (prev && prev.kind === 'assistant') {
         prev.refs.push(ref);
@@ -740,6 +861,36 @@ function groupTurnTimeline(turn: TranscriptTurn): TimelineGroup[] {
       const tool = turn.toolCalls.find(t => t.toolCallId === ref.id);
       if (!tool) continue;
       const relatedAgents = turn.agents.filter(a => a.toolCallId === tool.toolCallId);
+      const isRoutine = isRoutineCollapsibleTool(tool, relatedAgents, turn.status);
+
+      if (options.toolDisplayMode === 'hidden' && isRoutine) {
+        continue;
+      }
+
+      if (options.toolDisplayMode === 'compact' && isRoutine) {
+        const prev = groups[groups.length - 1];
+        if (prev && prev.kind === 'folded-tools') {
+          prev.tools.push(tool);
+        } else if (
+          prev &&
+          prev.kind === 'tool' &&
+          isRoutineCollapsibleTool(
+            prev.tool,
+            turn.agents.filter(a => a.toolCallId === prev.tool.toolCallId),
+            turn.status,
+          )
+        ) {
+          groups[groups.length - 1] = {
+            kind: 'folded-tools',
+            key: `folded-${prev.tool.toolCallId}`,
+            tools: [prev.tool, tool],
+          };
+        } else {
+          groups.push({ kind: 'tool', tool });
+        }
+        continue;
+      }
+
       const isCompact =
         relatedAgents.length === 0 &&
         tool.status !== 'ask' &&
@@ -959,8 +1110,11 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
 
       {turns.map(turn => {
         const isLastTurn = lastTurn?.index === turn.index;
-        const lastAssistantId = turn.assistantSegments[turn.assistantSegments.length - 1]?.id;
-        const groups = groupTurnTimeline(turn);
+        const lastTimelineRef = turn.timeline[turn.timeline.length - 1];
+        const groups = groupTurnTimeline(turn, {
+          showThinking: state.showThinking,
+          toolDisplayMode: state.toolDisplayMode,
+        });
         const footerNodes = renderTurnFooterNodes(turn, callbacks);
 
         let lastAssistantGroupIdx = -1;
@@ -1072,11 +1226,13 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
                           ? Math.max(0, now - thought.startedAt)
                           : thought.tookMs !== undefined
                             ? thought.tookMs
-                            : thought.endedAt !== undefined
-                              ? Math.max(0, thought.endedAt - thought.startedAt)
-                              : turn.endedAt !== undefined
-                                ? Math.max(0, turn.endedAt - thought.startedAt)
-                                : undefined;
+                            : thought.replayed
+                              ? undefined
+                              : thought.endedAt !== undefined
+                                ? Math.max(0, thought.endedAt - thought.startedAt)
+                                : turn.endedAt !== undefined
+                                  ? Math.max(0, turn.endedAt - thought.startedAt)
+                                  : undefined;
                         const durText =
                           elapsedMs !== undefined ? formatShortDuration(elapsedMs) : undefined;
                         const effectiveOpen = thought.userToggled
@@ -1128,9 +1284,10 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
                       if (ref.kind === 'assistant') {
                         const seg = turn.assistantSegments.find(s => s.id === ref.id);
                         if (!seg) return null;
-                        const isLastSegment = seg.id === lastAssistantId;
+                        const isActiveTrailingAssistant =
+                          lastTimelineRef?.kind === 'assistant' && lastTimelineRef.id === seg.id;
                         const isStreamingSeg =
-                          turn.status === 'streaming' && isLastTurn && isLastSegment;
+                          turn.status === 'streaming' && isLastTurn && isActiveTrailingAssistant;
 
                         return (
                           <md
@@ -1147,6 +1304,64 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
                     })}
                     {isFinalAssistantGroup ? footerNodes : null}
                   </col>
+                );
+              }
+
+              if (group.kind === 'folded-tools') {
+                const groupId = `turn-${turn.index}:${group.key}`;
+                const expanded = Boolean(state.expandedToolGroups[groupId]);
+                const { summary, totalTookMs, errorCount } = summarizeFoldedTools(group.tools);
+                const durText = totalTookMs > 0 ? formatShortDuration(totalTookMs) : undefined;
+                return (
+                  <section
+                    key={group.key}
+                    role="oma.tool.group"
+                    collapsible
+                    collapsed={!expanded}
+                    took={totalTookMs > 0 ? totalTookMs : undefined}
+                    head={
+                      <row key="head" gap="xs" align="center">
+                        <icon key="ic" name="tools" tone={errorCount > 0 ? 'warning' : 'muted'} />
+                        <text
+                          key="lbl"
+                          spans={[
+                            { t: summary, s: 'muted' },
+                            ...(durText ? [{ t: ` · ${durText}`, s: 'dim mono' as const }] : []),
+                          ]}
+                          wrap="none"
+                          truncate="end"
+                        />
+                        {errorCount > 0 ? (
+                          <badge
+                            key="err"
+                            text={`${errorCount} ${errorCount === 1 ? 'error' : 'errors'}`}
+                            tone="error"
+                          />
+                        ) : null}
+                      </row>
+                    }
+                    onToggle={ev => {
+                      const nextExpanded =
+                        ev.collapsed !== undefined
+                          ? !ev.collapsed
+                          : (ev.open ?? !expanded);
+                      callbacks.onToggleToolGroup?.(groupId, nextExpanded);
+                    }}
+                  >
+                    <col key="items" gap="none">
+                      {group.tools.map(tool =>
+                        renderToolItem(
+                          tool,
+                          [],
+                          toolPreviewLines,
+                          state.expandAllTools,
+                          turn.status,
+                          now,
+                          callbacks
+                        )
+                      )}
+                    </col>
+                  </section>
                 );
               }
 

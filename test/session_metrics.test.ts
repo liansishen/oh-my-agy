@@ -444,6 +444,87 @@ describe('SessionMetricsTracker (transcript.jsonl incremental tailing)', () => {
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test('guards TPS against resumed history backfill, multi-step calibration reuse, implicit burst spikes, and tool wait distortion', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-tps-guard-'));
+    const sessionId = 'session-tps-guard';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+    await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+    try {
+      let clock = 50_000;
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, now: () => clock });
+      tracker.setSession(sessionId);
+
+      // 1. Historical multi-response transcript (50,000 output tokens) read from offset 0
+      //    AFTER a short turn ends must NOT produce a 50,000 / 1s = 50,000 tok/s spike!
+      const histLines = Array.from({ length: 25 }, (_, i) =>
+        JSON.stringify({
+          step_index: i,
+          type: 'PLANNER_RESPONSE',
+          input_tokens: 1000,
+          cache_read_tokens: 4000,
+          output_tokens: 2000,
+        }),
+      );
+      await writeFile(transcriptFile, `${histLines.join('\n')}\n`, 'utf8');
+
+      tracker.beginStreamTurn();
+      clock = 51_000;
+      tracker.recordStreamText('a'.repeat(160)); // 40 est tokens / 1s = 40 tok/s
+      tracker.endStreamTurn();
+      const afterBackfill = await tracker.syncFromTranscript();
+      expect(afterBackfill.totalOutputTokens).toBe(50_000);
+      expect(afterBackfill.currentTps).toBeCloseTo(40, 5);
+
+      // 2. One-shot post-turn calibration: once calibrated, subsequent appended responses
+      //    within 15s must NOT accumulate against the old turn's short duration!
+      clock = 60_000;
+      tracker.beginStreamTurn();
+      clock = 61_000;
+      tracker.recordStreamText('b'.repeat(120)); // 30 est tok/s
+      tracker.endStreamTurn();
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 50 })}\n`,
+        'utf8',
+      );
+      const cal1 = await tracker.syncFromTranscript();
+      expect(cal1.currentTps).toBeCloseTo(50, 5);
+
+      // Another 3000-token response arrives 2s later while idle -> must NOT overwrite 50 tok/s with 3050 tok/s!
+      clock = 63_000;
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 3000 })}\n`,
+        'utf8',
+      );
+      const afterSecondAppend = await tracker.syncFromTranscript();
+      expect(afterSecondAppend.currentTps).toBeCloseTo(50, 5);
+
+      // 3. Implicit background wakeup burst chunk (< 500ms) must NOT flash huge tok/s
+      clock = 70_000;
+      tracker.recordStreamText('中'.repeat(600)); // 400 est tokens at t=0
+      clock = 70_120;
+      const burstSnap = tracker.recordStreamText('中'.repeat(600)); // 800 tokens in 120ms = 6667 tok/s if unguarded!
+      expect(burstSnap.currentTps).toBeCloseTo(50, 5);
+      tracker.endStreamTurn();
+
+      // 4. Authoritative outputTokens + pauseForTools/resumeAfterTools excludes tool wait time
+      clock = 80_000;
+      tracker.beginStreamTurn();
+      clock = 81_000; // 1s generation
+      tracker.pauseForTools();
+      clock = 91_000; // 10s tool execution (must be excluded)
+      tracker.resumeAfterTools();
+      clock = 92_000; // +1s generation -> total active gen = 2.0s
+      const authEnded = tracker.endStreamTurn({ authoritativeOutputTokens: 160 });
+      expect(authEnded.currentTps).toBeCloseTo(80, 5); // 160 / 2.0s = 80 tok/s
+      expect(authEnded.isStreamingTps).toBe(false);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

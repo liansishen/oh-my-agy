@@ -80,6 +80,8 @@ export interface ThoughtBlock {
   endedAt?: number;
   /** Total elapsed reasoning duration in milliseconds (`endedAt - startedAt`). */
   tookMs?: number;
+  /** True when reconstructed during `session/load` replay where wall-clock duration is unknown. */
+  readonly replayed?: boolean;
   open: boolean;
   userToggled: boolean;
 }
@@ -115,6 +117,8 @@ export interface ToolCallItem {
   readonly startedAt: number;
   endedAt?: number;
   tookMs?: number;
+  /** True when reconstructed during `session/load` replay. */
+  readonly replayed?: boolean;
   collapsed: boolean;
   userToggled?: boolean;
   awaitingPermission: boolean;
@@ -238,6 +242,8 @@ export interface TranscriptTurn {
   /** Full epoch millisecond timestamp when this turn was created. */
   readonly createdAt: number;
   endedAt?: number;
+  /** True when reconstructed during `session/load` replay where original turn duration is unknown. */
+  readonly replayed?: boolean;
   /** Marked via `surface.settle('main.turn-<index>')`. */
   settled: boolean;
   /** Marked when Tern drops this node via `GoneEvent`. */
@@ -315,6 +321,8 @@ export interface DetachedBackgroundTask {
   status: BackgroundJobStatus;
   endedAt?: number;
   outputText: string;
+  /** True when created from an ACP tool call still `in_progress` at `end_turn` (settles on `tool_call_update`). */
+  readonly awaitingToolCompletion?: boolean;
 }
 
 export type ContextBreakdownCategory = 'user' | 'assistant' | 'thought' | 'tool';
@@ -539,6 +547,25 @@ function extractToolContentText(content: readonly ToolCallContent[] | undefined)
     }
   }
   return parts.join('\n');
+}
+
+const TOOL_TIMESTAMPS_RE =
+  /^Created At:\s*([^\r\n]+)\r?\nCompleted At:\s*([^\r\n]+)(?:\r?\n|$)/;
+
+/**
+ * Extract real wall-clock tool execution duration from `agy` tool output headers
+ * (`Created At: <ISO>\nCompleted At: <ISO>`), useful when replaying historical sessions.
+ */
+export function extractToolDurationFromOutput(outputText: string): number | undefined {
+  if (!outputText || !outputText.startsWith('Created At:')) return undefined;
+  const match = TOOL_TIMESTAMPS_RE.exec(outputText);
+  if (!match?.[1] || !match[2]) return undefined;
+  const createdMs = Date.parse(match[1].trim());
+  const completedMs = Date.parse(match[2].trim());
+  if (!Number.isFinite(createdMs) || !Number.isFinite(completedMs)) return undefined;
+  const delta = completedMs - createdMs;
+  if (delta < 0 || delta > 24 * 60 * 60 * 1000) return undefined;
+  return delta;
 }
 
 function mapToolStatusToAgentStatus(status: TspToolStatus): SubagentTspStatus {
@@ -1313,11 +1340,19 @@ export class TranscriptStore {
   /**
    * Start a new interactive user turn (called when the local user submits a prompt).
    */
-  beginUserTurn(text: string, attachments: readonly AttachmentItem[] = []): TranscriptTurn {
+  beginUserTurn(
+    text: string,
+    attachments: readonly AttachmentItem[] = [],
+    options: { readonly isReplaying?: boolean } = {},
+  ): TranscriptTurn {
     const now = this._now();
-    // Defensively close any lingering running thoughts from a previous active turn
+    // Defensively close any lingering running thoughts / deferred background turn
     if (this.activeTurn) {
       this.finalizeRunningThoughts(this.activeTurn, { now });
+      if (this.activeTurn.status === 'streaming') {
+        this.activeTurn.status = 'done';
+        this.activeTurn.endedAt = this.activeTurn.endedAt ?? now;
+      }
     }
     const index = this._turns.length;
     const turn: TranscriptTurn = {
@@ -1341,6 +1376,7 @@ export class TranscriptStore {
       status: 'streaming',
       startedAt: now,
       createdAt: now,
+      ...(options.isReplaying ? { replayed: true } : {}),
       settled: false,
       evicted: false,
     };
@@ -1368,6 +1404,12 @@ export class TranscriptStore {
 
   /**
    * Finalize the currently active turn (when `session/prompt` resolves or is cancelled).
+   *
+   * When `session/prompt` ends normally (`done`) while one or more ACP tool calls are
+   * still `in_progress`/`pending`/`ask` (e.g. a long-running background `run_command`
+   * whose `tool_call_update(completed)` arrives after `end_turn`), keep those tools
+   * running, register them as detached background tasks awaiting tool completion, and
+   * keep the turn open for seamless continuation until `finalizeBackgroundTurn()`.
    */
   finishActiveTurn(
     stopReason?: StopReason,
@@ -1376,20 +1418,25 @@ export class TranscriptStore {
     options: {
       readonly autoCollapseThought?: boolean;
       readonly expandAllTools?: boolean;
+      /**
+       * When `true` (used by live `AppController`), keep still-running async-capable
+       * tools (`run_command`, `invoke_subagent`, `schedule`, `run_workflow`) active
+       * across `end_turn` so OSC `done` waits for their real `tool_call_update`.
+       */
+      readonly preserveInFlightBackgroundTools?: boolean;
     } = {},
   ): TranscriptTurn | undefined {
     const turn = this.activeTurn;
     if (!turn) return undefined;
 
     const now = this._now();
-    turn.endedAt = now;
     if (stopReason !== undefined) {
       turn.stopReason = stopReason;
     }
     if (errorMessage !== undefined) {
       turn.errorMessage = errorMessage;
     }
-    turn.status =
+    const resolvedStatus =
       statusOverride ?? (stopReason === 'cancelled' ? 'cancelled' : 'done');
 
     // Finalize all running/unclosed thought blocks
@@ -1399,7 +1446,28 @@ export class TranscriptStore {
       now,
     });
 
-    // Finalize any remaining non-terminal tools & subagents so no timer keeps ticking after turn end
+    // If the turn ended normally while async-capable ACP tools (bash/subagent/schedule/workflow)
+    // are still actively running in the background, preserve their live running state & register
+    // them as tracked background tasks so OSC `done` and turn settlement wait for real completion.
+    if (options.preserveInFlightBackgroundTools && resolvedStatus === 'done' && !turn.replayed) {
+      const stillRunningTools = turn.toolCalls.filter(
+        (tool) =>
+          (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') &&
+          tool.endedAt === undefined &&
+          this.isAsyncBackgroundCapableTool(tool),
+      );
+      if (stillRunningTools.length > 0) {
+        for (const tool of stillRunningTools) {
+          this.registerInFlightToolAsBackgroundTask(turn.index, tool);
+        }
+        return turn;
+      }
+    }
+
+    turn.endedAt = now;
+    turn.status = resolvedStatus;
+
+    // Finalize any remaining non-terminal tools & subagents on cancelled/error/finished turns
     for (const tool of turn.toolCalls) {
       if (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') {
         tool.awaitingPermission = false;
@@ -1412,7 +1480,9 @@ export class TranscriptStore {
           tool.status = 'done';
         }
         tool.endedAt = tool.endedAt ?? now;
-        tool.tookMs = tool.tookMs ?? Math.max(0, tool.endedAt - tool.startedAt);
+        if (!tool.replayed) {
+          tool.tookMs = tool.tookMs ?? Math.max(0, tool.endedAt - tool.startedAt);
+        }
         this.syncSubagentsForTool(turn, tool);
       }
     }
@@ -1421,6 +1491,44 @@ export class TranscriptStore {
       this.cancelActiveBackgroundTasks('cancelled');
     }
 
+    this._activeTurnIndex = null;
+    return turn;
+  }
+
+  /**
+   * Finalize an active turn that stayed open waiting for background tool completion
+   * and post-completion assistant summary chunks.
+   */
+  finalizeBackgroundTurn(
+    options: {
+      readonly autoCollapseThought?: boolean;
+      readonly expandAllTools?: boolean;
+    } = {},
+  ): TranscriptTurn | undefined {
+    const turn = this.activeTurn;
+    if (!turn) return undefined;
+
+    const now = this._now();
+    this.finalizeRunningThoughts(turn, {
+      autoCollapseThought: options.autoCollapseThought ?? true,
+      expandAllTools: options.expandAllTools ?? false,
+      now,
+    });
+    for (const tool of turn.toolCalls) {
+      if (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') {
+        tool.awaitingPermission = false;
+        tool.status = 'done';
+        tool.endedAt = tool.endedAt ?? now;
+        if (!tool.replayed) {
+          tool.tookMs = tool.tookMs ?? Math.max(0, tool.endedAt - tool.startedAt);
+        }
+        this.syncSubagentsForTool(turn, tool);
+      }
+    }
+    if (turn.status === 'streaming') {
+      turn.status = 'done';
+      turn.endedAt = turn.endedAt ?? now;
+    }
     this._activeTurnIndex = null;
     return turn;
   }
@@ -1453,7 +1561,14 @@ export class TranscriptStore {
             tool.status = 'done';
           }
           tool.endedAt = tool.endedAt ?? now;
-          tool.tookMs = tool.tookMs ?? Math.max(0, tool.endedAt - tool.startedAt);
+          if (tool.tookMs === undefined) {
+            const parsedDur = extractToolDurationFromOutput(tool.outputText);
+            if (parsedDur !== undefined) {
+              tool.tookMs = parsedDur;
+            } else if (!tool.replayed) {
+              tool.tookMs = Math.max(0, tool.endedAt - tool.startedAt);
+            }
+          }
           this.syncSubagentsForTool(turn, tool);
         }
       }
@@ -1495,7 +1610,7 @@ export class TranscriptStore {
             if (current && current.status === 'streaming') {
               this.finishActiveTurn('end_turn', 'done');
             }
-            this.beginUserTurn(chunkText);
+            this.beginUserTurn(chunkText, [], { isReplaying: true });
           } else if (current.user) {
             current.user.text += chunkText;
           } else {
@@ -1532,7 +1647,7 @@ export class TranscriptStore {
       case 'agent_thought_chunk': {
         const chunkText = extractContentText(update.content);
         if (!chunkText) return { handled: true };
-        const turn = this.ensureActiveTurn();
+        const turn = this.ensureActiveTurn(isReplaying);
         const lastRef = turn.timeline[turn.timeline.length - 1];
         const lastThought =
           lastRef?.kind === 'thought'
@@ -1555,6 +1670,7 @@ export class TranscriptStore {
             text: chunkText,
             status: 'running',
             startedAt: this._now(),
+            ...(isReplaying ? { replayed: true } : {}),
             open: showThinking && (!isReplaying || expandAllTools),
             userToggled: false,
           };
@@ -1575,7 +1691,7 @@ export class TranscriptStore {
           }
           return { handled: true };
         }
-        const turn = this.ensureActiveTurn();
+        const turn = this.ensureActiveTurn(isReplaying);
 
         // Complete any running thoughts; auto-collapse when configured & not manually toggled
         this.finalizeRunningThoughts(turn, { autoCollapseThought, expandAllTools });
@@ -2421,7 +2537,7 @@ export class TranscriptStore {
   // Internal helpers
   // -------------------------------------------------------------------------
 
-  private ensureActiveTurn(): TranscriptTurn {
+  private ensureActiveTurn(isReplaying = false): TranscriptTurn {
     if (this._activeTurnIndex !== null) {
       const existing = this._turns[this._activeTurnIndex];
       if (existing) return existing;
@@ -2441,6 +2557,7 @@ export class TranscriptStore {
       status: 'streaming',
       startedAt: now,
       createdAt: now,
+      ...(isReplaying ? { replayed: true } : {}),
       settled: false,
       evicted: false,
     };
@@ -2474,7 +2591,9 @@ export class TranscriptStore {
         const end = thought.endedAt ?? now;
         thought.status = 'done';
         thought.endedAt = end;
-        thought.tookMs = thought.tookMs ?? Math.max(0, end - thought.startedAt);
+        if (!thought.replayed) {
+          thought.tookMs = thought.tookMs ?? Math.max(0, end - thought.startedAt);
+        }
         if (autoCollapseThought && !expandAllTools && !thought.userToggled) {
           thought.open = false;
         }
@@ -2584,7 +2703,14 @@ export class TranscriptStore {
         if (fields.status === 'completed' || fields.status === 'failed') {
           tool.awaitingPermission = false;
           tool.endedAt = now;
-          tool.tookMs = Math.max(0, now - tool.startedAt);
+          if (tool.replayed) {
+            const parsedDur = extractToolDurationFromOutput(tool.outputText);
+            if (parsedDur !== undefined) {
+              tool.tookMs = parsedDur;
+            }
+          } else {
+            tool.tookMs = Math.max(0, now - tool.startedAt);
+          }
         }
       }
 
@@ -2603,7 +2729,7 @@ export class TranscriptStore {
     }
 
     // Create a brand new ToolCallItem
-    const turn = this.ensureActiveTurn();
+    const turn = this.ensureActiveTurn(isReplaying);
     // A tool call always terminates any preceding running thought blocks in the turn
     this.finalizeRunningThoughts(turn, {
       autoCollapseThought,
@@ -2633,6 +2759,7 @@ export class TranscriptStore {
     );
 
     const finished = acpStatus === 'completed' || acpStatus === 'failed';
+    const parsedReplayDur = finished ? extractToolDurationFromOutput(outputText) : undefined;
     const tool: ToolCallItem = {
       toolCallId: fields.toolCallId,
       acpStatus,
@@ -2651,7 +2778,17 @@ export class TranscriptStore {
       diffs,
       locations,
       startedAt: now,
-      ...(finished ? { endedAt: now, tookMs: 0 } : {}),
+      ...(finished
+        ? {
+            endedAt: now,
+            ...(parsedReplayDur !== undefined
+              ? { tookMs: parsedReplayDur }
+              : !isReplaying
+                ? { tookMs: 0 }
+                : {}),
+          }
+        : {}),
+      ...(isReplaying ? { replayed: true } : {}),
       collapsed: options.defaultCollapsed ?? true,
       awaitingPermission: false,
       cancelled: false,
@@ -2740,11 +2877,15 @@ export class TranscriptStore {
       return;
     }
 
-    // 2. If a previously tracked detached tool later gets updated to error/cancelled, settle it
+    // 2. If a previously tracked detached tool later gets updated to a terminal status, settle it
     const existingDetached = this._detachedBgTasks.get(tool.toolCallId);
     if (existingDetached) {
       if (tool.status === 'error' || tool.status === 'cancelled') {
         existingDetached.status = tool.status === 'error' ? 'failed' : 'cancelled';
+        existingDetached.endedAt = this._now();
+        existingDetached.outputText = tool.outputText;
+      } else if (tool.status === 'done' && existingDetached.awaitingToolCompletion) {
+        existingDetached.status = 'completed';
         existingDetached.endedAt = this._now();
         existingDetached.outputText = tool.outputText;
       } else if (tool.outputText) {
@@ -2760,6 +2901,57 @@ export class TranscriptStore {
         this._detachedBgTasks.set(tool.toolCallId, detected);
       }
     }
+  }
+
+  private isAsyncBackgroundCapableTool(tool: ToolCallItem): boolean {
+    const rawName = (tool.rawName ?? '').toLowerCase();
+    const titleLower = tool.title.toLowerCase();
+    if (rawName === 'swarm' || titleLower.startsWith('swarm')) {
+      return false;
+    }
+    if (
+      rawName === 'invoke_subagent' ||
+      rawName === 'subagent' ||
+      titleLower.includes('invoke_subagent')
+    ) {
+      return true;
+    }
+    const jobType = classifyNonAgentJobType(tool);
+    return jobType === 'bash' || jobType === 'schedule' || jobType === 'workflow';
+  }
+
+  private registerInFlightToolAsBackgroundTask(turnIndex: number, tool: ToolCallItem): void {
+    if (this._detachedBgTasks.has(tool.toolCallId)) return;
+    const jobType = classifyNonAgentJobType(tool) ?? 'task';
+    const inputRec = asRecord(tool.args) ?? asRecord(tool.rawInput);
+    const command =
+      jobType === 'bash'
+        ? (tool.target ||
+            firstStringField(inputRec, ['CommandLine', 'command', 'cmd', 'script']) ||
+            (tool.title.toLowerCase() !== 'bash' ? tool.title : undefined))
+        : firstStringField(inputRec, ['CommandLine', 'command', 'cmd', 'CronExpression', 'ScriptPath']);
+    const labelSource =
+      jobType === 'bash' ? (command ?? tool.title ?? 'bash') : (tool.title || tool.rawName || jobType);
+    const rawName = (tool.rawName ?? '').toLowerCase();
+    const isSubagent =
+      rawName === 'invoke_subagent' ||
+      rawName === 'subagent' ||
+      tool.title.toLowerCase().includes('invoke_subagent');
+
+    this._detachedBgTasks.set(tool.toolCallId, {
+      id: tool.toolCallId,
+      toolCallId: tool.toolCallId,
+      type: jobType,
+      label: collapseSingleLine(labelSource, 88),
+      ...(command ? { command } : {}),
+      ...(tool.title && tool.title !== command ? { title: tool.title } : {}),
+      ...(isSubagent ? { agentKind: 'subagent' as const } : {}),
+      startedAt: tool.startedAt,
+      turnIndex,
+      status: 'running',
+      outputText: tool.outputText,
+      awaitingToolCompletion: true,
+    });
   }
 
   private reconcileBackgroundCompletionFromText(text: string): void {

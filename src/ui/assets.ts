@@ -599,6 +599,16 @@ export const WELCOME_LOGO_STYLESHEET = [
   '  flex: 1 1 0px;',
   '  min-height: 0;',
   '}',
+  // Grouped routine tool-call disclosure row (`ui.tool_display = "compact"`)
+  "[data-role='oma.tool.group'] > .sf-section-head {",
+  '  padding: 2px 0;',
+  '  background: none;',
+  '}',
+  "[data-role='oma.tool.group'] > .sf-section-body {",
+  '  padding-left: 12px;',
+  '  border-left: 1px solid var(--l2);',
+  '  margin-top: 2px;',
+  '}',
   // Per-palette member name hues echoing each member's pixel bee sprite
   "[data-role='oma.swarm.name.gold'] { color: #E5B84B; font-weight: 600; }",
   "[data-role='oma.swarm.name.violet'] { color: #D946EF; font-weight: 600; }",

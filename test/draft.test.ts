@@ -1750,18 +1750,20 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
 
     const replayedTurn = replayStore.turns[0]!;
     expect(replayedTurn.status).toBe('done');
+    expect(replayedTurn.replayed).toBe(true);
     expect(replayedTurn.thoughts).toHaveLength(2);
     for (const th of replayedTurn.thoughts) {
       expect(th.status).toBe('done');
       expect(th.endedAt).toBeDefined();
-      expect(th.tookMs).toBeDefined();
+      expect(th.replayed).toBe(true);
+      // Replayed thoughts must NOT synthesize fake wall-clock durations (avoids `Thought for 0ms`)
+      expect(th.tookMs).toBeUndefined();
       expect(th.open).toBe(false);
     }
-    expect(replayedTurn.thoughts[0]?.tookMs).toBe(500);
-    expect(replayedTurn.thoughts[1]?.tookMs).toBe(200);
     expect(replayedTurn.toolCalls[0]?.status).toBe('done');
     expect(replayedTurn.toolCalls[0]?.endedAt).toBeDefined();
-    expect(replayedTurn.toolCalls[0]?.tookMs).toBeDefined();
+    expect(replayedTurn.toolCalls[0]?.replayed).toBe(true);
+    expect(replayedTurn.toolCalls[0]?.tookMs).toBeUndefined();
   });
 
   test('TranscriptStore.getBackgroundJobsSnapshot, /jobs (/tasks) dispatch, and AppStore jobs overlay state', async () => {

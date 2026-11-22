@@ -53,8 +53,10 @@ import {
 import {
   DEFAULT_CONFIG,
   getConfigPath,
+  normalizeToolDisplayMode,
   saveConfig,
   type OmaConfig,
+  type ToolDisplayMode,
 } from '../config/config';
 import {
   exportTranscriptMarkdown,
@@ -148,6 +150,10 @@ import {
 const MAX_EMBEDDED_FILE_BYTES = 256 * 1024;
 const DONE_TO_IDLE_DELAY_MS = 1500;
 const DEFAULT_BACKGROUND_DONE_GRACE_MS = 2000;
+const DEFAULT_BACKGROUND_WAKEUP_GRACE_MS = 10_000;
+const DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS = 120;
+const DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS = 250;
+const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
 const GIT_PROBE_MIN_INTERVAL_MS = 1500;
 const TPS_FLUSH_MIN_INTERVAL_MS = 120;
 
@@ -230,6 +236,8 @@ export interface AppControllerOptions {
   readonly gitExec?: GitExecFn;
   /** Quiet grace period (ms) before emitting deferred background/swarm `state=done`. Default: 2000. */
   readonly backgroundDoneGraceMs?: number;
+  /** Quiet drain window (ms) after `session/load` resolves to capture trailing async replay updates. */
+  readonly replayDrainQuietMs?: number;
 }
 
 function cloneConfig(config: OmaConfig): OmaConfig {
@@ -241,6 +249,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
     recent_models: [...(config.recent_models ?? [])],
     ui: {
       auto_collapse_thought: config.ui.auto_collapse_thought,
+      tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
       osc_7501: config.ui.osc_7501,
       reopen_anchor: config.ui.reopen_anchor,
@@ -358,6 +367,9 @@ export class AppController {
   readonly #dataDir?: string;
   readonly #gitExec?: GitExecFn;
   readonly #backgroundDoneGraceMs: number;
+  readonly #backgroundWakeupGraceMs: number;
+  readonly #replayDrainInitialQuietMs: number;
+  readonly #replayDrainActiveQuietMs: number;
   readonly #metricsTracker: SessionMetricsTracker;
 
   #acpClient: AcpClient | null = null;
@@ -374,6 +386,9 @@ export class AppController {
   #lastFocusedId: string | null | undefined = undefined;
   #workingStartedAt: number | undefined = undefined;
   #pendingBackgroundDone = false;
+  #awaitingPostToolWakeup = false;
+  #awaitingSwarmCoordinatorReply = false;
+  #deferredSettleTurnIndex: number | null = null;
   #activePromptTask: Promise<void> | null = null;
   #pickerLoadToken = 0;
   #attachmentSeq = 0;
@@ -387,6 +402,10 @@ export class AppController {
   #memberBeeBlobCache: Record<string, BeeMemberBlobPair> = {};
   #doneIdleTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #backgroundDoneTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #replayDrainActive = false;
+  #replayDrainResolve: (() => void) | null = null;
+  #replayDrainTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #replayDrainMaxTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #signalHandlers:
     | { sigint: () => void; sigterm: () => void; sighup: () => void }
     | undefined = undefined;
@@ -418,6 +437,18 @@ export class AppController {
       0,
       options.backgroundDoneGraceMs ?? DEFAULT_BACKGROUND_DONE_GRACE_MS
     );
+    this.#backgroundWakeupGraceMs =
+      options.backgroundDoneGraceMs !== undefined
+        ? this.#backgroundDoneGraceMs
+        : Math.max(this.#backgroundDoneGraceMs, DEFAULT_BACKGROUND_WAKEUP_GRACE_MS);
+    this.#replayDrainInitialQuietMs =
+      options.replayDrainQuietMs !== undefined
+        ? Math.max(0, options.replayDrainQuietMs)
+        : DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS;
+    this.#replayDrainActiveQuietMs =
+      options.replayDrainQuietMs !== undefined
+        ? Math.max(0, options.replayDrainQuietMs)
+        : DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
       now: this.#now,
@@ -442,6 +473,7 @@ export class AppController {
       cwd: initialCwd,
       autoAllowTools: this.#config.approval.auto_allow_tools,
       autoCollapseThought: this.#config.ui.auto_collapse_thought,
+      toolDisplayMode: normalizeToolDisplayMode(this.#config.ui.tool_display),
       recentModels: this.#config.recent_models,
       hour12: this.session.caps.hour12,
       supportsAside: this.session.caps.features.includes('aside'),
@@ -690,6 +722,7 @@ export class AppController {
     }
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
+    this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
     this.#metricsTracker.setSession(null);
@@ -924,17 +957,72 @@ export class AppController {
     void this.#refreshGitStatus();
   }
 
+  #cancelReplayDrain(): void {
+    this.#replayDrainActive = false;
+    if (this.#replayDrainTimer !== undefined) {
+      clearTimeout(this.#replayDrainTimer);
+      this.#replayDrainTimer = undefined;
+    }
+    if (this.#replayDrainMaxTimer !== undefined) {
+      clearTimeout(this.#replayDrainMaxTimer);
+      this.#replayDrainMaxTimer = undefined;
+    }
+    const resolve = this.#replayDrainResolve;
+    this.#replayDrainResolve = null;
+    resolve?.();
+  }
+
+  #noteReplayDrainActivity(): void {
+    if (!this.#replayDrainActive) return;
+    if (this.#replayDrainTimer !== undefined) {
+      clearTimeout(this.#replayDrainTimer);
+      this.#replayDrainTimer = undefined;
+    }
+    this.#replayDrainTimer = setTimeout(() => {
+      this.#cancelReplayDrain();
+    }, this.#replayDrainActiveQuietMs);
+  }
+
+  /**
+   * `agy acp` may resolve the `session/load` JSON-RPC response before its async
+   * replay stream finishes pushing all historical `session/update` notifications
+   * (especially on long sessions with large `edit_file` diff payloads). Keep
+   * `isReplaying = true` and `scheduler` suspended until the trailing burst goes
+   * quiet so stdout is drained at full speed without render backpressure or
+   * prematurely fusing trailing history into a live streaming turn.
+   */
+  async #waitForReplayDrain(): Promise<void> {
+    if (this.#shuttingDown || this.#replayDrainInitialQuietMs <= 0) {
+      return;
+    }
+    this.#cancelReplayDrain();
+    this.#replayDrainActive = true;
+    await new Promise<void>(resolve => {
+      this.#replayDrainResolve = resolve;
+      this.#replayDrainTimer = setTimeout(() => {
+        this.#cancelReplayDrain();
+      }, this.#replayDrainInitialQuietMs);
+      this.#replayDrainMaxTimer = setTimeout(() => {
+        this.#cancelReplayDrain();
+      }, DEFAULT_REPLAY_DRAIN_MAX_MS);
+    });
+  }
+
   async #loadSessionWithReplay(
     client: AcpClient,
     sessionId: string,
     cwd: string,
     knownTitle?: string
   ): Promise<void> {
+    this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.store.resetSessionState({ keepCommands: true });
     this.#syncSwarmFxStylesheet();
@@ -949,6 +1037,13 @@ export class AppController {
         mcpServers: [],
       });
 
+      await this.#waitForReplayDrain();
+      if (this.#shuttingDown) {
+        this.store.setReplaying(false);
+        this.scheduler.resumeAfterReplay(false);
+        return;
+      }
+
       this.store.transcript.finalizeReplayedTurns();
       this.store.setReplaying(false);
       const loadedTier = client.currentTier ?? extractSessionTier(loaded._meta);
@@ -962,7 +1057,8 @@ export class AppController {
         ...(loadedTier ? { tier: loadedTier } : {}),
       });
 
-      this.#bindSessionMetrics(loaded.sessionId);
+      this.#bindSessionMetrics(loaded.sessionId, false);
+      await this.#syncSessionMetricsFromTranscript();
       void this.#refreshGitStatus({ force: true });
 
       this.scheduler.resumeAfterReplay(true);
@@ -982,6 +1078,7 @@ export class AppController {
       }
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
     } catch (err) {
+      this.#cancelReplayDrain();
       this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(false);
       throw err;
@@ -1050,6 +1147,9 @@ export class AppController {
   }
 
   #handleAcpUpdate(params: SessionUpdateParams): void {
+    if (this.#replayDrainActive) {
+      this.#noteReplayDrainActivity();
+    }
     const prevBusy = this.store.isBusy;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
@@ -1088,33 +1188,87 @@ export class AppController {
         }
       }
 
-      // Tool call lifecycle hooks: mount swarm watcher, incrementally tail transcript, and refresh git
+      // Tool call lifecycle hooks: mount swarm watcher, track tool-wait TPS pauses,
+      // incrementally tail transcript, and refresh git
+      let toolFinishedInThisUpdate = false;
       if (
         update.sessionUpdate === 'tool_call' ||
         update.sessionUpdate === 'tool_call_update'
       ) {
-        const upd = update as { name?: unknown; title?: unknown; status?: unknown };
+        const upd = update as { name?: unknown; title?: unknown; status?: unknown; args?: unknown; rawInput?: unknown };
         const rawName = typeof upd.name === 'string' ? upd.name.trim().toLowerCase() : '';
         const rawTitle = typeof upd.title === 'string' ? upd.title.trim().toLowerCase() : '';
-        if (rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle)) {
+        const isSwarmWait =
+          rawName === 'swarm_wait' ||
+          rawTitle === 'swarm_wait' ||
+          rawTitle.includes('swarm_wait');
+        const isSwarmTool =
+          rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle);
+        if (isSwarmTool || isSwarmWait) {
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
+        if (isSwarmWait) {
+          this.#awaitingSwarmCoordinatorReply = true;
+        }
         if (upd.status === 'completed' || upd.status === 'failed') {
+          toolFinishedInThisUpdate = true;
           void this.#syncSessionMetricsFromTranscript();
           void this.#refreshGitStatus();
         }
+        if (this.store.hasActiveBackgroundTasks()) {
+          this.#metricsTracker.pauseForTools();
+        } else {
+          this.#metricsTracker.resumeAfterTools();
+        }
+      }
+
+      const isThoughtChunk = update.sessionUpdate === 'agent_thought_chunk';
+      const isMessageChunk = update.sessionUpdate === 'agent_message_chunk';
+      const isToolRunningUpdate =
+        (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+        ((update as { status?: unknown }).status === 'in_progress' ||
+          (update as { status?: unknown }).status === 'pending');
+
+      // When the coordinator wakes up after swarm workers finish and starts emitting
+      // its actual user-facing reply (`agent_message_chunk`), arm deferred `state=done`
+      // so the finish notification fires strictly after the coordinator's reply settles.
+      if (isMessageChunk && !this.store.getState().isStreaming) {
+        if (this.#awaitingSwarmCoordinatorReply || this.store.getState().hasSwarm) {
+          this.#awaitingSwarmCoordinatorReply = false;
+          this.#pendingBackgroundDone = true;
+        }
+      }
+
+      if (
+        toolFinishedInThisUpdate &&
+        prevBusy &&
+        !this.store.getState().isStreaming &&
+        !this.store.hasActiveBackgroundTasks() &&
+        !this.store.isSwarmWorking &&
+        !this.#isSwarmCoordinatorWorking() &&
+        !this.#awaitingSwarmCoordinatorReply
+      ) {
+        // The last background tool just finished; give the model a generous wakeup
+        // window (TTFT) before emitting OSC 7501 `state=done`.
+        this.#awaitingPostToolWakeup = true;
       }
 
       this.#reconcileBackgroundActivity(prevBusy);
 
       // If we are in deferred background/swarm quiet-grace state and live activity arrives
-      // (late assistant text/thought or in-progress tool), keep `working` and reset the grace timer.
+      // (late assistant text/thought, usage_update, or in-progress tool), keep `working`
+      // and pick the appropriate grace timer.
+      const isUsageAfterReply =
+        update.sessionUpdate === 'usage_update' && !this.#awaitingPostToolWakeup;
       const isLiveActivityUpdate =
-        update.sessionUpdate === 'agent_thought_chunk' ||
-        update.sessionUpdate === 'agent_message_chunk' ||
-        ((update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
-          (update as { status?: unknown }).status === 'in_progress');
+        isThoughtChunk || isMessageChunk || isToolRunningUpdate || isUsageAfterReply;
+
       if (this.#pendingBackgroundDone && isLiveActivityUpdate) {
+        if (isMessageChunk) {
+          this.#awaitingPostToolWakeup = false;
+        } else if (isThoughtChunk) {
+          this.#awaitingPostToolWakeup = true;
+        }
         const stateAfter = this.store.getState();
         this.#clearDoneIdleTimer();
         if (
@@ -1128,11 +1282,15 @@ export class AppController {
           stateAfter.isStreaming ||
           stateAfter.hasActiveBackgroundTasks ||
           stateAfter.isSwarmWorking ||
-          this.#isSwarmCoordinatorWorking()
+          this.#isSwarmCoordinatorWorking() ||
+          this.#awaitingSwarmCoordinatorReply
         ) {
           this.#clearBackgroundDoneTimer();
         } else {
-          this.#scheduleBackgroundDone();
+          const delayMs = this.#awaitingPostToolWakeup
+            ? this.#backgroundWakeupGraceMs
+            : this.#backgroundDoneGraceMs;
+          this.#scheduleBackgroundDone(delayMs);
         }
       }
     }
@@ -1209,9 +1367,13 @@ export class AppController {
   #handleAcpExit(info: AcpExitInfo): void {
     if (this.#shuttingDown || info.expected) return;
 
+    this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.store.transcript.cancelActiveBackgroundTasks('cancelled');
 
@@ -1545,6 +1707,24 @@ export class AppController {
         { ttl: 1800 }
       );
       this.scheduler.renderNow();
+      return;
+    }
+
+    if (name === 'o' && key.alt && !key.ctrl && !key.meta) {
+      const nextMode = this.store.cycleToolDisplayMode();
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: nextMode },
+      };
+      const label =
+        nextMode === 'all'
+          ? 'Tool calls: All (expanded list)'
+          : nextMode === 'compact'
+            ? 'Tool calls: Compact (grouped)'
+            : 'Tool calls: Hidden (completed runs hidden)';
+      this.store.pushToast(label, 'info', { ttl: 2000 });
+      this.scheduler.renderNow();
+      void this.#saveConfigSafe();
       return;
     }
 
@@ -2690,11 +2870,21 @@ export class AppController {
 
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    if (this.#deferredSettleTurnIndex !== null) {
+      this.scheduler.settleTurn(this.#deferredSettleTurnIndex);
+      this.#deferredSettleTurnIndex = null;
+    }
     this.store.draft.reset();
     this.store.clearAttachments();
     if (text.length > 0) {
       void this.store.history.push(text, state.cwd);
     }
+
+    // Ensure historical transcript token baseline is synced before starting TPS tracking
+    await this.#syncSessionMetricsFromTranscript();
+    if (this.#shuttingDown) return;
 
     // Mark streaming & render user turn synchronously before detaching the long-lived
     // `client.prompt(...)` RPC so the main session input loop stays responsive for
@@ -2727,25 +2917,53 @@ export class AppController {
           {
             autoCollapseThought: this.store.autoCollapseThought,
             expandAllTools: this.store.getState().expandAllTools,
+            preserveInFlightBackgroundTools: true,
           }
         );
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
         this.store.setStreaming(false);
 
+        const hasBgTools = this.store.hasActiveBackgroundTasks();
+        const swarmActive = this.store.isSwarmWorking;
+        const awaitingSwarmReply = this.#awaitingSwarmCoordinatorReply || swarmActive;
         const stillBusy =
-          this.store.hasActiveBackgroundTasks() ||
-          this.store.isSwarmWorking ||
+          hasBgTools ||
+          awaitingSwarmReply ||
           (this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking());
 
+        const promptOutputTokens =
+          typeof result.usage?.outputTokens === 'number' &&
+          Number.isFinite(result.usage.outputTokens) &&
+          result.usage.outputTokens > 0
+            ? result.usage.outputTokens
+            : undefined;
+
         if (!stillBusy) {
+          const endedSnap = this.#metricsTracker.endStreamTurn(
+            promptOutputTokens !== undefined
+              ? { authoritativeOutputTokens: promptOutputTokens }
+              : undefined
+          );
+          this.#applySessionMetricsSnapshot(endedSnap);
           this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#awaitingSwarmCoordinatorReply = false;
+          this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
         } else {
-          // Keep OSC 7501 `working` & continuous elapsed timer while detached background
-          // tasks or swarm workers remain active; defer `done` until all finish.
-          this.#pendingBackgroundDone = true;
+          // Keep OSC 7501 `working`, continuous elapsed timer & unsettled turn while
+          // detached/in-flight background tools or swarm workers remain active; defer
+          // `done` and turn settlement until the actual user-facing completion.
+          this.#metricsTracker.pauseForTools();
+          // Only non-swarm background tools arm `#pendingBackgroundDone` directly.
+          // Swarm worker transitions (`working -> waiting`) must NEVER emit `state=done`
+          // on their own; `state=done` waits for the coordinator's user-facing reply.
+          this.#pendingBackgroundDone = hasBgTools;
+          this.#awaitingSwarmCoordinatorReply = awaitingSwarmReply;
+          this.#awaitingPostToolWakeup = false;
+          if (finishedTurn) {
+            this.#deferredSettleTurnIndex = finishedTurn.index;
+          }
           this.#clearDoneIdleTimer();
           this.#clearBackgroundDoneTimer();
         }
@@ -2753,7 +2971,7 @@ export class AppController {
         // Flush final non-streaming frame & settle turn BEFORE emitting OSC 7501 `state=done`
         // so the user never receives a completion notification ahead of the final reply.
         this.scheduler.renderNow();
-        if (finishedTurn) {
+        if (!stillBusy && finishedTurn) {
           this.scheduler.settleTurn(finishedTurn.index);
           this.osc.reassertCursorHidden();
         }
@@ -2782,6 +3000,8 @@ export class AppController {
         this.store.setStreaming(false);
         if (!this.store.isBusy) {
           this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
         }
@@ -2955,9 +3175,20 @@ export class AppController {
         this.store.pushToast('Cancelling turn…', 'info', { ttl: 1500 });
       } else {
         this.#pendingBackgroundDone = false;
+        this.#awaitingPostToolWakeup = false;
+        this.#awaitingSwarmCoordinatorReply = false;
+        this.#deferredSettleTurnIndex = null;
         this.#workingStartedAt = undefined;
         this.#clearDoneIdleTimer();
         this.#clearBackgroundDoneTimer();
+        this.store.transcript.finalizeBackgroundTurn({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: state.expandAllTools,
+        });
+        if (this.#metricsTracker.isStreaming) {
+          const endedSnap = this.#metricsTracker.endStreamTurn();
+          this.#applySessionMetricsSnapshot(endedSnap);
+        }
         if (!this.store.isBusy) {
           this.osc.setStatusIdle();
         }
@@ -2965,9 +3196,20 @@ export class AppController {
       }
     } else if (cancelledBg > 0) {
       this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#awaitingSwarmCoordinatorReply = false;
+      this.#deferredSettleTurnIndex = null;
       this.#workingStartedAt = undefined;
       this.#clearDoneIdleTimer();
       this.#clearBackgroundDoneTimer();
+      this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: state.expandAllTools,
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
       if (!this.store.isBusy) {
         this.osc.setStatusIdle();
       }
@@ -3053,10 +3295,11 @@ export class AppController {
       return;
     }
 
-    const coordinatorSummarizing =
-      this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking();
+    const coordinatorWorking =
+      (this.#pendingBackgroundDone || this.#awaitingSwarmCoordinatorReply) &&
+      this.#isSwarmCoordinatorWorking();
 
-    if (state.hasActiveBackgroundTasks || state.isSwarmWorking || coordinatorSummarizing) {
+    if (state.hasActiveBackgroundTasks) {
       this.#clearBackgroundDoneTimer();
       if (this.#workingStartedAt === undefined) {
         this.#workingStartedAt = this.#now();
@@ -3071,12 +3314,40 @@ export class AppController {
       return;
     }
 
-    if (prevBusy || this.#pendingBackgroundDone) {
-      // Wait for a brief quiet grace period before emitting deferred `state=done`
-      // so coordinator summary / late ACP reply chunks never race behind the notification.
-      this.#pendingBackgroundDone = true;
+    if (state.isSwarmWorking || coordinatorWorking) {
+      this.#clearBackgroundDoneTimer();
+      if (this.#workingStartedAt === undefined) {
+        this.#workingStartedAt = this.#now();
+      }
+      if (!prevBusy) {
+        this.#clearDoneIdleTimer();
+        if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+          this.osc.setStatusWorking();
+        }
+      }
+      return;
+    }
+
+    // Only emit deferred OSC 7501 `state=done` when `#pendingBackgroundDone` was armed by
+    // a non-swarm background task or an actual coordinator `agent_message_chunk` reply —
+    // NEVER merely because swarm workers transitioned from `working` to `waiting`.
+    if (this.#pendingBackgroundDone && !this.#awaitingSwarmCoordinatorReply) {
       if (prevBusy || this.#backgroundDoneTimer === undefined) {
-        this.#scheduleBackgroundDone();
+        const delayMs = this.#awaitingPostToolWakeup
+          ? this.#backgroundWakeupGraceMs
+          : this.#backgroundDoneGraceMs;
+        this.#scheduleBackgroundDone(delayMs);
+      }
+      return;
+    }
+
+    // Swarm workers went idle/waiting while no user-facing coordinator reply has completed:
+    // clear working timer and return quietly to `idle` without firing a spurious `finish`.
+    if (prevBusy) {
+      this.#clearBackgroundDoneTimer();
+      this.#workingStartedAt = undefined;
+      if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+        this.osc.setStatusIdle();
       }
     }
   }
@@ -3710,6 +3981,9 @@ export class AppController {
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
+    this.#awaitingPostToolWakeup = false;
+    this.#awaitingSwarmCoordinatorReply = false;
+    this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.store.resetSessionState({ keepCommands: true });
     this.#syncSwarmFxStylesheet();
@@ -4085,6 +4359,14 @@ export class AppController {
       };
       this.store.setAutoCollapseThought(next);
       omaUpdated = true;
+    } else if (rowId === 'ui.tool_display') {
+      const next: ToolDisplayMode = normalizeToolDisplayMode(value);
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: next },
+      };
+      this.store.setToolDisplayMode(next);
+      omaUpdated = true;
     } else if (rowId === 'ui.tool_preview_lines') {
       const num = typeof value === 'number' ? value : Number(value);
       if (Number.isFinite(num)) {
@@ -4244,6 +4526,7 @@ export class AppController {
         recent_models: [...this.#config.recent_models],
       });
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
+      this.store.setToolDisplayMode(this.#config.ui.tool_display);
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
       const ok = await this.#saveConfigSafe();
@@ -4513,9 +4796,10 @@ export class AppController {
     return snap?.memberByName['coordinator']?.status === 'working';
   }
 
-  #scheduleBackgroundDone(): void {
+  #scheduleBackgroundDone(delayMs?: number): void {
     this.#clearBackgroundDoneTimer();
     if (this.#shuttingDown) return;
+    const waitMs = delayMs ?? this.#backgroundDoneGraceMs;
     this.#backgroundDoneTimer = setTimeout(() => {
       this.#backgroundDoneTimer = undefined;
       if (this.#shuttingDown || !this.#pendingBackgroundDone) return;
@@ -4524,19 +4808,38 @@ export class AppController {
         state.isStreaming ||
         state.hasActiveBackgroundTasks ||
         state.isSwarmWorking ||
-        this.#isSwarmCoordinatorWorking()
+        this.#isSwarmCoordinatorWorking() ||
+        this.#awaitingSwarmCoordinatorReply
       ) {
         return;
       }
       this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#awaitingSwarmCoordinatorReply = false;
       this.#workingStartedAt = undefined;
+      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: state.expandAllTools,
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
+      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+      this.#deferredSettleTurnIndex = null;
       // Ensure any late chunks or tool updates are flushed to the screen before notifying done
       this.scheduler.renderNow();
+      if (settleIdx !== null) {
+        this.scheduler.settleTurn(settleIdx);
+        this.osc.reassertCursorHidden();
+      }
       if (!this.store.approvals.hasPending() && !state.activeQuestion) {
         this.osc.setStatusDone();
         this.#scheduleDoneToIdle();
       }
-    }, this.#backgroundDoneGraceMs);
+      void this.#syncSessionMetricsFromTranscript();
+      void this.#persistSessionAnchorAndOsc();
+    }, waitMs);
   }
 
   #clearBackgroundDoneTimer(): void {
@@ -4546,11 +4849,11 @@ export class AppController {
     }
   }
 
-  #bindSessionMetrics(sessionId: string | null): void {
+  #bindSessionMetrics(sessionId: string | null, autoSync = true): void {
     this.#metricsTracker.setSession(sessionId);
     this.#lastTpsStoreFlushAt = 0;
     this.store.setSessionMetrics(null);
-    if (sessionId) {
+    if (sessionId && autoSync) {
       void this.#syncSessionMetricsFromTranscript();
     }
   }
@@ -5033,6 +5336,10 @@ export class AppController {
           },
           onToggleTool: (toolCallId, collapsed) => {
             this.store.transcript.toggleTool(toolCallId, collapsed);
+            this.scheduler.renderNow();
+          },
+          onToggleToolGroup: (groupId, expanded) => {
+            this.store.toggleToolGroup(groupId, expanded);
             this.scheduler.renderNow();
           },
           onToggleNotice: (noticeId, collapsed) => {

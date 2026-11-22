@@ -412,6 +412,7 @@ describe('src/config/config.ts recent_models & atomic saveConfig', () => {
       ],
       ui: {
         auto_collapse_thought: false,
+        tool_display: 'compact',
         tool_preview_lines: 24,
         osc_7501: true,
         reopen_anchor: false,

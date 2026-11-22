@@ -61,10 +61,19 @@ export interface SessionMetricsTrackerOptions extends TranscriptPathOptions {
 
 const TPS_WINDOW_MS = 3_000;
 const MIN_STREAM_DURATION_MS = 100;
+const MIN_IMPLICIT_STREAM_DURATION_MS = 500;
+const BURST_GUARD_WINDOW_MS = 500;
+const BURST_GUARD_MAX_TPS = 400;
+const MAX_REASONABLE_TPS = 1_000;
 const CALIBRATION_EXPIRY_MS = 15_000;
 const READ_CHUNK_BYTES = 256 * 1024;
 const ASCII_CHARS_PER_TOKEN = 4;
 const NON_ASCII_CHARS_PER_TOKEN = 1.5;
+
+export interface EndStreamTurnOptions {
+  /** Authoritative single-turn output tokens reported by ACP `session/prompt` result. */
+  readonly authoritativeOutputTokens?: number;
+}
 
 // ---------------------------------------------------------------------------
 // Path Resolution
@@ -325,7 +334,11 @@ export class SessionMetricsTracker {
 
   // Streaming sliding window & post-turn calibration
   private _streaming = false;
+  private _implicitStream = false;
   private _turnStartTime: number | null = null;
+  private _segmentStartTime: number | null = null;
+  private _toolWaitPausedAt: number | null = null;
+  private _accumulatedToolWaitMs = 0;
   private _turnStartOutputTokens = 0;
   private _turnEstimatedTokens = 0;
   private _samples: StreamSample[] = [];
@@ -405,13 +418,21 @@ export class SessionMetricsTracker {
     this._responseCount = 0;
 
     this._streaming = false;
+    this._implicitStream = false;
     this._turnStartTime = null;
+    this._segmentStartTime = null;
+    this._toolWaitPausedAt = null;
+    this._accumulatedToolWaitMs = 0;
     this._turnStartOutputTokens = 0;
     this._turnEstimatedTokens = 0;
     this._samples = [];
     this._pendingCalibration = null;
     this._currentTps = null;
     this._isStreamingTps = false;
+  }
+
+  get isStreaming(): boolean {
+    return this._streaming;
   }
 
   getSnapshot(): SessionMetricsSnapshot {
@@ -435,13 +456,43 @@ export class SessionMetricsTracker {
    * Mark the beginning of a streaming assistant turn.
    */
   beginStreamTurn(): void {
+    const now = this._now();
     this._streaming = true;
-    this._turnStartTime = this._now();
+    this._implicitStream = false;
+    this._turnStartTime = now;
+    this._segmentStartTime = now;
+    this._toolWaitPausedAt = null;
+    this._accumulatedToolWaitMs = 0;
     this._turnStartOutputTokens = this._totalOutputTokens;
     this._turnEstimatedTokens = 0;
     this._samples = [];
     this._pendingCalibration = null;
     this._isStreamingTps = false;
+  }
+
+  /**
+   * Pause active generation timing while tool calls are executing so tool wait
+   * latency neither drags down turn TPS nor distorts the sliding window.
+   */
+  pauseForTools(): void {
+    if (!this._streaming) return;
+    if (this._toolWaitPausedAt === null) {
+      this._toolWaitPausedAt = this._now();
+    }
+    this._samples = [];
+  }
+
+  /**
+   * Resume active generation timing once all in-flight tools finish (or new
+   * model output arrives).
+   */
+  resumeAfterTools(): void {
+    if (!this._streaming || this._toolWaitPausedAt === null) return;
+    const now = this._now();
+    this._accumulatedToolWaitMs += Math.max(0, now - this._toolWaitPausedAt);
+    this._toolWaitPausedAt = null;
+    this._segmentStartTime = now;
+    this._samples = [];
   }
 
   /**
@@ -454,11 +505,17 @@ export class SessionMetricsTracker {
     const now = this._now();
     if (!this._streaming) {
       this._streaming = true;
+      this._implicitStream = true;
       this._turnStartTime = now;
+      this._segmentStartTime = now;
+      this._toolWaitPausedAt = null;
+      this._accumulatedToolWaitMs = 0;
       this._turnStartOutputTokens = this._totalOutputTokens;
       this._turnEstimatedTokens = 0;
       this._samples = [];
       this._pendingCalibration = null;
+    } else if (this._toolWaitPausedAt !== null) {
+      this.resumeAfterTools();
     }
 
     const estTokens = estimateTextTokens(deltaText);
@@ -477,18 +534,31 @@ export class SessionMetricsTracker {
       this._samples.splice(0, firstValidIdx);
     }
 
-    const startTime = this._turnStartTime ?? now;
+    const startTime = this._segmentStartTime ?? this._turnStartTime ?? now;
     const windowStart = Math.max(startTime, cutoff);
     const elapsedMs = now - windowStart;
+    const minDurationMs = this._implicitStream
+      ? MIN_IMPLICIT_STREAM_DURATION_MS
+      : MIN_STREAM_DURATION_MS;
 
-    if (elapsedMs >= MIN_STREAM_DURATION_MS) {
+    if (elapsedMs >= minDurationMs) {
       let windowTokens = 0;
       for (const s of this._samples) {
         windowTokens += s.tokens;
       }
       if (windowTokens > 0) {
-        this._currentTps = windowTokens / (elapsedMs / 1000);
-        this._isStreamingTps = true;
+        const candidateTps = windowTokens / (elapsedMs / 1000);
+        const isShortBurstSpike =
+          elapsedMs < BURST_GUARD_WINDOW_MS && candidateTps > BURST_GUARD_MAX_TPS;
+        if (
+          !isShortBurstSpike &&
+          Number.isFinite(candidateTps) &&
+          candidateTps > 0 &&
+          candidateTps <= MAX_REASONABLE_TPS
+        ) {
+          this._currentTps = candidateTps;
+          this._isStreamingTps = true;
+        }
       }
     }
 
@@ -497,40 +567,69 @@ export class SessionMetricsTracker {
 
   /**
    * Mark the end of a streaming assistant turn. Marks TPS as idle (non-streaming)
-   * and arms post-turn calibration so the next `syncFromTranscript()` replaces the
-   * estimated rate with authoritative `output_tokens / duration`.
+   * and either applies authoritative single-turn `outputTokens` directly or arms
+   * one-shot post-turn calibration from `transcript.jsonl`.
    */
-  endStreamTurn(): SessionMetricsSnapshot {
+  endStreamTurn(options?: EndStreamTurnOptions): SessionMetricsSnapshot {
     if (!this._streaming) {
       this._isStreamingTps = false;
       return this.getSnapshot();
     }
 
     const now = this._now();
+    if (this._toolWaitPausedAt !== null) {
+      this._accumulatedToolWaitMs += Math.max(0, now - this._toolWaitPausedAt);
+      this._toolWaitPausedAt = null;
+    }
+
     const startTime = this._turnStartTime ?? now;
-    const durationMs = Math.max(0, now - startTime);
+    const totalElapsedMs = Math.max(0, now - startTime);
+    const activeGenMs = Math.max(0, totalElapsedMs - this._accumulatedToolWaitMs);
+    const durationMs = activeGenMs >= MIN_STREAM_DURATION_MS ? activeGenMs : totalElapsedMs;
 
     this._streaming = false;
+    this._implicitStream = false;
     this._isStreamingTps = false;
 
-    if (durationMs >= MIN_STREAM_DURATION_MS) {
-      const deltaAlreadySynced = this._totalOutputTokens - this._turnStartOutputTokens;
-      if (deltaAlreadySynced > 0) {
-        this._currentTps = deltaAlreadySynced / (durationMs / 1000);
-      } else if (this._currentTps === null && this._turnEstimatedTokens > 0) {
-        this._currentTps = this._turnEstimatedTokens / (durationMs / 1000);
-      }
+    const authOut = options?.authoritativeOutputTokens;
+    const hasAuthoritativeOut =
+      typeof authOut === 'number' && Number.isFinite(authOut) && authOut > 0;
 
-      this._pendingCalibration = {
-        durationMs,
-        baselineOutputTokens: this._turnStartOutputTokens,
-        endedAt: now,
-      };
+    if (durationMs >= MIN_STREAM_DURATION_MS) {
+      if (hasAuthoritativeOut) {
+        const authTps = authOut / (durationMs / 1000);
+        if (Number.isFinite(authTps) && authTps > 0 && authTps <= MAX_REASONABLE_TPS) {
+          this._currentTps = authTps;
+        }
+        // Authoritative per-turn outputTokens already applied; do not arm transcript delta calibration
+        this._pendingCalibration = null;
+      } else {
+        const deltaAlreadySynced = this._totalOutputTokens - this._turnStartOutputTokens;
+        if (deltaAlreadySynced > 0) {
+          const syncedTps = deltaAlreadySynced / (durationMs / 1000);
+          if (Number.isFinite(syncedTps) && syncedTps > 0 && syncedTps <= MAX_REASONABLE_TPS) {
+            this._currentTps = syncedTps;
+          }
+        } else if (this._currentTps === null && this._turnEstimatedTokens > 0) {
+          const estTps = this._turnEstimatedTokens / (durationMs / 1000);
+          if (Number.isFinite(estTps) && estTps > 0 && estTps <= MAX_REASONABLE_TPS) {
+            this._currentTps = estTps;
+          }
+        }
+
+        this._pendingCalibration = {
+          durationMs,
+          baselineOutputTokens: this._turnStartOutputTokens,
+          endedAt: now,
+        };
+      }
     } else {
       this._pendingCalibration = null;
     }
 
     this._turnStartTime = null;
+    this._segmentStartTime = null;
+    this._accumulatedToolWaitMs = 0;
     this._samples = [];
     return this.getSnapshot();
   }
@@ -609,7 +708,7 @@ export class SessionMetricsTracker {
       return this.getSnapshot();
     }
 
-    const hadNonCheckpointOutputDelta = this.consumeAppendedBytes(
+    const { hadNonCheckpointOutputDelta, addedResponses } = this.consumeAppendedBytes(
       newBytes,
       readFromOffset === 0,
     );
@@ -617,25 +716,44 @@ export class SessionMetricsTracker {
     this._byteOffset = readFromOffset + newBytes.length;
     this._lastMtimeMs = st.mtimeMs;
 
-    // Post-turn TPS calibration using authoritative output_tokens delta
+    // One-shot post-turn TPS calibration using authoritative output_tokens delta.
+    // Guard against polluting calibration with historical multi-response backfills
+    // (when reading from byte offset 0 on an existing resumed session) and consume
+    // `_pendingCalibration` immediately once applied so subsequent steps never
+    // accumulate against a stale short duration.
     if (!this._streaming && this._pendingCalibration !== null) {
       const cal = this._pendingCalibration;
       if (this._now() - cal.endedAt > CALIBRATION_EXPIRY_MS) {
         this._pendingCalibration = null;
+      } else if (readFromOffset === 0 && cal.baselineOutputTokens === 0 && addedResponses > 1) {
+        this._pendingCalibration = null;
       } else if (hadNonCheckpointOutputDelta) {
         const deltaOutput = this._totalOutputTokens - cal.baselineOutputTokens;
         if (deltaOutput > 0 && cal.durationMs >= MIN_STREAM_DURATION_MS) {
-          this._currentTps = deltaOutput / (cal.durationMs / 1000);
-          this._isStreamingTps = false;
+          const calibratedTps = deltaOutput / (cal.durationMs / 1000);
+          if (
+            Number.isFinite(calibratedTps) &&
+            calibratedTps > 0 &&
+            calibratedTps <= MAX_REASONABLE_TPS
+          ) {
+            this._currentTps = calibratedTps;
+            this._isStreamingTps = false;
+          }
         }
+        this._pendingCalibration = null;
       }
     }
 
     return this.getSnapshot();
   }
 
-  private consumeAppendedBytes(chunk: Buffer, isStartOfFile: boolean): boolean {
-    if (chunk.length === 0) return false;
+  private consumeAppendedBytes(
+    chunk: Buffer,
+    isStartOfFile: boolean,
+  ): { readonly hadNonCheckpointOutputDelta: boolean; readonly addedResponses: number } {
+    if (chunk.length === 0) {
+      return { hadNonCheckpointOutputDelta: false, addedResponses: 0 };
+    }
 
     const combined =
       this._pendingBytes.length > 0 ? Buffer.concat([this._pendingBytes, chunk]) : chunk;
@@ -644,7 +762,7 @@ export class SessionMetricsTracker {
     if (lastNewlineIdx === -1) {
       // Incomplete line without newline yet; retain raw bytes to avoid splitting UTF-8 sequences
       this._pendingBytes = Buffer.from(combined);
-      return false;
+      return { hadNonCheckpointOutputDelta: false, addedResponses: 0 };
     }
 
     const completeSlice = combined.subarray(0, lastNewlineIdx + 1);
@@ -657,6 +775,7 @@ export class SessionMetricsTracker {
     }
 
     let sawNonCheckpointOutputDelta = false;
+    let addedResponses = 0;
     const lines = text.split(/\r?\n/);
     for (const line of lines) {
       const parsed = parseTranscriptTokenLine(line);
@@ -665,12 +784,13 @@ export class SessionMetricsTracker {
       this._totalCacheReadTokens += parsed.cacheReadTokens;
       this._totalOutputTokens += parsed.outputTokens;
       this._responseCount += 1;
+      addedResponses += 1;
       if (!parsed.isCheckpoint && parsed.outputTokens > 0) {
         sawNonCheckpointOutputDelta = true;
       }
     }
 
-    return sawNonCheckpointOutputDelta;
+    return { hadNonCheckpointOutputDelta: sawNonCheckpointOutputDelta, addedResponses };
   }
 }
 
