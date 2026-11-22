@@ -35,6 +35,7 @@ export interface AppViewProps {
   readonly commands: readonly SlashCommandDef[];
   readonly trafficEntries: readonly TrafficEntry[];
   readonly toolPreviewLines: number;
+  readonly evictedNodeIds?: ReadonlySet<string>;
   readonly config?: OmaConfig;
   readonly configPath?: string;
   readonly agySettingsPath?: string;
@@ -116,6 +117,7 @@ export function buildAppView(props: AppViewProps): ViewInput {
     commands,
     trafficEntries,
     toolPreviewLines,
+    evictedNodeIds,
     config,
     configPath,
     agySettingsPath,
@@ -132,6 +134,7 @@ export function buildAppView(props: AppViewProps): ViewInput {
       plan={plan}
       version={version}
       toolPreviewLines={toolPreviewLines}
+      evictedNodeIds={evictedNodeIds}
       now={now}
       callbacks={callbacks.transcript}
     />

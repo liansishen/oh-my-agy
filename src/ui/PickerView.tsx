@@ -2029,6 +2029,10 @@ export function HelpOverlayView(props: HelpOverlayViewProps): JSX.Element {
       cells: { keys: keycapSpans(['ctrl+o']), action: 'Toggle expand all tools' },
     },
     {
+      id: 'tool-visibility',
+      cells: { keys: keycapSpans(['ctrl+shift+o']), action: 'Show or hide tool activity' },
+    },
+    {
       id: 'tool-display',
       cells: { keys: keycapSpans(['alt+o']), action: 'Cycle tool display mode' },
     },

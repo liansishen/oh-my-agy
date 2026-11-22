@@ -606,6 +606,7 @@ export class AppStore {
   private _showThinking: boolean;
   private _expandAllTools: boolean;
   private _toolDisplayMode: ToolDisplayMode;
+  private _lastVisibleToolDisplayMode: Exclude<ToolDisplayMode, 'hidden'>;
   private _expandedToolGroups: Record<string, boolean> = {};
   private _promptCapabilities: PromptCapabilities = {};
 
@@ -645,6 +646,8 @@ export class AppStore {
     this._showThinking = options.showThinking ?? true;
     this._expandAllTools = options.expandAllTools ?? false;
     this._toolDisplayMode = options.toolDisplayMode ?? 'all';
+    this._lastVisibleToolDisplayMode =
+      this._toolDisplayMode === 'hidden' ? 'compact' : this._toolDisplayMode;
 
     this.draft = new DraftEngine({
       now: this._now,
@@ -747,7 +750,6 @@ export class AppStore {
     if (this._expandAllTools === expand) return;
     this._expandAllTools = expand;
     this.transcript.setAllToolsCollapsed(!expand);
-    this.transcript.setAllThoughtsOpen(expand && this._showThinking);
     this.emit();
   }
 
@@ -755,13 +757,15 @@ export class AppStore {
     const next = !this._expandAllTools;
     this._expandAllTools = next;
     this.transcript.setAllToolsCollapsed(!next);
-    this.transcript.setAllThoughtsOpen(next && this._showThinking);
     this.emit();
     return next;
   }
 
   setToolDisplayMode(mode: ToolDisplayMode): void {
     if (this._toolDisplayMode === mode) return;
+    if (mode !== 'hidden') {
+      this._lastVisibleToolDisplayMode = mode;
+    }
     this._toolDisplayMode = mode;
     this.emit();
   }
@@ -770,6 +774,21 @@ export class AppStore {
     const order: readonly ToolDisplayMode[] = ['all', 'compact', 'hidden'];
     const idx = order.indexOf(this._toolDisplayMode);
     const next = order[(idx + 1) % order.length] ?? 'all';
+    if (next !== 'hidden') {
+      this._lastVisibleToolDisplayMode = next;
+    }
+    this._toolDisplayMode = next;
+    this.emit();
+    return next;
+  }
+
+  /**
+   * Toggle tool activity visibility (`Ctrl+Shift+O`, aligned with `omp` `app.tools.toggleVisibility`):
+   * flips between `'hidden'` and the last non-hidden display mode (`'all'` or `'compact'`).
+   */
+  toggleToolVisibility(): ToolDisplayMode {
+    const next: ToolDisplayMode =
+      this._toolDisplayMode === 'hidden' ? this._lastVisibleToolDisplayMode : 'hidden';
     this._toolDisplayMode = next;
     this.emit();
     return next;

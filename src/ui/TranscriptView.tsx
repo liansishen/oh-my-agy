@@ -5,6 +5,7 @@ import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
 import {
+  estimateTokensFromText,
   formatFullLocalTime,
   formatTurnTime,
   type ActiveQuestionCard,
@@ -54,6 +55,7 @@ export interface TranscriptViewProps {
   readonly plan: PlanState | null;
   readonly version: string;
   readonly toolPreviewLines: number;
+  readonly evictedNodeIds?: ReadonlySet<string>;
   readonly now?: number;
   readonly callbacks: TranscriptCallbacks;
 }
@@ -66,6 +68,29 @@ function formatShortDuration(ms: number): string {
   const mins = Math.floor(secs / 60);
   const rem = Math.round(secs % 60);
   return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
+}
+
+/**
+ * Format completed thought duration aligned with `omp` (`W2e`):
+ * whole seconds with a 1s floor under 60s (`Thought for 1s`, `Thought for 4s`),
+ * and `Xm Ys` at or above 60s.
+ */
+function formatThoughtDuration(ms: number): string {
+  const safe = Math.max(0, ms);
+  if (safe < 60_000) {
+    return `${Math.max(1, Math.round(safe / 1000))}s`;
+  }
+  const totalSecs = Math.round(safe / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const rem = totalSecs % 60;
+  return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
+}
+
+function formatCompactTokenCount(tokens: number): string {
+  if (tokens >= 1000) {
+    return `${(tokens / 1000).toFixed(1)}k`;
+  }
+  return String(tokens);
 }
 
 function formatTurnUsageLabel(turn: TranscriptTurn): string {
@@ -196,8 +221,15 @@ function resolveToolVerbTitle(tool: ToolCallItem): string {
   return key.length > 0 ? `${key[0]!.toUpperCase()}${key.slice(1)}` : rawTitle;
 }
 
-function resolveToolFrame(tool: ToolCallItem): 'inline' | 'card' {
+function resolveToolFrame(
+  tool: ToolCallItem,
+  toolDisplayMode: ToolDisplayMode,
+  isPendingOrRunning: boolean,
+): 'inline' | 'card' {
   if (tool.status === 'ask') return 'card';
+  if (toolDisplayMode === 'compact' && !isPendingOrRunning) {
+    return 'inline';
+  }
   const name = tool.displayName.toLowerCase();
   if (name === 'edit' || name === 'write' || name === 'todo' || name === 'task') {
     return 'card';
@@ -478,13 +510,19 @@ function renderToolItem(
   relatedAgents: readonly SubagentEntry[],
   toolPreviewLines: number,
   expandAllTools: boolean,
+  toolDisplayMode: ToolDisplayMode,
   turnStatus: TranscriptTurn['status'],
   now: number,
-  callbacks: TranscriptCallbacks
+  callbacks: TranscriptCallbacks,
+  nodeKey: string = tool.toolCallId
 ): JSX.Element {
   const isAsk = tool.status === 'ask';
   const isToolRunning =
     tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming';
+  const isPendingOrRunning =
+    (tool.status === 'pending' || tool.status === 'running') &&
+    tool.endedAt === undefined &&
+    turnStatus === 'streaming';
   const toolAge = isToolRunning ? Math.max(0, now - tool.startedAt) : undefined;
   const toolTook = isToolRunning
     ? undefined
@@ -504,12 +542,13 @@ function renderToolItem(
   if (relatedAgents.length > 0) {
     return (
       <tool
-        key={tool.toolCallId}
+        key={nodeKey}
         role="omp.tool.task"
         name="task"
         title="Task"
         target={tool.title}
         targetKind="text"
+        intent={tool.intent}
         status={tool.status}
         age={toolAge}
         took={toolTook}
@@ -526,32 +565,42 @@ function renderToolItem(
 
   const bodyNodes = renderToolBody(tool, toolPreviewLines, turnStatus, now);
   const hasBody = bodyNodes.length > 0;
-  const frame = resolveToolFrame(tool);
+  const frame = resolveToolFrame(tool, toolDisplayMode, isPendingOrRunning);
   const toolRole = `omp.tool.${tool.displayName}`;
+  const isEditOrWrite = tool.displayName === 'edit' || tool.displayName === 'write';
   const effectiveCollapsed = isAsk
     ? false
     : tool.userToggled
       ? tool.collapsed
       : expandAllTools
         ? false
-        : tool.collapsed;
+        : isEditOrWrite && isPendingOrRunning
+          ? false
+          : tool.collapsed;
   const href = resolveToolFileHref(tool);
   const meta = computeToolMeta(tool);
   const previewProp =
-    frame === 'inline'
-      ? ('none' as const)
-      : tool.displayName !== 'bash' && hasBody
-        ? { lines: toolPreviewLines }
-        : undefined;
+    tool.displayName === 'bash'
+      ? hasBody && (toolDisplayMode === 'all' || isToolRunning)
+        ? ('children' as const)
+        : ('none' as const)
+      : frame === 'inline'
+        ? ('none' as const)
+        : toolDisplayMode === 'compact' && isEditOrWrite && effectiveCollapsed && !isPendingOrRunning
+          ? ('none' as const)
+          : hasBody
+            ? { lines: toolPreviewLines }
+            : undefined;
 
   return (
     <tool
-      key={tool.toolCallId}
+      key={nodeKey}
       role={toolRole}
       name={tool.displayName}
       title={resolveToolVerbTitle(tool)}
       target={tool.target}
       targetKind={tool.targetKind}
+      intent={tool.intent}
       href={href}
       meta={meta}
       exit={tool.exitCode}
@@ -577,12 +626,13 @@ function renderToolItem(
 
 function renderNotice(
   notice: NoticeItem,
-  onToggleNotice: (noticeId: string, collapsed: boolean) => void
+  onToggleNotice: (noticeId: string, collapsed: boolean) => void,
+  nodeKey: string = notice.id
 ): JSX.Element {
   if (notice.kind === 'compaction') {
     return (
       <section
-        key={notice.id}
+        key={nodeKey}
         role="omp.compaction"
         head={notice.text}
         collapsible
@@ -610,7 +660,7 @@ function renderNotice(
 
   return (
     <row
-      key={notice.id}
+      key={nodeKey}
       role={`omp.notice.${notice.level}`}
       tone={notice.level}
       gap="sm"
@@ -747,8 +797,8 @@ function renderQuestionCard(
 
 type TimelineGroup =
   | { readonly kind: 'assistant'; readonly key: string; readonly refs: TurnTimelineRef[] }
-  | { readonly kind: 'compact-tools'; readonly key: string; readonly tools: ToolCallItem[] }
-  | { readonly kind: 'folded-tools'; readonly key: string; readonly tools: ToolCallItem[] }
+  | { readonly kind: 'read-group'; readonly key: string; readonly tools: ToolCallItem[] }
+  | { readonly kind: 'hidden-tools'; readonly key: string; readonly tools: ToolCallItem[] }
   | { readonly kind: 'tool'; readonly tool: ToolCallItem }
   | { readonly kind: 'notice'; readonly notice: NoticeItem };
 
@@ -765,65 +815,44 @@ function isRoutineCollapsibleTool(
   return true;
 }
 
-function formatToolGroupCategory(tool: ToolCallItem): string {
-  switch (tool.displayName) {
-    case 'bash':
-      return 'Bash';
-    case 'read':
-      return 'Read';
-    case 'edit':
-      return 'Edit';
-    case 'write':
-      return 'Write';
-    case 'find':
-      return 'Find';
-    case 'grep':
-      return 'Grep';
-    case 'web':
-      return 'Web';
-    default: {
-      const label = tool.rawName?.trim() || tool.displayName?.trim() || tool.title?.trim() || 'Tool';
-      return label.replace(/^Run\s+/i, '').trim() || 'Tool';
-    }
-  }
+function isGroupableReadTool(
+  tool: ToolCallItem,
+  relatedAgents: readonly SubagentEntry[],
+  turnStatus: TranscriptTurn['status'],
+): boolean {
+  return (
+    tool.displayName === 'read' &&
+    tool.status === 'done' &&
+    isRoutineCollapsibleTool(tool, relatedAgents, turnStatus)
+  );
 }
 
-function summarizeFoldedTools(tools: readonly ToolCallItem[]): {
-  readonly summary: string;
-  readonly totalTookMs: number;
-  readonly errorCount: number;
-} {
-  const counts = new Map<string, number>();
-  let totalTookMs = 0;
-  let errorCount = 0;
-
+function summarizeReadGroupPreview(tools: readonly ToolCallItem[]): string {
+  const names: string[] = [];
   for (const tool of tools) {
-    const cat = formatToolGroupCategory(tool);
-    counts.set(cat, (counts.get(cat) ?? 0) + 1);
+    const raw = tool.target?.trim() || tool.title.trim();
+    const base = raw ? splitPathDirAndName(raw).name : '';
+    if (base && !names.includes(base)) {
+      names.push(base);
+    }
+  }
+  if (names.length === 0) return '';
+  if (names.length <= 3) return names.join(', ');
+  return `${names.slice(0, 3).join(', ')} +${names.length - 3}`;
+}
+
+function sumToolDurationMs(tools: readonly ToolCallItem[]): number {
+  let totalTookMs = 0;
+  for (const tool of tools) {
     const ms =
       tool.tookMs !== undefined
         ? tool.tookMs
-        : tool.endedAt !== undefined
+        : !tool.replayed && tool.endedAt !== undefined
           ? Math.max(0, tool.endedAt - tool.startedAt)
           : 0;
     totalTookMs += ms;
-    if (tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)) {
-      errorCount += 1;
-    }
   }
-
-  const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const topParts = ordered.slice(0, 4).map(([cat, n]) => `${n} ${cat}`);
-  if (ordered.length > 4) {
-    const rest = ordered.slice(4).reduce((sum, [, n]) => sum + n, 0);
-    topParts.push(`+${rest} more`);
-  }
-
-  return {
-    summary: `${tools.length} tool calls (${topParts.join(' · ')})`,
-    totalTookMs,
-    errorCount,
-  };
+  return totalTookMs;
 }
 
 function groupTurnTimeline(
@@ -837,9 +866,20 @@ function groupTurnTimeline(
 
   for (const ref of turn.timeline) {
     if (ref.kind === 'thought') {
-      if (!options.showThinking) continue;
+      const thought = turn.thoughts.find(t => t.id === ref.id);
+      const isLiveThought = Boolean(
+        thought &&
+          thought.status === 'running' &&
+          thought.endedAt === undefined &&
+          turn.status === 'streaming'
+      );
+      if (!options.showThinking && !isLiveThought) continue;
+      // Keep thought-only `<col role="omp.assistant">` nodes separate from assistant prose
+      // so Tern's native `Worked for ...` work-collapsing engine absorbs a trailing thought
+      // right after tool calls into the collapsed work summary instead of leaving a lone
+      // `Thought >` stranded above the final reply.
       const prev = groups[groups.length - 1];
-      if (prev && prev.kind === 'assistant') {
+      if (prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'thought')) {
         prev.refs.push(ref);
       } else {
         groups.push({ kind: 'assistant', key: `assistant-${ref.id}`, refs: [ref] });
@@ -849,7 +889,7 @@ function groupTurnTimeline(
 
     if (ref.kind === 'assistant') {
       const prev = groups[groups.length - 1];
-      if (prev && prev.kind === 'assistant') {
+      if (prev && prev.kind === 'assistant' && prev.refs.every(r => r.kind === 'assistant')) {
         prev.refs.push(ref);
       } else {
         groups.push({ kind: 'assistant', key: `assistant-${ref.id}`, refs: [ref] });
@@ -864,60 +904,50 @@ function groupTurnTimeline(
       const isRoutine = isRoutineCollapsibleTool(tool, relatedAgents, turn.status);
 
       if (options.toolDisplayMode === 'hidden' && isRoutine) {
+        const prev = groups[groups.length - 1];
+        if (prev && prev.kind === 'hidden-tools') {
+          prev.tools.push(tool);
+        } else {
+          groups.push({
+            kind: 'hidden-tools',
+            key: `activity-${tool.toolCallId}`,
+            tools: [tool],
+          });
+        }
         continue;
       }
 
-      if (options.toolDisplayMode === 'compact' && isRoutine) {
+      // In both 'all' and 'compact' modes, emit ONLY native top-level `<tool>` nodes
+      // (never custom `<section>` wrappers like `oma.tool.group`), so Tern's native
+      // `.sf-work-head` / `.sf-work` work-sequence collapsing engine folds an entire
+      // thought + tool run seamlessly without breaking the chain.
+      // Consecutive completed Reads aggregate into a single native `<tool role="omp.tool.read">`
+      // matching `omp`'s `ReadToolGroupComponent`.
+      if (isGroupableReadTool(tool, relatedAgents, turn.status)) {
         const prev = groups[groups.length - 1];
-        if (prev && prev.kind === 'folded-tools') {
+        if (prev && prev.kind === 'read-group') {
           prev.tools.push(tool);
-        } else if (
+          continue;
+        }
+        if (
           prev &&
           prev.kind === 'tool' &&
-          isRoutineCollapsibleTool(
+          isGroupableReadTool(
             prev.tool,
             turn.agents.filter(a => a.toolCallId === prev.tool.toolCallId),
             turn.status,
           )
         ) {
           groups[groups.length - 1] = {
-            kind: 'folded-tools',
-            key: `folded-${prev.tool.toolCallId}`,
+            kind: 'read-group',
+            key: `read-group-${prev.tool.toolCallId}`,
             tools: [prev.tool, tool],
           };
-        } else {
-          groups.push({ kind: 'tool', tool });
+          continue;
         }
-        continue;
       }
 
-      const isCompact =
-        relatedAgents.length === 0 &&
-        tool.status !== 'ask' &&
-        resolveToolFrame(tool) === 'inline';
-
-      if (isCompact) {
-        const prev = groups[groups.length - 1];
-        if (prev && prev.kind === 'compact-tools') {
-          prev.tools.push(tool);
-        } else if (
-          prev &&
-          prev.kind === 'tool' &&
-          turn.agents.every(a => a.toolCallId !== prev.tool.toolCallId) &&
-          prev.tool.status !== 'ask' &&
-          resolveToolFrame(prev.tool) === 'inline'
-        ) {
-          groups[groups.length - 1] = {
-            kind: 'compact-tools',
-            key: `compact-${prev.tool.toolCallId}`,
-            tools: [prev.tool, tool],
-          };
-        } else {
-          groups.push({ kind: 'tool', tool });
-        }
-      } else {
-        groups.push({ kind: 'tool', tool });
-      }
+      groups.push({ kind: 'tool', tool });
       continue;
     }
 
@@ -1030,21 +1060,20 @@ function renderTurnFooterNodes(
 }
 
 /**
- * Main transcript region aligned 1:1 with `omp`'s native TSP layout:
- * - Root `<col role="omp.transcript">` (direct child `<col key="turn-N">` keeps ID `main.turn-N`
- *   for `surface.settle()` and `GoneEvent` eviction!)
- * - Welcome card: `<card key="welcome" role="omp.welcome">`
- * - User message: `<card key="user" role="omp.user" tone="user">` with `hour12` timestamp,
- *   full-time hover tooltip, and context menu (`Copy message` / `Edit & resend` / `Retry turn`)
- * - Assistant container: `<col role="omp.assistant">` with `<section role="omp.thinking|omp.thinking.live" took={...}>`
- *   controlled by `showThinking` / `expandAllTools`, direct `<md>`, `omp.error` with action bar, and `omp.turn.usage`
- * - Tools: `<tool role="omp.tool.<name>" frame="inline|card">` with `preview="none"` & `href` on inline tools,
- *   `omp.tool.file` path rows, live `<elapsed role="omp.run.time">` & truncated bash commands, and `omp.tool.task`
+ * Main transcript region aligned 1:1 with `omp`'s native flat TSP layout:
+ * - Root `<col role="omp.transcript">` with **flat direct children** (`main.t<N>-user`,
+ *   `main.t<N>-assistant-*`, `main.t<N>-<toolCallId>`, `main.t<N>-read-group-*`, etc.)
+ *   so Tern's native `.sf-main >` selectors activate automatically:
+ *   - `.sf-work-head` / `.sf-work` / `.sf-folded` automatic work-sequence collapsing
+ *   - `.sf-thought-lead` / `.sf-thought-more` / `.sf-thought-gone` consecutive thought merging
+ *   - Chat Reader measure, Chat Spine timeline dots, `omp-arrive` animation, and frameless tools
+ * - Individual top-level nodes are settled via `RenderScheduler.settleTurn()` and filtered on `GoneEvent`.
  */
 export function TranscriptView(props: TranscriptViewProps): JSX.Element {
-  const { state, turns, plan, version, toolPreviewLines, callbacks } = props;
+  const { state, turns, plan, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
   const now = props.now ?? Date.now();
   const lastTurn = turns[turns.length - 1];
+  const isEvicted = (key: string): boolean => Boolean(evictedNodeIds?.has(`main.${key}`));
 
   const welcomeTipSpans: readonly (string | SpanData)[] = [
     { t: 'Type ', s: 'muted' },
@@ -1108,7 +1137,8 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
         </card>
       ) : null}
 
-      {turns.map(turn => {
+      {turns.flatMap(turn => {
+        const turnPrefix = `t${turn.index}-`;
         const isLastTurn = lastTurn?.index === turn.index;
         const lastTimelineRef = turn.timeline[turn.timeline.length - 1];
         const groups = groupTurnTimeline(turn, {
@@ -1119,7 +1149,8 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
 
         let lastAssistantGroupIdx = -1;
         for (let i = groups.length - 1; i >= 0; i--) {
-          if (groups[i]?.kind === 'assistant') {
+          const g = groups[i];
+          if (g?.kind === 'assistant' && g.refs.some(r => r.kind === 'assistant')) {
             lastAssistantGroupIdx = i;
             break;
           }
@@ -1138,11 +1169,14 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
           ? formatFullLocalTime(userTs, state.hour12)
           : '';
 
-        return (
-          <col key={`turn-${turn.index}`}>
-            {turn.user ? (
+        const turnNodes: JSX.Element[] = [];
+
+        if (turn.user) {
+          const userKey = `${turnPrefix}user`;
+          if (!isEvicted(userKey)) {
+            turnNodes.push(
               <card
-                key="user"
+                key={userKey}
                 role="omp.user"
                 tone="user"
                 actions={{
@@ -1206,208 +1240,239 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
                   </row>
                 ) : null}
               </card>
-            ) : null}
+            );
+          }
+        }
 
-            {groups.map((group, groupIdx) => {
-              if (group.kind === 'assistant') {
-                const isFinalAssistantGroup = groupIdx === lastAssistantGroupIdx;
-                return (
-                  <col key={group.key} role="omp.assistant">
-                    {group.refs.map(ref => {
-                      if (ref.kind === 'thought') {
-                        if (!state.showThinking) return null;
-                        const thought = turn.thoughts.find(t => t.id === ref.id);
-                        if (!thought) return null;
-                        const isLive =
-                          thought.status === 'running' &&
-                          thought.endedAt === undefined &&
-                          turn.status === 'streaming';
-                        const elapsedMs = isLive
-                          ? Math.max(0, now - thought.startedAt)
-                          : thought.tookMs !== undefined
-                            ? thought.tookMs
-                            : thought.replayed
-                              ? undefined
-                              : thought.endedAt !== undefined
-                                ? Math.max(0, thought.endedAt - thought.startedAt)
-                                : turn.endedAt !== undefined
-                                  ? Math.max(0, turn.endedAt - thought.startedAt)
-                                  : undefined;
-                        const durText =
-                          elapsedMs !== undefined ? formatShortDuration(elapsedMs) : undefined;
-                        const effectiveOpen = thought.userToggled
-                          ? thought.open
-                          : state.expandAllTools
-                            ? true
-                            : thought.open;
+        groups.forEach((group, groupIdx) => {
+          if (group.kind === 'assistant') {
+            const nodeKey = `${turnPrefix}${group.key}`;
+            if (isEvicted(nodeKey)) return;
+            const isFinalAssistantGroup = groupIdx === lastAssistantGroupIdx;
+            turnNodes.push(
+              <col key={nodeKey} role="omp.assistant">
+                {group.refs.map(ref => {
+                  if (ref.kind === 'thought') {
+                    const thought = turn.thoughts.find(t => t.id === ref.id);
+                    if (!thought) return null;
+                    const isLive =
+                      thought.status === 'running' &&
+                      thought.endedAt === undefined &&
+                      turn.status === 'streaming';
+                    if (!state.showThinking && !isLive) return null;
+                    const elapsedMs = isLive
+                      ? Math.max(0, now - thought.startedAt)
+                      : thought.tookMs !== undefined
+                        ? thought.tookMs
+                        : thought.replayed
+                          ? undefined
+                          : thought.endedAt !== undefined
+                            ? Math.max(0, thought.endedAt - thought.startedAt)
+                            : turn.endedAt !== undefined
+                              ? Math.max(0, turn.endedAt - thought.startedAt)
+                              : undefined;
+                    const durText =
+                      elapsedMs !== undefined ? formatThoughtDuration(elapsedMs) : undefined;
+                    const effectiveOpen = thought.open;
+                    const thoughtTokens = estimateTokensFromText(thought.text);
+                    const thoughtTokenTitle =
+                      thoughtTokens > 0
+                        ? `${formatCompactTokenCount(thoughtTokens)} tokens`
+                        : undefined;
+                    const liveThoughtTps =
+                      isLive &&
+                      state.sessionMetrics?.isStreamingTps &&
+                      state.sessionMetrics.currentTps !== null &&
+                      state.sessionMetrics.currentTps >= 0.05
+                        ? state.sessionMetrics.currentTps
+                        : undefined;
 
-                        return (
-                          <section
-                            key={thought.id}
-                            role={isLive ? 'omp.thinking.live' : 'omp.thinking'}
-                            took={isLive ? undefined : elapsedMs}
-                            collapsible
-                            collapsed={!effectiveOpen}
-                            head={
-                              isLive ? (
-                                <row gap="sm" align="center">
-                                  <spinner
-                                    key="spin"
-                                    style="starburst"
-                                    role="omp.thinking.spin"
-                                  />
-                                  <text key="lbl" spans={[{ t: 'Thinking…', s: 'muted' }]} />
-                                  <elapsed key="age" age={elapsedMs ?? 0} format="short" />
-                                </row>
-                              ) : (
-                                [
-                                  {
-                                    t: durText ? `Thought for ${durText}` : 'Thought',
-                                    s: 'muted',
-                                  },
-                                ]
-                              )
-                            }
-                            onToggle={ev => {
-                              const nextOpen =
-                                ev.collapsed !== undefined
-                                  ? !ev.collapsed
-                                  : (ev.open ?? !effectiveOpen);
-                              callbacks.onToggleThought(thought.id, nextOpen);
-                            }}
-                          >
-                            <md key="body" text={thought.text} stream={isLive} />
-                          </section>
-                        );
-                      }
+                    return (
+                      <section
+                        key={thought.id}
+                        role={isLive ? 'omp.thinking.live' : 'omp.thinking'}
+                        title={isLive ? undefined : thoughtTokenTitle}
+                        took={isLive ? undefined : elapsedMs}
+                        collapsible
+                        collapsed={!effectiveOpen}
+                        head={
+                          isLive ? (
+                            <row gap="sm" align="center" title={thoughtTokenTitle}>
+                              <spinner
+                                key="spin"
+                                style="starburst"
+                                role="omp.thinking.spin"
+                              />
+                              <text key="lbl" spans={[{ t: 'Thinking…', s: 'muted' }]} />
+                              <elapsed key="age" age={elapsedMs ?? 0} format="short" />
+                              {liveThoughtTps !== undefined ? (
+                                <rate key="rate" value={liveThoughtTps} unit="tok/s" />
+                              ) : null}
+                            </row>
+                          ) : (
+                            [
+                              {
+                                t: durText ? `Thought for ${durText}` : 'Thought',
+                                s: 'muted',
+                              },
+                            ]
+                          )
+                        }
+                        onToggle={ev => {
+                          const nextOpen =
+                            ev.collapsed !== undefined
+                              ? !ev.collapsed
+                              : (ev.open ?? !effectiveOpen);
+                          callbacks.onToggleThought(thought.id, nextOpen);
+                        }}
+                      >
+                        <md key="body" text={thought.text} stream={isLive} />
+                      </section>
+                    );
+                  }
 
-                      if (ref.kind === 'assistant') {
-                        const seg = turn.assistantSegments.find(s => s.id === ref.id);
-                        if (!seg) return null;
-                        const isActiveTrailingAssistant =
-                          lastTimelineRef?.kind === 'assistant' && lastTimelineRef.id === seg.id;
-                        const isStreamingSeg =
-                          turn.status === 'streaming' && isLastTurn && isActiveTrailingAssistant;
+                  if (ref.kind === 'assistant') {
+                    const seg = turn.assistantSegments.find(s => s.id === ref.id);
+                    if (!seg) return null;
+                    const isActiveTrailingAssistant =
+                      lastTimelineRef?.kind === 'assistant' && lastTimelineRef.id === seg.id;
+                    const isStreamingSeg =
+                      turn.status === 'streaming' && isLastTurn && isActiveTrailingAssistant;
 
-                        return (
-                          <md
-                            key={seg.id}
-                            text={seg.text}
-                            stream={isStreamingSeg}
-                            cwd={state.displayCwd}
-                            icons
-                          />
-                        );
-                      }
+                    return (
+                      <md
+                        key={seg.id}
+                        text={seg.text}
+                        stream={isStreamingSeg}
+                        cwd={state.displayCwd}
+                        icons
+                      />
+                    );
+                  }
 
-                      return null;
-                    })}
-                    {isFinalAssistantGroup ? footerNodes : null}
-                  </col>
-                );
-              }
+                  return null;
+                })}
+                {isFinalAssistantGroup ? footerNodes : null}
+              </col>
+            );
+            return;
+          }
 
-              if (group.kind === 'folded-tools') {
-                const groupId = `turn-${turn.index}:${group.key}`;
-                const expanded = Boolean(state.expandedToolGroups[groupId]);
-                const { summary, totalTookMs, errorCount } = summarizeFoldedTools(group.tools);
-                const durText = totalTookMs > 0 ? formatShortDuration(totalTookMs) : undefined;
-                return (
-                  <section
-                    key={group.key}
-                    role="oma.tool.group"
-                    collapsible
-                    collapsed={!expanded}
-                    took={totalTookMs > 0 ? totalTookMs : undefined}
-                    head={
-                      <row key="head" gap="xs" align="center">
-                        <icon key="ic" name="tools" tone={errorCount > 0 ? 'warning' : 'muted'} />
-                        <text
-                          key="lbl"
-                          spans={[
-                            { t: summary, s: 'muted' },
-                            ...(durText ? [{ t: ` · ${durText}`, s: 'dim mono' as const }] : []),
-                          ]}
-                          wrap="none"
-                          truncate="end"
-                        />
-                        {errorCount > 0 ? (
-                          <badge
-                            key="err"
-                            text={`${errorCount} ${errorCount === 1 ? 'error' : 'errors'}`}
-                            tone="error"
-                          />
-                        ) : null}
-                      </row>
-                    }
-                    onToggle={ev => {
-                      const nextExpanded =
-                        ev.collapsed !== undefined
-                          ? !ev.collapsed
-                          : (ev.open ?? !expanded);
-                      callbacks.onToggleToolGroup?.(groupId, nextExpanded);
-                    }}
-                  >
-                    <col key="items" gap="none">
-                      {group.tools.map(tool =>
-                        renderToolItem(
-                          tool,
-                          [],
-                          toolPreviewLines,
-                          state.expandAllTools,
-                          turn.status,
-                          now,
-                          callbacks
-                        )
-                      )}
-                    </col>
-                  </section>
-                );
-              }
+          if (group.kind === 'hidden-tools') {
+            const nodeKey = `${turnPrefix}${group.key}`;
+            if (isEvicted(nodeKey)) return;
+            turnNodes.push(
+              <col key={nodeKey} role="omp.activity" hidden>
+                {group.tools.map(tool =>
+                  renderToolItem(
+                    tool,
+                    [],
+                    toolPreviewLines,
+                    state.expandAllTools,
+                    state.toolDisplayMode,
+                    turn.status,
+                    now,
+                    callbacks
+                  )
+                )}
+              </col>
+            );
+            return;
+          }
 
-              if (group.kind === 'compact-tools') {
-                return (
-                  <col key={group.key} role="omp.compact" gap="none">
-                    {group.tools.map(tool =>
-                      renderToolItem(
-                        tool,
-                        [],
-                        toolPreviewLines,
-                        state.expandAllTools,
-                        turn.status,
-                        now,
-                        callbacks
-                      )
-                    )}
-                  </col>
-                );
-              }
+          if (group.kind === 'read-group') {
+            const nodeKey = `${turnPrefix}${group.key}`;
+            if (isEvicted(nodeKey)) return;
+            const groupId = `turn-${turn.index}:${group.key}`;
+            const userExpanded = state.expandedToolGroups[groupId];
+            const expanded =
+              userExpanded !== undefined ? Boolean(userExpanded) : state.expandAllTools;
+            const previewNames = summarizeReadGroupPreview(group.tools);
+            const totalTookMs = sumToolDurationMs(group.tools);
+            const meta: readonly (readonly SpanData[])[] | undefined = previewNames
+              ? [[{ t: previewNames, s: 'muted' }]]
+              : undefined;
+            turnNodes.push(
+              <tool
+                key={nodeKey}
+                role="omp.tool.read"
+                name="read"
+                title="Read"
+                target={`${group.tools.length} ${group.tools.length === 1 ? 'file' : 'files'}`}
+                targetKind="text"
+                meta={meta}
+                status="done"
+                took={totalTookMs > 0 ? totalTookMs : undefined}
+                frame="inline"
+                collapsible
+                collapsed={!expanded}
+                preview="none"
+                onToggle={ev => {
+                  const nextExpanded =
+                    ev.collapsed !== undefined
+                      ? !ev.collapsed
+                      : (ev.open ?? !expanded);
+                  callbacks.onToggleToolGroup?.(groupId, nextExpanded);
+                }}
+              >
+                <col key="items" gap="none">
+                  {group.tools.map(tool =>
+                    renderToolItem(
+                      tool,
+                      [],
+                      toolPreviewLines,
+                      state.expandAllTools,
+                      state.toolDisplayMode,
+                      turn.status,
+                      now,
+                      callbacks
+                    )
+                  )}
+                </col>
+              </tool>
+            );
+            return;
+          }
 
-              if (group.kind === 'tool') {
-                const relatedAgents = turn.agents.filter(
-                  a => a.toolCallId === group.tool.toolCallId
-                );
-                return renderToolItem(
-                  group.tool,
-                  relatedAgents,
-                  toolPreviewLines,
-                  state.expandAllTools,
-                  turn.status,
-                  now,
-                  callbacks
-                );
-              }
+          if (group.kind === 'tool') {
+            const nodeKey = `${turnPrefix}${group.tool.toolCallId}`;
+            if (isEvicted(nodeKey)) return;
+            const relatedAgents = turn.agents.filter(
+              a => a.toolCallId === group.tool.toolCallId
+            );
+            turnNodes.push(
+              renderToolItem(
+                group.tool,
+                relatedAgents,
+                toolPreviewLines,
+                state.expandAllTools,
+                state.toolDisplayMode,
+                turn.status,
+                now,
+                callbacks,
+                nodeKey
+              )
+            );
+            return;
+          }
 
-              return renderNotice(group.notice, callbacks.onToggleNotice);
-            })}
+          const noticeKey = `${turnPrefix}${group.notice.id}`;
+          if (isEvicted(noticeKey)) return;
+          turnNodes.push(renderNotice(group.notice, callbacks.onToggleNotice, noticeKey));
+        });
 
-            {lastAssistantGroupIdx === -1 && footerNodes.length > 0 ? (
-              <col key="assistant-end" role="omp.assistant">
+        if (lastAssistantGroupIdx === -1 && footerNodes.length > 0) {
+          const endKey = `${turnPrefix}assistant-end`;
+          if (!isEvicted(endKey)) {
+            turnNodes.push(
+              <col key={endKey} role="omp.assistant">
                 {footerNodes}
               </col>
-            ) : null}
-          </col>
-        );
+            );
+          }
+        }
+
+        return turnNodes;
       })}
 
       {plan && plan.entries.length > 0 ? (

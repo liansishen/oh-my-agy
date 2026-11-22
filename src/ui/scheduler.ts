@@ -1,4 +1,23 @@
-import type { GoneEvent, Renderable, Surface } from '@stencil-hq/tern';
+import { Node, type GoneEvent, type Renderable, type Surface, type ViewInput } from '@stencil-hq/tern';
+
+function extractMainChildIds(view: Renderable): string[] {
+  if (!view || typeof view !== 'object') return [];
+  const mainRoot =
+    view instanceof Node
+      ? view
+      : 'main' in (view as ViewInput)
+        ? (view as ViewInput).main
+        : undefined;
+  if (!(mainRoot instanceof Node)) return [];
+  const ids: string[] = [];
+  mainRoot.children.forEach((child, i) => {
+    const key = child.props['key'];
+    const name =
+      typeof key === 'string' ? key : typeof key === 'number' ? String(key) : String(i);
+    ids.push(`main.${name}`);
+  });
+  return ids;
+}
 
 export type SchedulerSurface = Pick<Surface, 'render' | 'settle' | 'scroll' | 'closed'>;
 
@@ -29,6 +48,7 @@ export class RenderScheduler {
   #disposed = false;
   #settledIds = new Set<string>();
   #evictedIds = new Set<string>();
+  #lastMainChildIds: string[] = [];
 
   constructor(
     surface: SchedulerSurface,
@@ -73,7 +93,9 @@ export class RenderScheduler {
     }
     this.#clearTimer();
     this.#dirty = false;
-    this.#surface.render(this.#buildView());
+    const view = this.#buildView();
+    this.#lastMainChildIds = extractMainChildIds(view);
+    this.#surface.render(view);
   }
 
   /** Suspends intermediate renders while replaying history during `session/load`. */
@@ -92,12 +114,22 @@ export class RenderScheduler {
   }
 
   /**
-   * Marks a completed turn (`main.turn-<index>`) as settled so Tern can reduce diff overhead
-   * and consider it for scrollback memory eviction.
+   * Marks all top-level nodes belonging to a completed turn (`main.t<index>-*`) as settled
+   * so Tern can reduce diff overhead and consider them for scrollback memory eviction.
    */
   settleTurn(turnIndex: number): boolean {
-    const id = `main.turn-${turnIndex}`;
-    return this.settleNode(id);
+    const prefix = `main.t${turnIndex}-`;
+    const matching = this.#lastMainChildIds.filter(id => id.startsWith(prefix));
+    if (matching.length > 0) {
+      let settledAny = false;
+      for (const id of matching) {
+        if (this.settleNode(id)) {
+          settledAny = true;
+        }
+      }
+      return settledAny;
+    }
+    return this.settleNode(`main.turn-${turnIndex}`);
   }
 
   settleNode(nodeId: string): boolean {
@@ -145,6 +177,7 @@ export class RenderScheduler {
   resetSession(): void {
     this.#settledIds.clear();
     this.#evictedIds.clear();
+    this.#lastMainChildIds = [];
   }
 
   dispose(): void {

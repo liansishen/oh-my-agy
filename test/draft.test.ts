@@ -1312,10 +1312,12 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
       'tool',
     ]);
 
-    // Global thinking & tool collapse helpers
+    // Global thinking & tool collapse helpers (aligned with omp: expandAllTools is decoupled from thoughts)
     const thought0 = t0.thoughts[0]!;
     expect(store.isThoughtOpen(thought0, { showThinking: false, expandAllTools: true })).toBe(false);
-    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: true })).toBe(true);
+    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: true })).toBe(false);
+    store.toggleThought(thought0.id, true);
+    expect(store.isThoughtOpen(thought0, { showThinking: true, expandAllTools: false })).toBe(true);
     expect(store.isToolCollapsed(t1.toolCalls[0]!, false)).toBe(false);
     store.setAllToolsCollapsed(true);
     expect(t1.toolCalls[0]?.collapsed).toBe(true);

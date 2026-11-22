@@ -107,6 +107,8 @@ export interface ToolCallItem {
   targetKind: TspToolTargetKind;
   title: string;
   target?: string;
+  /** Short human-readable intent label (e.g. `toolSummary` / `_intent`) shown in `<tool intent>`. */
+  intent?: string;
   args?: Record<string, unknown>;
   rawInput?: unknown;
   rawOutput?: unknown;
@@ -518,6 +520,30 @@ function extractToolTarget(
   }
 
   return undefined;
+}
+
+function extractToolIntent(
+  fields: Pick<ToolCallFields, 'args' | 'rawInput'>,
+  title?: string,
+  target?: string,
+): string | undefined {
+  const inputRec = asRecord(fields.args) ?? asRecord(fields.rawInput);
+  const raw = firstStringField(inputRec, [
+    'toolSummary',
+    'ToolSummary',
+    '_intent',
+    'intent',
+    'Intent',
+    'Description',
+    'description',
+  ]);
+  if (!raw) return undefined;
+  const cleaned = collapseSingleLine(raw, 72);
+  if (!cleaned) return undefined;
+  const lower = cleaned.toLowerCase();
+  if (title && lower === title.trim().toLowerCase()) return undefined;
+  if (target && lower === target.trim().toLowerCase()) return undefined;
+  return cleaned;
 }
 
 function extractDiffItems(content: readonly ToolCallContent[] | undefined): ToolDiffItem[] {
@@ -2012,15 +2038,14 @@ export class TranscriptStore {
   }
 
   /**
-   * Resolve whether a thought block should be expanded under global `showThinking` / `expandAllTools` toggles.
+   * Resolve whether a thought block should be expanded under global `showThinking` toggle.
+   * Aligned with `omp`: `expandAllTools` (`Ctrl+O`) is decoupled from thinking blocks.
    */
   isThoughtOpen(
     thought: ThoughtBlock,
-    options: { readonly showThinking: boolean; readonly expandAllTools: boolean },
+    options: { readonly showThinking: boolean; readonly expandAllTools?: boolean },
   ): boolean {
-    if (!options.showThinking) return false;
-    if (thought.userToggled) return thought.open;
-    if (options.expandAllTools) return true;
+    if (!options.showThinking && thought.status !== 'running') return false;
     return thought.open;
   }
 
@@ -2055,7 +2080,7 @@ export class TranscriptStore {
   }
 
   /**
-   * Record that `surface.settle('main.turn-<index>')` was issued for a completed turn.
+   * Record that `surface.settle(...)` was issued for a completed turn or one of its flat top-level nodes.
    */
   markSettled(nodeIdOrTurnIndex: string | number): boolean {
     const nodeId =
@@ -2064,7 +2089,10 @@ export class TranscriptStore {
         : nodeIdOrTurnIndex;
     if (this._evictedIds.has(nodeId)) return false;
     this._settledIds.add(nodeId);
-    const turn = this._turns.find((t) => t.nodeId === nodeId);
+    const flatMatch = /^main\.t(\d+)-/.exec(nodeId);
+    const turn = flatMatch
+      ? this._turns[Number(flatMatch[1])]
+      : this._turns.find((t) => t.nodeId === nodeId);
     if (turn) {
       turn.settled = true;
     }
@@ -2594,7 +2622,7 @@ export class TranscriptStore {
         if (!thought.replayed) {
           thought.tookMs = thought.tookMs ?? Math.max(0, end - thought.startedAt);
         }
-        if (autoCollapseThought && !expandAllTools && !thought.userToggled) {
+        if (autoCollapseThought && !thought.userToggled) {
           thought.open = false;
         }
         closedCount++;
@@ -2670,6 +2698,14 @@ export class TranscriptStore {
       );
       if (nextTarget !== undefined) {
         tool.target = nextTarget;
+      }
+      const nextIntent = extractToolIntent(
+        { args: tool.args, rawInput: tool.rawInput },
+        tool.title,
+        tool.target,
+      );
+      if (nextIntent !== undefined) {
+        tool.intent = nextIntent;
       }
 
       if (fields.rawOutput !== undefined) {
@@ -2757,6 +2793,11 @@ export class TranscriptStore {
       },
       meta.targetKind,
     );
+    const intent = extractToolIntent(
+      { args: fields.args, rawInput: fields.rawInput },
+      title,
+      target,
+    );
 
     const finished = acpStatus === 'completed' || acpStatus === 'failed';
     const parsedReplayDur = finished ? extractToolDurationFromOutput(outputText) : undefined;
@@ -2770,6 +2811,7 @@ export class TranscriptStore {
       targetKind: meta.targetKind,
       title,
       ...(target !== undefined ? { target } : {}),
+      ...(intent !== undefined ? { intent } : {}),
       ...(fields.args !== undefined ? { args: fields.args } : {}),
       ...(fields.rawInput !== undefined ? { rawInput: fields.rawInput } : {}),
       ...(fields.rawOutput !== undefined ? { rawOutput: fields.rawOutput } : {}),

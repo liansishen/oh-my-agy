@@ -772,7 +772,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     host.input.emitTspEvent({ ev: 'send', sf: 'oma', id: EDITOR_NODE_ID, text: 'Hello agent' });
 
     await waitFor(() =>
-      host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-0')
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t0-'))
     );
 
     expect(host.osc7501).toContain('state=working');
@@ -855,10 +855,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     expect(contextSetOps.length).toBeGreaterThan(0);
 
-    // Verify GoneEvent evicts main.turn-0 cleanly
-    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.turn-0'] });
-    await waitFor(() => controller.scheduler.isEvicted('main.turn-0'));
-    expect(controller.store.transcript.getVisibleTurns().length).toBe(0);
+    // Verify flat omp-aligned main children (`main.t0-user`, `main.t0-assistant-*`, `main.t0-<tool>`) with NO wrapper turn-0 col
+    expect(host.findWireNodes(n => n.id === 'main.turn-0').length).toBe(0);
+    expect(userCards[0]!.id).toBe('main.t0-user');
+
+    // Verify GoneEvent evicts flat top-level node cleanly without breaking subsequent frames
+    host.input.emitTspEvent({ ev: 'gone', sf: 'oma', ids: ['main.t0-user'] });
+    await waitFor(() => controller.scheduler.isEvicted('main.t0-user'));
+    expect(controller.store.transcript.evictedTurnIds.has('main.t0-user')).toBe(true);
 
     // Dynamic configOptions removing thought_level hides embedded dock.composer.bar.model.effort glyph
     acp.send({
@@ -3018,7 +3022,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const doneThought1 = current.get(thought1Id)!;
     expect(doneThought1.p['role']).toBe('omp.thinking');
     expect(doneThought1.p['took']).toBe(1500);
-    expect(JSON.stringify(doneThought1.p['head'])).toContain('Thought for 1.5s');
+    // Aligned with `omp`: completed thoughts round to whole seconds (1500ms -> 2s)
+    expect(JSON.stringify(doneThought1.p['head'])).toContain('Thought for 2s');
     // Old live head row, spinner, and live <elapsed> MUST be completely deleted!
     expect(current.has(`${thought1Id}.head`)).toBe(false);
     expect(current.has(`${thought1Id}.head.age`)).toBe(false);
@@ -3595,7 +3600,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const beforeTurn = host.rawStream.length;
     await controller.submitInput('Check settle cursor reassert');
     await waitFor(() =>
-      host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-0')
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t0-'))
     );
     expect(host.rawStream.slice(beforeTurn)).toContain(HIDE_CURSOR);
 
@@ -4407,7 +4412,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     const turnStream = host.rawStream.slice(streamBeforeTurn);
     const replyIdx = turnStream.indexOf('Synchronous final answer text.');
-    const settleIdx = turnStream.indexOf('["settle","main.turn-0"]');
+    const settleIdx = turnStream.indexOf('["settle","main.t0-');
     const doneIdx = turnStream.indexOf('\x1b]7501;state=done');
     expect(replyIdx).toBeGreaterThanOrEqual(0);
     expect(settleIdx).toBeGreaterThan(replyIdx);
@@ -5140,12 +5145,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       suffix: string
     ): boolean => {
       for (const key of nodes.keys()) {
-        if (key === suffix || key.endsWith(`.${suffix}`)) return true;
+        if (key === suffix || key.endsWith(`.${suffix}`) || key.endsWith(`-${suffix}`)) return true;
       }
       return false;
     };
 
-    // 1. Default mode = 'all': all 3 routine tools render individually (no folded-tools group)
+    // 1. Default mode = 'all': all 3 routine tools render directly under main with full previews
     await controller.submitInput('run checks');
     await waitFor(() => !controller.store.getState().isStreaming);
     await waitFor(() => {
@@ -5154,40 +5159,59 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         hasNodeSuffix(n, 'tc-bash-1') &&
         hasNodeSuffix(n, 'tc-bash-2') &&
         hasNodeSuffix(n, 'tc-read-1') &&
-        !n.has('main.turn-0.folded-tc-bash-1')
+        n.get('main.t0-tc-bash-1')?.p['preview'] === 'children'
       );
     });
 
-    // 2. Press Alt+O (`\x1bo`) -> switches to 'compact': merges 3 routine tools into a single collapsible `oma.tool.group`
+    // 2. Press Alt+O (`\x1bo`) -> switches to 'compact': keeps native top-level `<tool>` nodes
+    // (no custom `oma.tool.group` wrapper that breaks Tern's `Worked for ...` folding),
+    // rendered as compact single-line inline rows (`frame='inline'`, `preview='none'`).
     host.input.emit('\x1bo');
     await waitFor(() => controller.store.getState().toolDisplayMode === 'compact');
-    await waitFor(() => replayNodes().has('main.turn-0.folded-tc-bash-1'));
-    const foldedGroup = replayNodes().get('main.turn-0.folded-tc-bash-1');
-    expect(foldedGroup?.p['role']).toBe('oma.tool.group');
-    expect(foldedGroup?.p['collapsed']).toBe(true);
-    const groupLabel = replayNodes().get('main.turn-0.folded-tc-bash-1.head.lbl');
-    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('3 tool calls');
-    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('2 Bash');
-    expect(JSON.stringify(groupLabel?.p['spans'] ?? '')).toContain('1 Read');
-
-    // Toggle the folded group open via Tern toggle event
-    host.input.emitTspEvent({
-      ev: 'toggle',
-      sf: 'oma',
-      id: 'main.turn-0.folded-tc-bash-1',
-      collapsed: false,
+    await waitFor(() => {
+      const n = replayNodes();
+      const b1 = n.get('main.t0-tc-bash-1');
+      const r1 = n.get('main.t0-tc-read-1');
+      return (
+        b1?.k === 'tool' &&
+        b1?.p['frame'] === 'inline' &&
+        b1?.p['preview'] === 'none' &&
+        r1?.k === 'tool' &&
+        r1?.p['frame'] === 'inline' &&
+        r1?.p['preview'] === 'none'
+      );
     });
-    await waitFor(() => replayNodes().get('main.turn-0.folded-tc-bash-1')?.p['collapsed'] === false);
+    expect(replayNodes().has('main.t0-folded-tc-bash-1')).toBe(false);
 
-    // 3. Press Alt+O again -> switches to 'hidden': hides completed routine tools AND persists `tool_display = "hidden"` to config.toml
+    // 3. Press Alt+O again -> switches to 'hidden': wraps completed routine tools in native `omp.activity` (`hidden: true`) AND persists `tool_display = "hidden"` to config.toml
+    const isHiddenNode = (
+      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
+      suffix: string
+    ): boolean => {
+      for (const key of nodes.keys()) {
+        if (key === suffix || key.endsWith(`.${suffix}`) || key.endsWith(`-${suffix}`)) {
+          // Walk ancestor chain to see if mounted inside a `hidden: true` container
+          let cur = key;
+          while (cur.includes('.')) {
+            if (nodes.get(cur)?.p['hidden'] === true) return true;
+            cur = cur.slice(0, cur.lastIndexOf('.'));
+          }
+          return nodes.get(cur)?.p['hidden'] === true;
+        }
+      }
+      return true;
+    };
+
     host.input.emit('\x1bo');
     await waitFor(() => controller.store.getState().toolDisplayMode === 'hidden');
     await waitFor(() => {
       const n = replayNodes();
       return (
-        !n.has('main.turn-0.folded-tc-bash-1') &&
-        !hasNodeSuffix(n, 'tc-bash-1') &&
-        !hasNodeSuffix(n, 'tc-read-1')
+        !n.has('main.t0-folded-tc-bash-1') &&
+        n.get('main.t0-activity-tc-bash-1')?.p['role'] === 'omp.activity' &&
+        n.get('main.t0-activity-tc-bash-1')?.p['hidden'] === true &&
+        isHiddenNode(n, 'tc-bash-1') &&
+        isHiddenNode(n, 'tc-read-1')
       );
     });
     await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('tool_display = "hidden"'));
@@ -5195,14 +5219,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(parsedSaved.warnings).toEqual([]);
     expect(parsedSaved.config.ui.tool_display).toBe('hidden');
 
-    // 4. In 'hidden' mode, actively running tools stay visible while streaming, then hide once completed
+    // 4. In 'hidden' mode, actively running tools stay visible while streaming, then hide via `omp.activity` once completed
     void controller.submitInput('run live command');
-    await waitFor(() => hasNodeSuffix(replayNodes(), 'tc-live-bash'));
+    await waitFor(() => !isHiddenNode(replayNodes(), 'tc-live-bash'));
     releaseRunningTurn.resolve();
     await waitFor(() => !controller.store.getState().isStreaming);
-    await waitFor(() => !hasNodeSuffix(replayNodes(), 'tc-live-bash'));
+    await waitFor(() => isHiddenNode(replayNodes(), 'tc-live-bash'));
 
-    // 5. `/settings` `ui.tool_display` choice switches back to 'all' and restores individual tool rows
+    // 5. `/settings` `ui.tool_display` choice switches back to 'all' and restores visible individual tool rows
     await controller.submitInput('/settings');
     await waitFor(() => controller.store.getState().settings !== null);
     host.input.emitTspEvent({
@@ -5213,7 +5237,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       value: 'all',
     });
     await waitFor(() => controller.store.getState().toolDisplayMode === 'all');
-    await waitFor(() => hasNodeSuffix(replayNodes(), 'tc-bash-1'));
+    await waitFor(() => !isHiddenNode(replayNodes(), 'tc-bash-1'));
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;
@@ -5448,17 +5472,17 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     // Resumed bash tool with Created At/Completed At recovers real 3000ms duration; read tool without timestamps has undefined took
     const histBash = [...nodesAfterResume.entries()].find(
-      ([id, n]) => n.k === 'tool' && id.endsWith('.tc-hist-bash')
+      ([id, n]) => n.k === 'tool' && (id.endsWith('.tc-hist-bash') || id.endsWith('-tc-hist-bash'))
     )?.[1];
     const histRead = [...nodesAfterResume.entries()].find(
-      ([id, n]) => n.k === 'tool' && id.endsWith('.tc-hist-read')
+      ([id, n]) => n.k === 'tool' && (id.endsWith('.tc-hist-read') || id.endsWith('-tc-hist-read'))
     )?.[1];
     expect(histBash?.p['took']).toBe(3000);
     expect(histRead?.p['took']).toBeUndefined();
 
     // Resumed turn footer must NOT display fake '0ms'
     const turn0Usage = [...nodesAfterResume.entries()].find(
-      ([id]) => id.startsWith('main.turn-0.') && id.endsWith('.turn-usage.text')
+      ([id]) => id.startsWith('main.t0-') && id.endsWith('.turn-usage.text')
     )?.[1];
     expect(String(turn0Usage?.p['text'] ?? '')).toBe('2 tools');
 
@@ -5482,7 +5506,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
     await Bun.sleep(100);
     expect(host.osc7501.slice(oscLenBefore)).not.toContain('state=done');
-    expect(host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-1')).toBe(false);
+    expect(
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t1-'))
+    ).toBe(false);
 
     // 3. Complete background tool + deliver post-tool final reply -> appended to SAME turn-1, settled, THEN state=done fires!
     releaseToolFinish.resolve();
@@ -5491,7 +5517,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.store.transcript.turns).toHaveLength(2);
     expect(controller.store.transcript.turns[1]?.assistantText).toContain('Migration finished cleanly!');
     expect(controller.store.transcript.getToolById('tc-bg-migrate')?.status).toBe('done');
-    expect(host.allOps.some(op => op[0] === 'settle' && op[1] === 'main.turn-1')).toBe(true);
+    expect(
+      host.allOps.some(op => op[0] === 'settle' && typeof op[1] === 'string' && op[1].startsWith('main.t1-'))
+    ).toBe(true);
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;
@@ -5673,21 +5701,431 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.store.getState().sessionMetrics?.isStreamingTps ?? false).toBe(false);
     expect(host.osc7501).not.toContain('state=done');
 
-    // 3. In compact mode, edit + bash fold together BEFORE the final assistant reply, and the reply keeps its footer
+    // 3. In compact mode, edit + bash fold together directly under `main` BEFORE the final assistant reply
     const lastTurnIdx = turns[1]!.index;
-    const turnNodeOps = host.allOps.filter(
-      op => op[0] === 'add' && op[1] === `main.turn-${lastTurnIdx}`
+    const prefix = `main.t${lastTurnIdx}-`;
+    const mainAddOps = host.allOps.filter(
+      op => op[0] === 'add' && op[2] === 'main' && typeof op[1] === 'string' && op[1].startsWith(prefix)
     );
-    expect(turnNodeOps.length).toBeGreaterThan(0);
-    const turnWire = turnNodeOps[turnNodeOps.length - 1]![4] as WireNode;
-    const childIds = (turnWire.c ?? []).map(c => c.id);
-    const foldedIdx = childIds.findIndex(id => id.includes('folded-tc-trailing-edit'));
-    const finalReplyIdx = childIds.findIndex(id => id.includes('.assistant-msg-'));
-    expect(foldedIdx).toBeGreaterThanOrEqual(0);
-    expect(finalReplyIdx).toBeGreaterThan(foldedIdx);
+    // Note: reconcile.ts emits `add` in reverse order using `before` sibling ids; reconstruct visual order from `before`
+    const orderedTopIds: string[] = [];
+    for (const op of mainAddOps) {
+      const id = op[1] as string;
+      const beforeId = op[3] as string | null;
+      const curIdx = orderedTopIds.indexOf(id);
+      if (curIdx >= 0) orderedTopIds.splice(curIdx, 1);
+      if (beforeId === null) {
+        orderedTopIds.push(id);
+      } else {
+        const bIdx = orderedTopIds.indexOf(beforeId);
+        if (bIdx >= 0) orderedTopIds.splice(bIdx, 0, id);
+        else orderedTopIds.push(id);
+      }
+    }
+    const editToolIdx = orderedTopIds.findIndex(id => id.endsWith('-tc-trailing-edit'));
+    const finalReplyIdx = orderedTopIds.findIndex(id => id.includes('-assistant-msg-'));
+    expect(editToolIdx).toBeGreaterThanOrEqual(0);
+    expect(finalReplyIdx).toBeGreaterThan(editToolIdx);
     // No orphan edit tool after the final assistant reply
-    expect(childIds.slice(finalReplyIdx + 1).some(id => id.includes('tc-trailing-edit'))).toBe(
+    expect(orderedTopIds.slice(finalReplyIdx + 1).some(id => id.includes('tc-trailing-edit'))).toBe(
       false
+    );
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('omp-aligned thought & tool UX: live thought survives Ctrl+T with rate/tokens, whole-second Thought for Ns, Ctrl+O decoupled, toolSummary->intent, Bash preview=children, auto-expand running edit, Read(N) group, compact single edit preview=none, and Ctrl+Shift+O hidden toggle', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 1_000_000;
+    const releaseLiveThought = Promise.withResolvers<void>();
+    const releaseRunningEdit = Promise.withResolvers<void>();
+    let promptCount = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-omp-ux' } });
+      } else if (msg.method === 'session/prompt') {
+        promptCount += 1;
+        if (promptCount === 1) {
+          // Turn 0: quick 400ms thought -> rounds to 'Thought for 1s', Bash with toolSummary -> intent + preview='children',
+          // consecutive 2 Reads -> Read (2) group, running Edit -> auto-expanded then collapsed when done
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'Inspecting project files and running tests.' },
+              },
+            },
+          });
+          clock += 400;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-bash-intent',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'bun test',
+                args: { CommandLine: 'bun test', toolSummary: 'Run unit test suite' },
+                rawOutput: { output: '164 pass', exit_code: 0 },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-read-a',
+                name: 'read_file',
+                kind: 'read',
+                status: 'completed',
+                title: 'File /work/src/a.ts',
+                locations: [{ path: '/work/src/a.ts' }],
+                rawOutput: { output: 'export const a = 1;\n' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-read-b',
+                name: 'read_file',
+                kind: 'read',
+                status: 'completed',
+                title: 'File /work/src/b.ts',
+                locations: [{ path: '/work/src/b.ts' }],
+                rawOutput: { output: 'export const b = 2;\n' },
+              },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-edit-live',
+                name: 'edit_file',
+                kind: 'edit',
+                status: 'in_progress',
+                title: 'File /work/src/a.ts',
+                locations: [{ path: '/work/src/a.ts' }],
+                content: [
+                  {
+                    type: 'diff',
+                    path: '/work/src/a.ts',
+                    oldText: 'export const a = 1;\n',
+                    newText: 'export const a = 2;\n',
+                  },
+                ],
+              },
+            },
+          });
+
+          void releaseRunningEdit.promise.then(() => {
+            clock += 600;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-edit-live',
+                  status: 'completed',
+                },
+              },
+            });
+            clock += 200;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_thought_chunk',
+                  content: { type: 'text', text: 'Summarizing the final answer.' },
+                },
+              },
+            });
+            clock += 300;
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Updated a.ts successfully.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        } else {
+          // Turn 1: live streaming thought while showThinking === false -> must STILL render live thought + rate + tokens!
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: {
+                  type: 'text',
+                  text: 'Streaming deep reasoning tokens to verify live rate and tooltip display...',
+                },
+              },
+            },
+          });
+          clock += 1000;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-omp-ux',
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: {
+                  type: 'text',
+                  text: ' More reasoning tokens arriving steadily over one second.',
+                },
+              },
+            },
+          });
+          void releaseLiveThought.promise.then(() => {
+            server.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'sess-omp-ux',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Done.' },
+                },
+              },
+            });
+            server.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          });
+        }
+      } else if (msg.method === 'session/close') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        server.crash(0);
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, tool_display: 'all' } },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // 1. Start Turn 0 and inspect while edit_file is still in_progress:
+    const p1 = controller.submitInput('update a.ts');
+    await waitFor(() => replayNodes().has('main.t0-tc-edit-live'));
+
+    const midNodes = replayNodes();
+    // Flat main structure: direct top-level nodes under `main` (NO `main.turn-0` wrapper!)
+    expect(midNodes.has('main.turn-0')).toBe(false);
+    expect(midNodes.get('main.t0-user')?.p['role']).toBe('omp.user');
+    // Running edit_file auto-expands (`collapsed === false`)
+    expect(midNodes.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(false);
+    // Bash tool is direct child of `main`, maps `toolSummary` -> `intent`, and uses `preview: 'children'` in 'all' mode
+    const bashNode = midNodes.get('main.t0-tc-bash-intent');
+    expect(bashNode?.k).toBe('tool');
+    expect(bashNode?.p['intent']).toBe('Run unit test suite');
+    expect(bashNode?.p['preview']).toBe('children');
+    // Consecutive 2 Reads aggregate into a native `<tool role="omp.tool.read" frame="inline">` directly under `main`
+    // (aligned with `omp`'s `ReadToolGroupComponent`, so Tern's `Worked for ...` chain is never broken)
+    const readGroup = midNodes.get('main.t0-read-group-tc-read-a');
+    expect(readGroup?.k).toBe('tool');
+    expect(readGroup?.p['role']).toBe('omp.tool.read');
+    expect(readGroup?.p['name']).toBe('read');
+    expect(readGroup?.p['title']).toBe('Read');
+    expect(readGroup?.p['target']).toBe('2 files');
+    expect(readGroup?.p['frame']).toBe('inline');
+    expect(readGroup?.p['preview']).toBe('none');
+    expect(JSON.stringify(readGroup?.p['meta'] ?? '')).toContain('a.ts, b.ts');
+
+    // Finish Turn 0
+    releaseRunningEdit.resolve();
+    await p1;
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    const doneNodes = replayNodes();
+    // Completed 400ms thought rounds to 'Thought for 1s' and has token tooltip
+    const doneThought = [...doneNodes.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(JSON.stringify(doneThought?.p['head'] ?? '')).toContain('Thought for 1s');
+    expect(String(doneThought?.p['title'] ?? '')).toContain('tokens');
+    // Completed edit returns to collapsed=true
+    expect(doneNodes.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(true);
+    // Trailing thought right before final reply sits in its OWN thought-only `omp.assistant`
+    // container (separate from prose `Done.` + `omp.turn.usage`) so Tern's `Worked for ...`
+    // absorbs all thoughts cleanly without stranding a lone `Thought >` above the final answer.
+    const trailingThoughtEntry = [...doneNodes.entries()].find(
+      ([id, n]) =>
+        n.k === 'section' &&
+        n.p['role'] === 'omp.thinking' &&
+        doneNodes.get(`${id}.body`)?.p['text'] === 'Summarizing the final answer.'
+    );
+    expect(trailingThoughtEntry).toBeDefined();
+    const trailingThoughtParent = trailingThoughtEntry![0].slice(
+      0,
+      trailingThoughtEntry![0].lastIndexOf('.')
+    );
+    const proseMdEntry = [...doneNodes.entries()].find(
+      ([, n]) => n.k === 'md' && n.p['text'] === 'Updated a.ts successfully.'
+    );
+    expect(proseMdEntry).toBeDefined();
+    const proseParent = proseMdEntry![0].slice(0, proseMdEntry![0].lastIndexOf('.'));
+    expect(trailingThoughtParent).not.toBe(proseParent);
+    expect(doneNodes.get(`${proseParent}.turn-usage`)?.p['role']).toBe('omp.turn.usage');
+    expect(doneNodes.has(`${trailingThoughtParent}.turn-usage`)).toBe(false);
+
+    // 2. Ctrl+O expands tools ONLY — completed thought stays collapsed!
+    host.input.emit('\x0f');
+    await waitFor(() => controller.store.getState().expandAllTools === true);
+    const afterCtrlO = replayNodes();
+    expect(afterCtrlO.get('main.t0-tc-edit-live')?.p['collapsed']).toBe(false);
+    const thoughtAfterCtrlO = [...afterCtrlO.values()].find(
+      n => n.k === 'section' && n.p['role'] === 'omp.thinking'
+    );
+    expect(thoughtAfterCtrlO?.p['collapsed']).toBe(true);
+    // Toggle Ctrl+O back off
+    host.input.emit('\x0f');
+    await waitFor(() => controller.store.getState().expandAllTools === false);
+
+    // 3. Ctrl+Shift+O (`CSI 111;6u`) toggles directly to 'hidden' (using omp.activity hidden=true) and back to 'all'
+    host.input.emit('\x1b[111;6u');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'hidden');
+    await waitFor(() => replayNodes().get('main.t0-activity-tc-bash-intent')?.p['hidden'] === true);
+    host.input.emit('\x1b[111;6u');
+    await waitFor(() => controller.store.getState().toolDisplayMode === 'all');
+
+    // 4. Compact mode: standalone completed edit uses preview='none' (single-line collapsed header)
+    controller.store.setToolDisplayMode('compact');
+    // Inject a standalone turn with a single edit to test standalone compact edit
+    const standaloneTurn = controller.store.transcript.beginUserTurn('single edit');
+    controller.store.transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-solo-edit',
+      name: 'edit_file',
+      kind: 'edit',
+      status: 'completed',
+      title: 'File /work/src/solo.ts',
+      locations: [{ path: '/work/src/solo.ts' }],
+      content: [
+        { type: 'diff', path: '/work/src/solo.ts', oldText: 'a\n', newText: 'b\n' },
+      ],
+    });
+    controller.store.transcript.finishActiveTurn('end_turn');
+    controller.scheduler.renderNow();
+    const compactSolo = replayNodes().get(`main.t${standaloneTurn.index}-tc-solo-edit`);
+    expect(compactSolo?.p['preview']).toBe('none');
+
+    // 5. Ctrl+T hides completed thoughts, yet Turn 1's LIVE streaming thought remains visible with <rate unit="tok/s"> + tokens tooltip!
+    host.input.emit('\x14');
+    await waitFor(() => controller.store.getState().showThinking === false);
+    const afterCtrlT = replayNodes();
+    expect(
+      [...afterCtrlT.values()].some(n => n.k === 'section' && n.p['role'] === 'omp.thinking')
+    ).toBe(false);
+
+    const p2 = controller.submitInput('think live while hidden');
+    await waitFor(() =>
+      [...replayNodes().values()].some(n => n.k === 'section' && n.p['role'] === 'omp.thinking.live')
+    );
+    const liveNodes = replayNodes();
+    const liveThoughtEntry = [...liveNodes.entries()].find(
+      ([, n]) => n.k === 'section' && n.p['role'] === 'omp.thinking.live'
+    );
+    expect(liveThoughtEntry).toBeDefined();
+    const liveHead = liveNodes.get(`${liveThoughtEntry![0]}.head`);
+    expect(String(liveHead?.p['title'] ?? '')).toContain('tokens');
+    const liveRate = liveNodes.get(`${liveThoughtEntry![0]}.head.rate`);
+    expect(liveRate?.k).toBe('rate');
+    expect(liveRate?.p['unit']).toBe('tok/s');
+    expect(Number(liveRate?.p['value'] ?? 0)).toBeGreaterThanOrEqual(0.05);
+
+    releaseLiveThought.resolve();
+    await p2;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // Once finished while showThinking === false, the thought hides cleanly
+    await waitFor(() =>
+      ![...replayNodes().values()].some(
+        n => n.k === 'section' && (n.p['role'] === 'omp.thinking' || n.p['role'] === 'omp.thinking.live')
+      )
     );
 
     await controller.shutdown({ cleanExit: true });

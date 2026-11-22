@@ -219,7 +219,7 @@ function buildPageSections(
       {
         id: 'ui.tool_display',
         label: 'Tool Call Display',
-        hint: 'Show all routine tools, group into a collapsible summary, or hide completed runs (Alt+O)',
+        hint: 'Show full previews (All), single-line inline rows (Compact), or hide completed runs (Alt+O / Ctrl+Shift+O)',
         changed: config.ui.tool_display !== DEFAULT_CONFIG.ui.tool_display,
         defaultLabel: 'All',
         control: {

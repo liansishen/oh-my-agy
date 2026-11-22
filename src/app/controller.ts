@@ -1699,7 +1699,25 @@ export class AppController {
       return;
     }
 
-    if (name === 'o' && key.ctrl && !key.alt && !key.meta) {
+    if (name === 'o' && key.ctrl && key.shift && !key.alt && !key.meta) {
+      const nextMode = this.store.toggleToolVisibility();
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, tool_display: nextMode },
+      };
+      const label =
+        nextMode === 'hidden'
+          ? 'Tool activity hidden (Ctrl+Shift+O to show)'
+          : nextMode === 'compact'
+            ? 'Tool activity shown (Compact)'
+            : 'Tool activity shown (All)';
+      this.store.pushToast(label, 'info', { ttl: 2000 });
+      this.scheduler.renderNow();
+      void this.#saveConfigSafe();
+      return;
+    }
+
+    if (name === 'o' && key.ctrl && !key.shift && !key.alt && !key.meta) {
       const expanded = this.store.toggleExpandAllTools();
       this.store.pushToast(
         expanded ? 'Expanded all tool outputs' : 'Collapsed tool outputs',
@@ -1718,9 +1736,9 @@ export class AppController {
       };
       const label =
         nextMode === 'all'
-          ? 'Tool calls: All (expanded list)'
+          ? 'Tool calls: All (full previews)'
           : nextMode === 'compact'
-            ? 'Tool calls: Compact (grouped)'
+            ? 'Tool calls: Compact (inline rows)'
             : 'Tool calls: Hidden (completed runs hidden)';
       this.store.pushToast(label, 'info', { ttl: 2000 });
       this.scheduler.renderNow();
@@ -5322,6 +5340,7 @@ export class AppController {
       commands: this.store.commands.getAll(),
       trafficEntries: this.store.traffic.list(),
       toolPreviewLines: this.#config.ui.tool_preview_lines,
+      evictedNodeIds: this.store.transcript.evictedTurnIds,
       config: this.#config,
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
