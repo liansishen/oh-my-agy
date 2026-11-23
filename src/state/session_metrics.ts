@@ -55,6 +55,16 @@ export interface SessionMetricsTrackerOptions extends TranscriptPathOptions {
   readonly sessionId?: string | null;
 }
 
+export interface TranscriptCompactionCheckpoint {
+  readonly stepIndex: number;
+  readonly userInputsBefore: number;
+  readonly precededByCompactCommand: boolean;
+  readonly summaryText: string;
+  readonly createdAt?: string;
+  readonly tokensBefore?: number;
+  readonly summaryTokens?: number;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -212,6 +222,39 @@ interface ParsedTokenRecord {
   readonly isCheckpoint: boolean;
 }
 
+interface ParsedTranscriptLine {
+  readonly tokens: ParsedTokenRecord | null;
+  readonly explicitUserInput?: {
+    readonly isCompactCommand: boolean;
+  };
+  readonly checkpoint?: {
+    readonly stepIndex?: number;
+    readonly summaryText: string;
+    readonly createdAt?: string;
+    readonly tokensBefore?: number;
+    readonly summaryTokens?: number;
+  };
+}
+
+const SKIPPED_CHECKPOINT_STATUSES = new Set([
+  'IN_PROGRESS',
+  'RUNNING',
+  'PENDING',
+  'FAILED',
+  'ERROR',
+]);
+
+function extractUserInputCommandText(content: string): string {
+  const match = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(content);
+  return (match ? match[1]! : content).trim();
+}
+
+function extractCheckpointSummaryText(content: string): string {
+  const match = /<summary>\s*([\s\S]*?)\s*<\/summary>/i.exec(content);
+  const extracted = match?.[1]?.trim();
+  return extracted && extracted.length > 0 ? extracted : content.trim();
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -267,7 +310,7 @@ function extractTokenFields(obj: Record<string, unknown>): {
   return {};
 }
 
-function parseTranscriptTokenLine(line: string): ParsedTokenRecord | null {
+function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
   const trimmed = line.trim();
   if (trimmed.length === 0) return null;
 
@@ -281,20 +324,68 @@ function parseTranscriptTokenLine(line: string): ParsedTokenRecord | null {
   if (!isPlainObject(raw)) return null;
 
   const fields = extractTokenFields(raw);
-  if (
-    fields.input === undefined &&
-    fields.cacheRead === undefined &&
-    fields.output === undefined
-  ) {
+  const recordType = typeof raw.type === 'string' ? raw.type.toUpperCase() : '';
+  const hasTokens =
+    fields.input !== undefined ||
+    fields.cacheRead !== undefined ||
+    fields.output !== undefined;
+
+  const tokens: ParsedTokenRecord | null = hasTokens
+    ? {
+        uncachedInputTokens: fields.input ?? 0,
+        cacheReadTokens: fields.cacheRead ?? 0,
+        outputTokens: fields.output ?? 0,
+        isCheckpoint: recordType === 'CHECKPOINT',
+      }
+    : null;
+
+  let explicitUserInput: ParsedTranscriptLine['explicitUserInput'];
+  if (recordType === 'USER_INPUT') {
+    const source = typeof raw.source === 'string' ? raw.source.trim().toUpperCase() : '';
+    if (source === '' || source === 'USER_EXPLICIT') {
+      const content = typeof raw.content === 'string' ? extractUserInputCommandText(raw.content) : '';
+      explicitUserInput = {
+        isCompactCommand: /^\/compact(?:\s|$)/i.test(content),
+      };
+    }
+  }
+
+  let checkpoint: ParsedTranscriptLine['checkpoint'];
+  if (recordType === 'CHECKPOINT') {
+    const status = typeof raw.status === 'string' ? raw.status.trim().toUpperCase() : '';
+    if (!SKIPPED_CHECKPOINT_STATUSES.has(status)) {
+      const content = typeof raw.content === 'string' ? raw.content : '';
+      const summaryText = content ? extractCheckpointSummaryText(content) : '';
+      const stepIndex = asNonNegativeFiniteNumber(raw.step_index ?? raw.stepIndex);
+      const createdAt =
+        typeof raw.created_at === 'string'
+          ? raw.created_at
+          : typeof raw.createdAt === 'string'
+            ? raw.createdAt
+            : undefined;
+      const tokensBefore =
+        fields.input !== undefined || fields.cacheRead !== undefined
+          ? (fields.input ?? 0) + (fields.cacheRead ?? 0)
+          : undefined;
+      const summaryTokens = fields.output;
+      checkpoint = {
+        ...(stepIndex !== undefined ? { stepIndex } : {}),
+        summaryText,
+        ...(createdAt !== undefined ? { createdAt } : {}),
+        ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+        ...(summaryTokens !== undefined ? { summaryTokens } : {}),
+      };
+    }
+  }
+
+  if (!tokens && !explicitUserInput && !checkpoint) {
     return null;
   }
 
-  const recordType = typeof raw.type === 'string' ? raw.type.toUpperCase() : '';
   return {
-    uncachedInputTokens: fields.input ?? 0,
-    cacheReadTokens: fields.cacheRead ?? 0,
-    outputTokens: fields.output ?? 0,
-    isCheckpoint: recordType === 'CHECKPOINT',
+    tokens,
+    ...(explicitUserInput ? { explicitUserInput } : {}),
+    ...(checkpoint ? { checkpoint } : {}),
   };
 }
 
@@ -331,6 +422,12 @@ export class SessionMetricsTracker {
   private _totalCacheReadTokens = 0;
   private _totalOutputTokens = 0;
   private _responseCount = 0;
+
+  // Incremental compaction checkpoint tracking
+  private _explicitUserInputCount = 0;
+  private _lastExplicitUserInputWasCompact = false;
+  private _checkpointSeq = 0;
+  private _latestCheckpoint: TranscriptCompactionCheckpoint | null = null;
 
   // Streaming sliding window & post-turn calibration
   private _streaming = false;
@@ -417,6 +514,11 @@ export class SessionMetricsTracker {
     this._totalOutputTokens = 0;
     this._responseCount = 0;
 
+    this._explicitUserInputCount = 0;
+    this._lastExplicitUserInputWasCompact = false;
+    this._checkpointSeq = 0;
+    this._latestCheckpoint = null;
+
     this._streaming = false;
     this._implicitStream = false;
     this._turnStartTime = null;
@@ -433,6 +535,10 @@ export class SessionMetricsTracker {
 
   get isStreaming(): boolean {
     return this._streaming;
+  }
+
+  getLatestCheckpoint(): TranscriptCompactionCheckpoint | null {
+    return this._latestCheckpoint;
   }
 
   getSnapshot(): SessionMetricsSnapshot {
@@ -683,6 +789,10 @@ export class SessionMetricsTracker {
       this._totalCacheReadTokens = 0;
       this._totalOutputTokens = 0;
       this._responseCount = 0;
+      this._explicitUserInputCount = 0;
+      this._lastExplicitUserInputWasCompact = false;
+      this._checkpointSeq = 0;
+      this._latestCheckpoint = null;
       this._pendingCalibration = null;
     }
 
@@ -778,15 +888,42 @@ export class SessionMetricsTracker {
     let addedResponses = 0;
     const lines = text.split(/\r?\n/);
     for (const line of lines) {
-      const parsed = parseTranscriptTokenLine(line);
+      const parsed = parseTranscriptLine(line);
       if (!parsed) continue;
-      this._totalUncachedInputTokens += parsed.uncachedInputTokens;
-      this._totalCacheReadTokens += parsed.cacheReadTokens;
-      this._totalOutputTokens += parsed.outputTokens;
-      this._responseCount += 1;
-      addedResponses += 1;
-      if (!parsed.isCheckpoint && parsed.outputTokens > 0) {
-        sawNonCheckpointOutputDelta = true;
+      if (parsed.tokens) {
+        this._totalUncachedInputTokens += parsed.tokens.uncachedInputTokens;
+        this._totalCacheReadTokens += parsed.tokens.cacheReadTokens;
+        this._totalOutputTokens += parsed.tokens.outputTokens;
+        this._responseCount += 1;
+        addedResponses += 1;
+        if (!parsed.tokens.isCheckpoint && parsed.tokens.outputTokens > 0) {
+          sawNonCheckpointOutputDelta = true;
+        }
+      }
+      if (parsed.explicitUserInput) {
+        this._explicitUserInputCount += 1;
+        this._lastExplicitUserInputWasCompact = parsed.explicitUserInput.isCompactCommand;
+      }
+      if (parsed.checkpoint) {
+        const stepIndex = parsed.checkpoint.stepIndex ?? ++this._checkpointSeq;
+        if (parsed.checkpoint.stepIndex !== undefined) {
+          this._checkpointSeq = Math.max(this._checkpointSeq, stepIndex);
+        }
+        this._latestCheckpoint = {
+          stepIndex,
+          userInputsBefore: this._explicitUserInputCount,
+          precededByCompactCommand: this._lastExplicitUserInputWasCompact,
+          summaryText: parsed.checkpoint.summaryText,
+          ...(parsed.checkpoint.createdAt !== undefined
+            ? { createdAt: parsed.checkpoint.createdAt }
+            : {}),
+          ...(parsed.checkpoint.tokensBefore !== undefined
+            ? { tokensBefore: parsed.checkpoint.tokensBefore }
+            : {}),
+          ...(parsed.checkpoint.summaryTokens !== undefined
+            ? { summaryTokens: parsed.checkpoint.summaryTokens }
+            : {}),
+        };
       }
     }
 

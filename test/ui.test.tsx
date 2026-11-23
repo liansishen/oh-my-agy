@@ -25,6 +25,7 @@ import { DEFAULT_CONFIG, parseConfigToml } from '../src/config/config';
 import type { ExecCommandFn } from '../src/ecosystem/cli';
 import { PreviewStore } from '../src/preview/store';
 import type { GitExecFn } from '../src/state/git_status';
+import { getTranscriptPath } from '../src/state/session_metrics';
 import { COMPLETION_LIST_PREFIX, EDITOR_NODE_ID } from '../src/state/store';
 import { HIDE_CURSOR, SHOW_CURSOR } from '../src/termio/osc';
 import { SafeTermOutput } from '../src/termio/output';
@@ -9478,7 +9479,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await ctrl3.submitInput('/resume sess-resume-orch');
     await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-resume-orch');
     host3.input.emit('\r');
-    await waitFor(() => ctrl3.store.getState().sessionId === 'sess-resume-orch');
+    await waitFor(
+      () => ctrl3.store.getState().sessionId === 'sess-resume-orch' && !ctrl3.store.getState().isReplaying,
+    );
     expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
     expect(ctrl3.store.getState().controls.supportsThoughtLevel).toBe(false);
     expect(ctrl3.store.getState().controls.currentModeId).toBe('plan');
@@ -9492,7 +9495,9 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await ctrl3.submitInput('/resume sess-no-anchor-1');
     await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-no-anchor-1');
     host3.input.emit('\r');
-    await waitFor(() => ctrl3.store.getState().sessionId === 'sess-no-anchor-1');
+    await waitFor(
+      () => ctrl3.store.getState().sessionId === 'sess-no-anchor-1' && !ctrl3.store.getState().isReplaying,
+    );
     expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
     expect(ctrl3.store.getState().controls.currentThoughtLevel).toBe('low');
     await ctrl3.shutdown({ cleanExit: true });
@@ -9530,5 +9535,496 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(ctrl4.store.getState().controls.supportsThoughtLevel).toBe(false);
     await ctrl4.shutdown({ cleanExit: true });
     await run4;
+  });
+
+  test('post-compaction history hiding for live agy CHECKPOINT /compact, [Show earlier]/[Hide earlier], /settings toggle, explicit ACP compaction, auto-compaction, and /resume replay', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const configPath = join(tmp, 'config.toml');
+
+    const replayLiveNodes = (host: FakeTernHost): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // -----------------------------------------------------------------------
+    // Part 1: Live `/compact` (agy 1.5.14 transcript.jsonl CHECKPOINT flow),
+    //         [Show earlier]/[Hide earlier], /copy & /export, /settings toggle,
+    //         and mid-turn auto-compaction via usage_update drop
+    // -----------------------------------------------------------------------
+    const sidLive = 'sess-compact-live';
+    const transcriptFileLive = getTranscriptPath(sidLive, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptFileLive, '..'), { recursive: true });
+    let stepSeq = 0;
+
+    const copiedTexts: string[] = [];
+    const host1 = new FakeTernHost();
+    const session1 = await createConnectedSession(host1);
+    const acp1 = new MockAcpHarness();
+
+    acp1.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity', version: '1.5.14' },
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sidLive, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const blocks = (msg.params?.['prompt'] as Array<{ type: string; text?: string }> | undefined) ?? [];
+        const promptText = blocks.find(b => b.type === 'text')?.text ?? '';
+        appendFileSync(
+          transcriptFileLive,
+          JSON.stringify({
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            step_index: stepSeq++,
+            content: `<USER_REQUEST>\n${promptText}\n</USER_REQUEST>`,
+          }) + '\n',
+          'utf8',
+        );
+
+        if (promptText.trim() === '/compact') {
+          // Real agy 1.5.14 behavior: NO compaction_update / agent_message_chunk over ACP,
+          // only CHECKPOINT in transcript.jsonl + usage_update + end_turn
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({
+              type: 'CHECKPOINT',
+              source: 'SYSTEM',
+              status: 'DONE',
+              step_index: stepSeq++,
+              created_at: '2026-11-23T10:30:00Z',
+              input_tokens: 800,
+              cache_read_tokens: 180000,
+              output_tokens: 450,
+              content:
+                '# Resuming from a compaction\n\n<summary>\nKey context summarized cleanly.\n</summary>\n\n# Conversation Logs',
+            }) + '\n',
+            'utf8',
+          );
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 12000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn', usage: { outputTokens: 450 } },
+          });
+        } else if (promptText === 'Auto-compact mid turn') {
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({
+              type: 'CHECKPOINT',
+              source: 'SYSTEM',
+              status: 'DONE',
+              step_index: stepSeq++,
+              created_at: '2026-11-23T10:31:00Z',
+              input_tokens: 500,
+              cache_read_tokens: 90000,
+              output_tokens: 300,
+              content: '<summary>\nAuto-compacted summary mid-turn.\n</summary>',
+            }) + '\n',
+            'utf8',
+          );
+          // Drop usage from 180k -> 14k mid-turn while streaming
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 14000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sidLive,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Continuing after auto-compaction' } },
+            },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn' },
+          });
+        } else {
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 200, cache_read_tokens: 1000, output_tokens: 50 }) + '\n',
+            'utf8',
+          );
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 180000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sidLive,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Reply to: ${promptText}` },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl1 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session1,
+      output: host1.safeOutput,
+      acpSpawn: acp1.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath,
+      clipboard: {
+        readImage: async () => null,
+        readText: async () => null,
+        writeText: async text => {
+          copiedTexts.push(text);
+          return true;
+        },
+        isRemoteSshWithoutDisplay: () => false,
+      },
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run1 = ctrl1.run();
+    await ctrl1.readyPromise;
+
+    await ctrl1.submitInput('First question');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 1);
+    await ctrl1.submitInput('Second question');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 2);
+
+    // Before compaction, both Turn 0 and Turn 1 are mounted in main
+    expect(replayLiveNodes(host1).has('main.t0-user')).toBe(true);
+    expect(replayLiveNodes(host1).has('main.t1-user')).toBe(true);
+    expect(replayLiveNodes(host1).has('main.compacted-history')).toBe(false);
+
+    // Send `/compact`
+    await ctrl1.submitInput('/compact');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 3);
+    await waitFor(() => replayLiveNodes(host1).has('main.compacted-history'));
+
+    const liveAfterCompact = replayLiveNodes(host1);
+    expect(liveAfterCompact.has('main.t0-user')).toBe(false);
+    expect(liveAfterCompact.has('main.t1-user')).toBe(false);
+    expect(liveAfterCompact.has('main.t2-user')).toBe(true);
+    expect(
+      host1.allOps.some(op => op[0] === 'del' && (op[1] === 'main.t0-user' || op[1] === 'main.t1-user')),
+    ).toBe(true);
+
+    // Banner text & summary card present
+    expect(JSON.stringify(liveAfterCompact.get('main.compacted-history.label')?.p['spans'])).toContain(
+      '2 earlier turns hidden after compaction',
+    );
+    expect(liveAfterCompact.get('main.compacted-history.toggle')?.p['text']).toBe('Show earlier');
+    const compactSection = [...liveAfterCompact.entries()].find(
+      ([, v]) => v.k === 'section' && v.p['role'] === 'omp.compaction',
+    );
+    expect(compactSection).toBeDefined();
+    expect(JSON.stringify(liveAfterCompact.get(`${compactSection![0]}.summary`)?.p ?? {})).toContain(
+      'Key context summarized cleanly.',
+    );
+
+    // Toggle `[Show earlier]` mounts Turns 0 & 1 and switches button to `[Hide earlier]`
+    host1.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.compacted-history.toggle', act: 'click' });
+    await waitFor(() => replayLiveNodes(host1).has('main.t0-user'));
+    const liveExpanded = replayLiveNodes(host1);
+    expect(liveExpanded.has('main.t1-user')).toBe(true);
+    expect(liveExpanded.get('main.compacted-history.toggle')?.p['text']).toBe('Hide earlier');
+
+    // Toggle `[Hide earlier]` hides Turns 0 & 1 again
+    host1.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.compacted-history.toggle', act: 'click' });
+    await waitFor(() => !replayLiveNodes(host1).has('main.t0-user'));
+
+    // Underlying transcript remains intact for `/copy 2` (Turn 0, since Turn 2 `/compact` has empty assistant reply) & `/export`
+    await ctrl1.submitInput('/copy 2');
+    expect(copiedTexts).toEqual(['Reply to: First question']);
+    const exportPath = join(tmp, 'compacted-export.md');
+    await ctrl1.submitInput(`/export ${exportPath}`);
+    expect(readFileSync(exportPath, 'utf8')).toContain('First question');
+
+    // `/settings` `ui.collapse_compacted` false reveals hidden turns & persists to config.toml
+    await ctrl1.submitInput('/settings');
+    await waitFor(() => ctrl1.store.getState().settings !== null);
+    host1.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.collapse_compacted',
+      value: false,
+    });
+    await waitFor(() => replayLiveNodes(host1).has('main.t0-user'));
+    await waitFor(() => existsSync(configPath));
+    expect(parseConfigToml(readFileSync(configPath, 'utf8')).config.ui.collapse_compacted).toBe(false);
+
+    // Toggle `ui.collapse_compacted` back on and close settings
+    host1.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.collapse_compacted',
+      value: true,
+    });
+    await waitFor(() => !replayLiveNodes(host1).has('main.t0-user'));
+    expect(parseConfigToml(readFileSync(configPath, 'utf8')).config.ui.collapse_compacted).toBe(true);
+    host1.input.emit('\x1b');
+    await waitFor(() => ctrl1.store.getState().settings === null);
+
+    // Mid-turn automatic compaction (Turn 3) collapses Turn 2 while keeping Turn 3 visible
+    await ctrl1.submitInput('Auto-compact mid turn');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 4);
+    await waitFor(() => !replayLiveNodes(host1).has('main.t2-user'));
+    const liveAfterAuto = replayLiveNodes(host1);
+    expect(liveAfterAuto.has('main.t3-user')).toBe(true);
+    expect(JSON.stringify(liveAfterAuto.get('main.compacted-history.label')?.p['spans'])).toContain(
+      '3 earlier turns hidden after compaction',
+    );
+
+    await ctrl1.shutdown({ cleanExit: true });
+    await run1;
+
+    // -----------------------------------------------------------------------
+    // Part 2: Explicit ACP `compaction_update` / `compaction_summary_chunk` on Turn 1
+    // -----------------------------------------------------------------------
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    let promptIdx2 = 0;
+
+    acp2.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-explicit-compact', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const idx = promptIdx2++;
+        if (idx === 1) {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-explicit-compact',
+              update: { sessionUpdate: 'compaction_update', status: 'done', text: 'Compacted via ACP' },
+            },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-explicit-compact',
+              update: { sessionUpdate: 'compaction_summary_chunk', text: 'Explicit ACP summary' },
+            },
+          });
+        }
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-explicit-compact',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Resp ${idx}` } },
+          },
+        });
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-explicit.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = ctrl2.run();
+    await ctrl2.readyPromise;
+    await ctrl2.submitInput('Turn zero');
+    await waitFor(() => !ctrl2.store.getState().isStreaming && ctrl2.store.transcript.turns.length === 1);
+    await ctrl2.submitInput('Turn one');
+    await waitFor(() => !ctrl2.store.getState().isStreaming && ctrl2.store.transcript.turns.length === 2);
+    await waitFor(() => !replayLiveNodes(host2).has('main.t0-user'));
+    expect(replayLiveNodes(host2).has('main.compacted-history')).toBe(true);
+    expect(replayLiveNodes(host2).has('main.t1-user')).toBe(true);
+    await ctrl2.shutdown({ cleanExit: true });
+    await run2;
+
+    // -----------------------------------------------------------------------
+    // Part 3: `/resume` / `session/load` on compacted session hides pre-compaction turns
+    //         on the initial rendered Tern frame (and does not settle hidden turns)
+    // -----------------------------------------------------------------------
+    const sidResume = 'sess-resume-compacted';
+    const transcriptResume = getTranscriptPath(sidResume, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptResume, '..'), { recursive: true });
+    writeFileSync(
+      transcriptResume,
+      [
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 0, content: '<USER_REQUEST>\nOld 1\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 2, content: '<USER_REQUEST>\nOld 2\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 4, content: '<USER_REQUEST>\n/compact\n</USER_REQUEST>' }),
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 5,
+          content: '<summary>\nResumed compaction summary\n</summary>',
+        }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 6, content: '<USER_REQUEST>\nFollow up\n</USER_REQUEST>' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await previewStore.save({
+      sessionId: sidResume,
+      cwd: tmp,
+      title: 'Compacted Resume Session',
+      updatedAt: '2026-11-23T10:32:00.000Z',
+      preview: [{ role: 'user', text: 'Follow up' }],
+    });
+
+    const host3 = new FakeTernHost();
+    const session3 = await createConnectedSession(host3);
+    const acp3 = new MockAcpHarness();
+
+    acp3.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = msg.params?.['sessionId'] as string;
+        const sendReplay = (sessionUpdate: string, text: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sid, update: { sessionUpdate, content: { type: 'text', text } } },
+          });
+        };
+        sendReplay('user_message_chunk', 'Old 1');
+        sendReplay('agent_message_chunk', 'Old answer 1');
+        sendReplay('user_message_chunk', 'Old 2');
+        sendReplay('agent_message_chunk', 'Old answer 2');
+        sendReplay('user_message_chunk', '/compact');
+        sendReplay('user_message_chunk', 'Follow up');
+        sendReplay('agent_message_chunk', 'Follow up answer');
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl3 = new AppController({
+      cli: parseCliArgs(['--resume', sidResume]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session3,
+      output: host3.safeOutput,
+      acpSpawn: acp3.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-resume.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      replayDrainQuietMs: 15,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run3 = ctrl3.run();
+    await ctrl3.readyPromise;
+    await waitFor(() => ctrl3.store.transcript.turns.length === 4 && !ctrl3.store.getState().isReplaying);
+    expect(ctrl3.store.transcript.turns[2]?.user?.text).toBe('/compact');
+    expect(ctrl3.store.transcript.turns[3]?.user?.text).toBe('Follow up');
+
+    const resumedLive = replayLiveNodes(host3);
+    expect(resumedLive.has('main.compacted-history')).toBe(true);
+    expect(resumedLive.has('main.t0-user')).toBe(false);
+    expect(resumedLive.has('main.t1-user')).toBe(false);
+    expect(resumedLive.has('main.t2-user')).toBe(true);
+    expect(resumedLive.has('main.t3-user')).toBe(true);
+
+    // Pre-compaction turns were never even added or settled on the resumed Tern frame
+    expect(
+      host3.allOps.some(
+        op => (op[0] === 'add' && (op[4].id === 'main.t0-user' || op[4].id === 'main.t1-user')) ||
+              (op[0] === 'settle' && (String(op[1]).startsWith('main.t0-') || String(op[1]).startsWith('main.t1-') || op[1] === 'main.turn-0' || op[1] === 'main.turn-1')),
+      ),
+    ).toBe(false);
+    // Boundary turn t2 WAS settled
+    expect(host3.allOps.some(op => op[0] === 'settle' && String(op[1]).startsWith('main.t2-'))).toBe(true);
+
+    await ctrl3.shutdown({ cleanExit: true });
+    await run3;
   });
 });

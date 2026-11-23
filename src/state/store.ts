@@ -477,6 +477,7 @@ export interface AppState {
   readonly beeMemberBlobs?: Readonly<Record<string, BeeMemberBlobPair>>;
   readonly showThinking: boolean;
   readonly autoCollapseThought: boolean;
+  readonly collapseCompacted: boolean;
   readonly expandAllTools: boolean;
   readonly toolDisplayMode: ToolDisplayMode;
   readonly expandedToolGroups: Readonly<Record<string, boolean>>;
@@ -514,6 +515,7 @@ export interface AppStoreOptions {
   readonly cwd?: string;
   readonly autoAllowTools?: readonly string[];
   readonly autoCollapseThought?: boolean;
+  readonly collapseCompacted?: boolean;
   readonly recentModels?: readonly string[];
   readonly hour12?: boolean;
   readonly supportsAside?: boolean;
@@ -602,6 +604,7 @@ export class AppStore {
   private readonly _now: () => number;
   private readonly _listeners = new Set<() => void>();
   private _autoCollapseThought: boolean;
+  private _collapseCompacted: boolean;
 
   private _connectionStatus: ConnectionStatus = 'initializing';
   private _isStreaming = false;
@@ -669,6 +672,7 @@ export class AppStore {
     this._now = options.now ?? (() => Date.now());
     this._cwd = options.cwd ?? process.cwd();
     this._autoCollapseThought = options.autoCollapseThought ?? true;
+    this._collapseCompacted = options.collapseCompacted ?? true;
     this._recentModels = normalizeRecentModels(options.recentModels);
     this._hour12 = options.hour12 ?? false;
     this._supportsAside = options.supportsAside ?? false;
@@ -724,6 +728,16 @@ export class AppStore {
   setAutoCollapseThought(enabled: boolean): void {
     if (this._autoCollapseThought === enabled) return;
     this._autoCollapseThought = enabled;
+    this.emit();
+  }
+
+  get collapseCompacted(): boolean {
+    return this._collapseCompacted;
+  }
+
+  setCollapseCompacted(enabled: boolean): void {
+    if (this._collapseCompacted === enabled) return;
+    this._collapseCompacted = enabled;
     this.emit();
   }
 
@@ -1112,6 +1126,7 @@ export class AppStore {
       ...(this._beeMemberBlobs ? { beeMemberBlobs: this._beeMemberBlobs } : {}),
       showThinking: this._showThinking,
       autoCollapseThought: this._autoCollapseThought,
+      collapseCompacted: this._collapseCompacted,
       expandAllTools: this._expandAllTools,
       toolDisplayMode: this._toolDisplayMode,
       expandedToolGroups: this._expandedToolGroups,

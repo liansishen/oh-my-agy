@@ -40,6 +40,7 @@ import {
   type UnknownSessionUpdate,
 } from '../acp/protocol';
 import type { ApprovalDecision, MappedPermissionOptions } from './approval';
+import type { TranscriptCompactionCheckpoint } from './session_metrics';
 
 // ---------------------------------------------------------------------------
 // Data Models
@@ -169,6 +170,15 @@ export interface NoticeItem {
   summaryText: string;
   collapsed: boolean;
   readonly timestamp: number;
+  checkpointStepIndex?: number;
+}
+
+export interface VisibleTranscriptSlice {
+  readonly turns: readonly TranscriptTurn[];
+  readonly hiddenCompactedTurnCount: number;
+  readonly totalCompactedTurnCount: number;
+  readonly hasCompactedHistory: boolean;
+  readonly compactedHistoryExpanded: boolean;
 }
 
 export interface PlanItemState {
@@ -1326,6 +1336,9 @@ export class TranscriptStore {
   private readonly _detachedBgTasks = new Map<string, DetachedBackgroundTask>();
   private readonly _settledIds = new Set<string>();
   private readonly _evictedIds = new Set<string>();
+  private _compactedBeforeTurnIndex: number | null = null;
+  private _showCompactedHistory = false;
+  private _lastAppliedCheckpointStepIndex: number | null = null;
   private _idSeq = 1;
 
   constructor(options: { now?: () => number } = {}) {
@@ -1353,12 +1366,215 @@ export class TranscriptStore {
     return this._evictedIds;
   }
 
+  get compactedBeforeTurnIndex(): number | null {
+    return this._compactedBeforeTurnIndex;
+  }
+
+  get showCompactedHistory(): boolean {
+    return this._showCompactedHistory;
+  }
+
   /**
    * Turns that have not been evicted by Tern (`GoneEvent`).
    * Views should render only these turns so no ops target dropped nodes.
    */
   getVisibleTurns(): readonly TranscriptTurn[] {
     return this._turns.filter((t) => !t.evicted);
+  }
+
+  /**
+   * Mark all turns with index `< turnIndex` as pre-compaction history and collapse
+   * them by default (`_showCompactedHistory = false`) monotonically per session.
+   */
+  markCompactedAtTurn(turnIndex: number): boolean {
+    if (!Number.isInteger(turnIndex) || turnIndex < 0) {
+      return false;
+    }
+    if (this._compactedBeforeTurnIndex !== null && turnIndex < this._compactedBeforeTurnIndex) {
+      return false;
+    }
+    const changed =
+      this._compactedBeforeTurnIndex !== turnIndex || this._showCompactedHistory !== false;
+    this._compactedBeforeTurnIndex = turnIndex;
+    this._showCompactedHistory = false;
+    return changed;
+  }
+
+  setShowCompactedHistory(show: boolean): boolean {
+    if (this._showCompactedHistory === show) {
+      return false;
+    }
+    this._showCompactedHistory = show;
+    return true;
+  }
+
+  markCompactionCompleted(
+    turnIndex: number,
+    options?: { readonly summaryText?: string; readonly text?: string },
+  ): boolean {
+    const turn = this._turns.find((t) => t.index === turnIndex);
+    let addedNotice = false;
+    if (turn && !turn.notices.some((n) => n.kind === 'compaction')) {
+      const notice: NoticeItem = {
+        id: `notice-${this._idSeq++}`,
+        kind: 'compaction',
+        level: 'info',
+        status: 'done',
+        text: options?.text || 'Context compacted',
+        summaryText: options?.summaryText ?? '',
+        collapsed: true,
+        timestamp: this._now(),
+      };
+      turn.notices.push(notice);
+      turn.timeline.push({ kind: 'notice', id: notice.id });
+      this.bumpTurn(turn);
+      addedNotice = true;
+    }
+    const boundaryChanged = this.markCompactedAtTurn(turnIndex);
+    return addedNotice || boundaryChanged;
+  }
+
+  applyTranscriptCompactionCheckpoint(checkpoint: TranscriptCompactionCheckpoint): boolean {
+    if (this._turns.length === 0) {
+      return false;
+    }
+    if (
+      this._lastAppliedCheckpointStepIndex !== null &&
+      checkpoint.stepIndex <= this._lastAppliedCheckpointStepIndex
+    ) {
+      return false;
+    }
+
+    const userTurns = this._turns.filter((t) => t.user !== undefined);
+    const isCompactUserTurn = (t: TranscriptTurn): boolean =>
+      /^\/compact(?:\s|$)/i.test((t.user?.text ?? '').trim());
+
+    let targetTurn: TranscriptTurn | undefined;
+    if (checkpoint.userInputsBefore > 0 && checkpoint.userInputsBefore <= userTurns.length) {
+      const candidate = userTurns[checkpoint.userInputsBefore - 1]!;
+      targetTurn = candidate;
+      if (checkpoint.precededByCompactCommand && !isCompactUserTurn(candidate)) {
+        for (let i = checkpoint.userInputsBefore - 2; i >= 0; i--) {
+          if (isCompactUserTurn(userTurns[i]!)) {
+            targetTurn = userTurns[i];
+            break;
+          }
+        }
+        if (targetTurn === candidate) {
+          for (let i = checkpoint.userInputsBefore; i < userTurns.length; i++) {
+            if (isCompactUserTurn(userTurns[i]!)) {
+              targetTurn = userTurns[i];
+              break;
+            }
+          }
+        }
+      }
+    } else if (checkpoint.userInputsBefore > userTurns.length && userTurns.length > 0) {
+      if (checkpoint.precededByCompactCommand) {
+        for (let i = userTurns.length - 1; i >= 0; i--) {
+          if (isCompactUserTurn(userTurns[i]!)) {
+            targetTurn = userTurns[i];
+            break;
+          }
+        }
+      }
+      if (!targetTurn) {
+        targetTurn = userTurns[userTurns.length - 1];
+      }
+    } else if (checkpoint.userInputsBefore === 0) {
+      targetTurn = this._turns[0];
+    } else {
+      targetTurn = this._turns[this._turns.length - 1];
+    }
+
+    if (!targetTurn) {
+      return false;
+    }
+
+    const existing = [...targetTurn.notices].reverse().find((n) => n.kind === 'compaction');
+    if (
+      existing &&
+      (existing.checkpointStepIndex === undefined ||
+        existing.checkpointStepIndex === checkpoint.stepIndex)
+    ) {
+      existing.status = 'done';
+      existing.text = 'Context compacted';
+      existing.checkpointStepIndex = checkpoint.stepIndex;
+      if (
+        checkpoint.summaryText.length > 0 &&
+        (existing.summaryText.length === 0 ||
+          checkpoint.summaryText.length > existing.summaryText.length)
+      ) {
+        existing.summaryText = checkpoint.summaryText;
+      }
+    } else {
+      const notice: NoticeItem = {
+        id: `notice-${this._idSeq++}`,
+        kind: 'compaction',
+        level: 'info',
+        status: 'done',
+        text: 'Context compacted',
+        summaryText: checkpoint.summaryText,
+        collapsed: true,
+        timestamp: this._now(),
+        checkpointStepIndex: checkpoint.stepIndex,
+      };
+      targetTurn.notices.push(notice);
+      targetTurn.timeline.push({ kind: 'notice', id: notice.id });
+    }
+
+    this.bumpTurn(targetTurn);
+    this.markCompactedAtTurn(targetTurn.index);
+    this._lastAppliedCheckpointStepIndex = checkpoint.stepIndex;
+    return true;
+  }
+
+  getVisibleTranscriptSlice(collapseCompacted: boolean): VisibleTranscriptSlice {
+    const allVisible = this.getVisibleTurns();
+    const boundary = this._compactedBeforeTurnIndex;
+    if (boundary === null) {
+      return {
+        turns: allVisible,
+        hiddenCompactedTurnCount: 0,
+        totalCompactedTurnCount: 0,
+        hasCompactedHistory: false,
+        compactedHistoryExpanded: false,
+      };
+    }
+
+    let preCount = 0;
+    for (const turn of allVisible) {
+      if (turn.index < boundary) {
+        preCount += 1;
+      }
+    }
+    if (preCount === 0 || !collapseCompacted) {
+      return {
+        turns: allVisible,
+        hiddenCompactedTurnCount: 0,
+        totalCompactedTurnCount: 0,
+        hasCompactedHistory: false,
+        compactedHistoryExpanded: false,
+      };
+    }
+
+    if (this._showCompactedHistory) {
+      return {
+        turns: allVisible,
+        hiddenCompactedTurnCount: 0,
+        totalCompactedTurnCount: preCount,
+        hasCompactedHistory: true,
+        compactedHistoryExpanded: true,
+      };
+    }
+
+    return {
+      turns: allVisible.filter((t) => t.index >= boundary),
+      hiddenCompactedTurnCount: preCount,
+      totalCompactedTurnCount: preCount,
+      hasCompactedHistory: true,
+      compactedHistoryExpanded: false,
+    };
   }
 
   getToolById(toolCallId: string): ToolCallItem | undefined {
@@ -1641,10 +1857,15 @@ export class TranscriptStore {
         const current = this.activeTurn;
         // During replay, or if there is no local user message yet, create/append a user message
         if (isReplaying) {
+          const isAfterStandaloneCompact =
+            current?.user !== undefined &&
+            /^\/compact$/i.test(current.user.text.trim()) &&
+            !/^\s/.test(chunkText);
           if (
             !current ||
             current.timeline.length > 0 ||
-            current.status !== 'streaming'
+            current.status !== 'streaming' ||
+            isAfterStandaloneCompact
           ) {
             if (current && current.status === 'streaming') {
               this.finishActiveTurn('end_turn', 'done');
@@ -1859,6 +2080,18 @@ export class TranscriptStore {
           turn.notices.push(notice);
           turn.timeline.push({ kind: 'notice', id: notice.id });
         }
+        this.bumpTurn(turn);
+        const st = (update.status ?? '').trim().toLowerCase();
+        const isCompleted =
+          st === 'done' ||
+          st === 'completed' ||
+          st === 'complete' ||
+          st === 'finished' ||
+          st === 'success' ||
+          (st === '' && !/in progress|compacting|starting|pending/i.test(text));
+        if (isCompleted) {
+          this.markCompactedAtTurn(turn.index);
+        }
         return { handled: true };
       }
 
@@ -1884,6 +2117,8 @@ export class TranscriptStore {
           turn.notices.push(notice);
           turn.timeline.push({ kind: 'notice', id: notice.id });
         }
+        this.bumpTurn(turn);
+        this.markCompactedAtTurn(turn.index);
         return { handled: true };
       }
 
@@ -2579,6 +2814,9 @@ export class TranscriptStore {
     this._detachedBgTasks.clear();
     this._settledIds.clear();
     this._evictedIds.clear();
+    this._compactedBeforeTurnIndex = null;
+    this._showCompactedHistory = false;
+    this._lastAppliedCheckpointStepIndex = null;
   }
 
   // -------------------------------------------------------------------------

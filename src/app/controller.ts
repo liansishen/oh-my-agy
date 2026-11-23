@@ -268,6 +268,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
     recent_models: [...(config.recent_models ?? [])],
     ui: {
       auto_collapse_thought: config.ui.auto_collapse_thought,
+      collapse_compacted: config.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
       osc_7501: config.ui.osc_7501,
@@ -524,6 +525,7 @@ export class AppController {
       cwd: initialCwd,
       autoAllowTools: this.#config.approval.auto_allow_tools,
       autoCollapseThought: this.#config.ui.auto_collapse_thought,
+      collapseCompacted: this.#config.ui.collapse_compacted,
       toolDisplayMode: normalizeToolDisplayMode(this.#config.ui.tool_display),
       recentModels: this.#config.recent_models,
       hour12: this.session.caps.hour12,
@@ -1284,7 +1286,6 @@ export class AppController {
       }
 
       this.store.transcript.finalizeReplayedTurns();
-      this.store.setReplaying(false);
       const loadedTier = client.currentTier ?? extractSessionTier(loaded._meta);
       this.store.applySessionSnapshot({
         sessionId: loaded.sessionId,
@@ -1323,10 +1324,13 @@ export class AppController {
       }
       void this.#refreshGitStatus({ force: true });
 
+      this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(true);
 
       // Settle historical completed turns (keep the last turn unsettled so reveal/copy stays crisp)
-      const turns = this.store.transcript.getVisibleTurns();
+      const turns = this.store.transcript.getVisibleTranscriptSlice(
+        this.store.collapseCompacted
+      ).turns;
       let settledAny = false;
       for (let i = 0; i < turns.length - 1; i++) {
         const turn = turns[i];
@@ -1527,6 +1531,11 @@ export class AppController {
       this.#noteReplayDrainActivity();
     }
     const prevBusy = this.store.isBusy;
+    const isReplayingBefore = this.store.getState().isReplaying;
+    const prevUsageUsed =
+      !isReplayingBefore && params.update.sessionUpdate === 'usage_update'
+        ? (this.store.getState().usage?.used ?? 0)
+        : 0;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
       this.store.traffic.recordSystem(
@@ -1540,6 +1549,12 @@ export class AppController {
     const update = params.update;
 
     if (!isReplaying) {
+      if (update.sessionUpdate === 'usage_update') {
+        const nextUsageUsed = this.store.getState().usage?.used ?? 0;
+        if (prevUsageUsed >= 1_000 && nextUsageUsed > 0 && nextUsageUsed <= prevUsageUsed * 0.7) {
+          void this.#syncSessionMetricsFromTranscript();
+        }
+      }
       // Live streaming TPS tracking from assistant text & thought deltas
       if (
         update.sessionUpdate === 'agent_message_chunk' ||
@@ -3369,6 +3384,7 @@ export class AppController {
     this.#promptSubmitting = true;
     const sessionId = state.sessionId;
     const promptEpoch = this.#sessionEpoch;
+    const isCompactPrompt = /^\/compact(?:\s|$)/i.test(text.trim());
     const suppressedMentions = preserveDraft
       ? new Set<string>()
       : new Set(this.#suppressedMentionPaths);
@@ -3459,6 +3475,20 @@ export class AppController {
           }
         );
         this.store.setStreaming(false);
+
+        if (isCompactPrompt && result.stopReason === 'end_turn') {
+          await this.#syncSessionMetricsFromTranscript();
+          if (
+            this.#shuttingDown ||
+            promptEpoch !== this.#sessionEpoch ||
+            this.store.getState().sessionId !== sessionId
+          ) {
+            return;
+          }
+          if (finishedTurn && !finishedTurn.notices.some(n => n.kind === 'compaction')) {
+            this.store.transcript.markCompactionCompleted(finishedTurn.index);
+          }
+        }
 
         const hasBgTools = this.store.hasActiveBackgroundTasks();
         const swarmActive = this.store.isSwarmWorking;
@@ -5626,6 +5656,14 @@ export class AppController {
       };
       this.store.setAutoCollapseThought(next);
       omaUpdated = true;
+    } else if (rowId === 'ui.collapse_compacted') {
+      const next = Boolean(value);
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, collapse_compacted: next },
+      };
+      this.store.setCollapseCompacted(next);
+      omaUpdated = true;
     } else if (rowId === 'ui.tool_display') {
       const next: ToolDisplayMode = normalizeToolDisplayMode(value);
       this.#config = {
@@ -5801,6 +5839,7 @@ export class AppController {
         recent_models: [...this.#config.recent_models],
       });
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
+      this.store.setCollapseCompacted(this.#config.ui.collapse_compacted);
       this.store.setToolDisplayMode(this.#config.ui.tool_display);
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
@@ -6165,7 +6204,12 @@ export class AppController {
     if (!expectedSessionId) return;
     const snap = await this.#metricsTracker.syncFromTranscript();
     if (this.#shuttingDown || this.#metricsTracker.sessionId !== expectedSessionId) return;
-    if (this.#applySessionMetricsSnapshot(snap)) {
+    let dirty = this.#applySessionMetricsSnapshot(snap);
+    const checkpoint = this.#metricsTracker.getLatestCheckpoint();
+    if (checkpoint && this.store.transcript.applyTranscriptCompactionCheckpoint(checkpoint)) {
+      dirty = true;
+    }
+    if (dirty) {
       this.scheduler.markDirty();
     }
   }
@@ -6620,10 +6664,15 @@ export class AppController {
   #buildView() {
     const state = this.store.getState();
     const jobs = this.store.transcript.getBackgroundJobsSnapshot();
+    const allVisibleTurns = this.store.transcript.getVisibleTurns();
+    const transcriptSlice = this.store.transcript.getVisibleTranscriptSlice(
+      state.collapseCompacted
+    );
     return buildAppView({
       state,
       draft: this.store.draft.getState(),
-      turns: this.store.transcript.getVisibleTurns(),
+      turns: allVisibleTurns,
+      transcriptTurns: transcriptSlice.turns,
       plan: this.store.transcript.plan,
       jobs,
       version: OMA_VERSION,
@@ -6631,6 +6680,10 @@ export class AppController {
       trafficEntries: this.store.traffic.list(),
       toolPreviewLines: this.#config.ui.tool_preview_lines,
       evictedNodeIds: this.store.transcript.evictedTurnIds,
+      hiddenCompactedTurnCount: transcriptSlice.hiddenCompactedTurnCount,
+      totalCompactedTurnCount: transcriptSlice.totalCompactedTurnCount,
+      hasCompactedHistory: transcriptSlice.hasCompactedHistory,
+      compactedHistoryExpanded: transcriptSlice.compactedHistoryExpanded,
       config: this.#config,
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
@@ -6654,6 +6707,11 @@ export class AppController {
           onToggleNotice: (noticeId, collapsed) => {
             this.store.transcript.toggleNotice(noticeId, collapsed);
             this.scheduler.renderNow();
+          },
+          onToggleCompactedHistory: show => {
+            if (this.store.transcript.setShowCompactedHistory(show)) {
+              this.scheduler.renderNow();
+            }
           },
           onToggleAgent: (agentId, collapsed) => {
             this.store.transcript.toggleAgent(agentId, collapsed);

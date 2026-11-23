@@ -23,6 +23,7 @@ export interface TranscriptCallbacks {
   readonly onToggleTool: (toolCallId: string, collapsed: boolean) => void;
   readonly onToggleToolGroup?: (groupId: string, expanded: boolean) => void;
   readonly onToggleNotice: (noticeId: string, collapsed: boolean) => void;
+  readonly onToggleCompactedHistory?: (show: boolean) => void;
   readonly onToggleAgent: (agentId: string, collapsed: boolean) => void;
   readonly onApproveTool: (toolCallId: string, action: ApprovalAction) => void;
   readonly onCopyMessage: (text: string) => void;
@@ -56,6 +57,10 @@ export interface TranscriptViewProps {
   readonly version: string;
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
+  readonly hiddenCompactedTurnCount?: number;
+  readonly totalCompactedTurnCount?: number;
+  readonly hasCompactedHistory?: boolean;
+  readonly compactedHistoryExpanded?: boolean;
   readonly now?: number;
   readonly callbacks: TranscriptCallbacks;
 }
@@ -170,7 +175,7 @@ function computeCompletedTurnMemoKey(
     );
   }
   for (const n of turn.notices) {
-    parts.push(`no:${n.id}:${n.collapsed ? 1 : 0}:${hashTextFingerprint(n.text)}:${hashTextFingerprint(n.summaryText)}`);
+    parts.push(`no:${n.id}:${n.status ?? ''}:${n.collapsed ? 1 : 0}:${hashTextFingerprint(n.text)}:${hashTextFingerprint(n.summaryText)}`);
   }
   for (const a of turn.agents) {
     parts.push(
@@ -1170,6 +1175,10 @@ function renderTurnFooterNodes(
  */
 export function TranscriptView(props: TranscriptViewProps): JSX.Element {
   const { state, turns, plan, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
+  const hasCompactedHistory = Boolean(props.hasCompactedHistory);
+  const compactedHistoryExpanded = Boolean(props.compactedHistoryExpanded);
+  const hiddenCompactedTurnCount = props.hiddenCompactedTurnCount ?? 0;
+  const totalCompactedTurnCount = props.totalCompactedTurnCount ?? hiddenCompactedTurnCount;
   const now = props.now ?? Date.now();
   const lastTurn = turns[turns.length - 1];
   const isEvicted = (key: string): boolean => Boolean(evictedNodeIds?.has(`main.${key}`));
@@ -1188,7 +1197,7 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
 
   return (
     <col role="omp.transcript">
-      {turns.length === 0 ? (
+      {turns.length === 0 && !hasCompactedHistory ? (
         <card key="welcome" role="omp.welcome">
           <row key="lockup" align="center" gap="md" role="omp.welcome.lockup">
             {state.welcomeLogoBlobId ? (
@@ -1234,6 +1243,39 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
             />
           </row>
         </card>
+      ) : null}
+
+      {hasCompactedHistory ? (
+        <row
+          key="compacted-history"
+          role="omp.compaction.hidden"
+          align="center"
+          gap="sm"
+        >
+          <icon key="icon" name="info" role="omp.compaction.hidden-icon" />
+          <text
+            key="label"
+            grow={1}
+            shrink={1}
+            wrap="word"
+            spans={[
+              {
+                t: compactedHistoryExpanded
+                  ? `Showing ${totalCompactedTurnCount} earlier compacted ${totalCompactedTurnCount === 1 ? 'turn' : 'turns'}`
+                  : `${hiddenCompactedTurnCount} earlier ${hiddenCompactedTurnCount === 1 ? 'turn' : 'turns'} hidden after compaction`,
+                s: 'muted',
+              },
+            ]}
+          />
+          <button
+            key="toggle"
+            role="omp.compaction.toggle"
+            text={compactedHistoryExpanded ? 'Hide earlier' : 'Show earlier'}
+            size="sm"
+            variant="quiet"
+            onClick={() => callbacks.onToggleCompactedHistory?.(!compactedHistoryExpanded)}
+          />
+        </row>
       ) : null}
 
       {turns.flatMap(turn => {

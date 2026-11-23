@@ -29,6 +29,7 @@ export interface AppViewProps {
   readonly state: AppState;
   readonly draft: DraftState;
   readonly turns: readonly TranscriptTurn[];
+  readonly transcriptTurns?: readonly TranscriptTurn[];
   readonly plan: PlanState | null;
   readonly jobs?: BackgroundJobsSnapshot;
   readonly version: string;
@@ -36,6 +37,10 @@ export interface AppViewProps {
   readonly trafficEntries: readonly TrafficEntry[];
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
+  readonly hiddenCompactedTurnCount?: number;
+  readonly totalCompactedTurnCount?: number;
+  readonly hasCompactedHistory?: boolean;
+  readonly compactedHistoryExpanded?: boolean;
   readonly config?: OmaConfig;
   readonly configPath?: string;
   readonly agySettingsPath?: string;
@@ -111,6 +116,7 @@ export function buildAppView(props: AppViewProps): ViewInput {
     state,
     draft,
     turns,
+    transcriptTurns,
     plan,
     jobs,
     version,
@@ -118,6 +124,10 @@ export function buildAppView(props: AppViewProps): ViewInput {
     trafficEntries,
     toolPreviewLines,
     evictedNodeIds,
+    hiddenCompactedTurnCount,
+    totalCompactedTurnCount,
+    hasCompactedHistory,
+    compactedHistoryExpanded,
     config,
     configPath,
     agySettingsPath,
@@ -130,11 +140,15 @@ export function buildAppView(props: AppViewProps): ViewInput {
   const main: JSX.Element = (
     <TranscriptView
       state={state}
-      turns={turns}
+      turns={transcriptTurns ?? turns}
       plan={plan}
       version={version}
       toolPreviewLines={toolPreviewLines}
       evictedNodeIds={evictedNodeIds}
+      hiddenCompactedTurnCount={hiddenCompactedTurnCount}
+      totalCompactedTurnCount={totalCompactedTurnCount}
+      hasCompactedHistory={hasCompactedHistory}
+      compactedHistoryExpanded={compactedHistoryExpanded}
       now={now}
       callbacks={callbacks.transcript}
     />

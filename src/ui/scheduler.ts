@@ -129,6 +129,14 @@ export class RenderScheduler {
       const view = this.#buildView();
       this.#lastMainChildIds = extractMainChildIds(view);
       this.#lastMainChildIdsByTurn = indexMainChildIdsByTurn(this.#lastMainChildIds);
+      if (this.#settledIds.size > 0) {
+        const present = new Set(this.#lastMainChildIds);
+        for (const id of this.#settledIds) {
+          if (/^main\.t\d+-/.test(id) && !present.has(id)) {
+            this.#settledIds.delete(id);
+          }
+        }
+      }
       this.#flushPendingSettleTurns();
       return view;
     };

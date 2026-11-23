@@ -21,6 +21,7 @@ import {
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
 } from '../src/state/session_metrics';
+import { TranscriptStore } from '../src/state/transcript';
 import { AppStore } from '../src/state/store';
 
 // ---------------------------------------------------------------------------
@@ -819,6 +820,154 @@ describe('readTranscriptModelCandidates', () => {
         'gemini-4-hydrogen-high',
         'gemini-4-neon-xhigh',
       ]);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore alignment', () => {
+  test('extracts CHECKPOINT <summary>, counts USER_INPUT turns, handles incremental/truncation/reset, and aligns with TranscriptStore', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-checkpoint-test-'));
+    try {
+      const sessionId = 'sess-checkpoint-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const userLine = (step: number, text: string, source = 'USER_EXPLICIT') =>
+        JSON.stringify({
+          type: 'USER_INPUT',
+          source,
+          step_index: step,
+          content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>`,
+        });
+      const checkpointLine = (
+        step: number,
+        opts: { status?: string; content: string; inTok?: number; cacheTok?: number; outTok?: number },
+      ) =>
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: opts.status ?? 'DONE',
+          step_index: step,
+          created_at: `2026-11-23T10:00:0${step}Z`,
+          input_tokens: opts.inTok ?? 500,
+          cache_read_tokens: opts.cacheTok ?? 12000,
+          output_tokens: opts.outTok ?? 350,
+          content: opts.content,
+        });
+
+      // Turn 0, Turn 1, then IN_PROGRESS checkpoint (ignored), then internal subagent input (ignored), then Turn 2 (/compact) + DONE checkpoint
+      await writeFile(
+        transcriptFile,
+        [
+          userLine(0, 'Hello project'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20 }),
+          userLine(2, 'Inspect codebase'),
+          JSON.stringify({ type: 'USER_INPUT', source: 'SYSTEM_SUBAGENT', step_index: 3, content: 'internal helper' }),
+          checkpointLine(4, { status: 'IN_PROGRESS', content: '<summary>\npartial\n</summary>' }),
+          userLine(5, '/compact'),
+          checkpointLine(6, {
+            content:
+              '# Resuming from a compaction\n\n<summary>\n## Summary\nKept key architecture decisions.\n</summary>\n\n# Conversation Logs',
+            inTok: 400,
+            cacheTok: 15000,
+            outTok: 280,
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const firstCp = tracker.getLatestCheckpoint();
+      expect(firstCp).toEqual({
+        stepIndex: 6,
+        userInputsBefore: 3,
+        precededByCompactCommand: true,
+        summaryText: '## Summary\nKept key architecture decisions.',
+        createdAt: '2026-11-23T10:00:06Z',
+        tokensBefore: 15400,
+        summaryTokens: 280,
+      });
+
+      // Incrementally append Turn 3 (auto-compaction without /compact command, no <summary> tags -> trimmed raw fallback)
+      await appendFile(
+        transcriptFile,
+        [
+          userLine(7, 'Continue implementing tests'),
+          checkpointLine(9, {
+            content: '  Plain fallback compaction summary  ',
+            inTok: 200,
+            cacheTok: 8000,
+            outTok: 190,
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      await tracker.syncFromTranscript();
+      const secondCp = tracker.getLatestCheckpoint();
+      expect(secondCp).toEqual({
+        stepIndex: 9,
+        userInputsBefore: 4,
+        precededByCompactCommand: false,
+        summaryText: 'Plain fallback compaction summary',
+        createdAt: '2026-11-23T10:00:09Z',
+        tokensBefore: 8200,
+        summaryTokens: 190,
+      });
+
+      // Apply onto TranscriptStore: 4 turns, boundary advances to Turn 3, idempotent on re-apply
+      const store = new TranscriptStore({ now: () => 1_700_000_000_000 });
+      store.beginUserTurn('Hello project');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('Inspect codebase');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('/compact');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('Continue implementing tests');
+      store.finishActiveTurn('end_turn');
+
+      expect(store.applyTranscriptCompactionCheckpoint(firstCp!)).toBe(true);
+      expect(store.compactedBeforeTurnIndex).toBe(2);
+      expect(store.getVisibleTranscriptSlice(true).hiddenCompactedTurnCount).toBe(2);
+      expect(store.getVisibleTranscriptSlice(true).turns.map(t => t.index)).toEqual([2, 3]);
+      // Idempotent on same checkpoint
+      expect(store.applyTranscriptCompactionCheckpoint(firstCp!)).toBe(false);
+
+      // Advancing to second checkpoint hides Turns 0..2
+      expect(store.applyTranscriptCompactionCheckpoint(secondCp!)).toBe(true);
+      expect(store.compactedBeforeTurnIndex).toBe(3);
+      expect(store.getVisibleTranscriptSlice(true).hiddenCompactedTurnCount).toBe(3);
+      expect(store.getVisibleTranscriptSlice(true).turns.map(t => t.index)).toEqual([3]);
+
+      // Disabling collapseCompacted reveals all 4 turns without mutating underlying turns
+      expect(store.getVisibleTranscriptSlice(false).turns.map(t => t.index)).toEqual([0, 1, 2, 3]);
+      expect(store.getVisibleTranscriptSlice(false).hasCompactedHistory).toBe(false);
+
+      // File truncation resets checkpoint state cleanly
+      await writeFile(
+        transcriptFile,
+        userLine(0, 'Fresh after truncate') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestCheckpoint()).toBeNull();
+
+      // Re-add checkpoint, then verify reset() and setSession() clear it
+      await appendFile(
+        transcriptFile,
+        checkpointLine(1, { content: '<summary>Reloaded</summary>' }) + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestCheckpoint()?.summaryText).toBe('Reloaded');
+      tracker.reset();
+      expect(tracker.getLatestCheckpoint()).toBeNull();
+      tracker.setSession(null);
+      expect(tracker.getLatestCheckpoint()).toBeNull();
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
