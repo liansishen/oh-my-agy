@@ -4,9 +4,12 @@ import { createInterface } from 'node:readline';
 import { AcpClient, type AcpClientOptions } from '../acp/client';
 import {
   applyModelSelection,
+  clampThoughtLevelForChoices,
+  extractSessionControlState,
   resolveModeSelection,
   resolveModelSelection,
   resolveThoughtLevel,
+  splitModelThoughtSuffix,
   type SessionControlContext,
 } from '../acp/model';
 import { normalizeDisplayPath, sameDir } from '../acp/path';
@@ -17,6 +20,8 @@ import {
   type RequestPermissionResult,
   type SessionUpdateParams,
 } from '../acp/protocol';
+import { loadSessionPreview } from '../preview/store';
+import { readTranscriptModelCandidates } from '../state/session_metrics';
 
 export const OMA_VERSION: string = pkg.version;
 
@@ -50,6 +55,7 @@ export interface ResolvedResumeTarget {
   title?: string;
   model?: string;
   thoughtLevel?: string;
+  mode?: string;
   source: 'id' | 'anchor_file' | 'invalid_anchor';
   rawInput: string;
   anchorPath?: string;
@@ -277,6 +283,7 @@ export function resolveResumeTarget(raw: string): ResolvedResumeTarget {
         title: typeof obj['title'] === 'string' ? obj['title'] : undefined,
         model: typeof obj['model'] === 'string' ? obj['model'] : undefined,
         thoughtLevel: typeof obj['thoughtLevel'] === 'string' ? obj['thoughtLevel'] : undefined,
+        mode: typeof obj['mode'] === 'string' ? obj['mode'] : undefined,
         source: 'anchor_file',
         rawInput: raw,
         anchorPath: cleaned,
@@ -446,6 +453,13 @@ export async function runFallbackAgy(opts: RunFallbackOptions): Promise<number> 
   }
 }
 
+export interface PlainSessionControlState {
+  readonly modelId: string | null;
+  readonly supportsThoughtLevel: boolean;
+  readonly thoughtLevel: string | null;
+  readonly modeId: string | null;
+}
+
 export interface PlainAcpAdapter {
   start(): Promise<void>;
   initialize(): Promise<{ agentInfo?: { name?: string; version?: string } }>;
@@ -454,6 +468,10 @@ export interface PlainAcpAdapter {
   listSessions(): Promise<Array<{ sessionId: string; cwd?: string; title?: string; updatedAt?: string }>>;
   prompt(sessionId: string, text: string): Promise<{ stopReason?: string }>;
   cancel(sessionId: string): Promise<void>;
+  getControlState?(): PlainSessionControlState;
+  resolveSelectableModel?(
+    candidates: readonly string[]
+  ): { readonly modelId: string; readonly thoughtLevel?: string } | null;
   setConfigOption?(sessionId: string, configId: string, value: string): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
   shutdown(): Promise<void>;
@@ -484,6 +502,8 @@ export interface RunPlainReplOptions {
   stdout?: Pick<NodeJS.WriteStream, 'write'>;
   stderr?: Pick<NodeJS.WriteStream, 'write'>;
   sameDir?: (a: string, b: string) => boolean;
+  sessionsDir?: string;
+  baseBrainDir?: string;
 }
 
 export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
@@ -608,6 +628,9 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
       return { outcome: 'cancelled' };
     });
 
+    let resumedFromSession = false;
+    let resumeAnchorHint: { model?: string; thoughtLevel?: string; mode?: string } | undefined;
+
     if (opts.cli.resume) {
       const target = resolveResumeTarget(opts.cli.resume);
       if (opts.cli.resumeKind === 'fork') {
@@ -618,6 +641,12 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
         const loaded = await opts.adapter.loadSession(target.sessionId, target.cwd ?? opts.cwd);
         replayMuted = false;
         sessionId = loaded.sessionId;
+        resumedFromSession = true;
+        resumeAnchorHint = {
+          ...(target.model ? { model: target.model } : {}),
+          ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
+          ...(target.mode ? { mode: target.mode } : {}),
+        };
       } else {
         stderr.write(`[oma] warning: ${target.error ?? 'invalid anchor'}; creating new session.\n`);
         const created = await opts.adapter.newSession(opts.cwd);
@@ -634,6 +663,7 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
         const loaded = await opts.adapter.loadSession(latest.sessionId, opts.cwd);
         replayMuted = false;
         sessionId = loaded.sessionId;
+        resumedFromSession = true;
       } else {
         const created = await opts.adapter.newSession(opts.cwd);
         sessionId = created.sessionId;
@@ -643,15 +673,90 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
       sessionId = created.sessionId;
     }
 
+    let selectedModel: string | undefined;
+    let selectedThought: string | undefined;
+    let selectedMode: string | undefined;
+
     if (opts.adapter.setConfigOption) {
-      if (opts.cli.model) {
-        await opts.adapter.setConfigOption(sessionId, 'model', opts.cli.model).catch(() => {});
+      let initialModel = opts.cli.model?.trim() || undefined;
+      let initialThought = opts.cli.thought?.trim() || undefined;
+      let initialMode = opts.cli.mode?.trim() || undefined;
+
+      if (resumedFromSession) {
+        const stored = await loadSessionPreview(
+          sessionId,
+          opts.sessionsDir ? { sessionsDir: opts.sessionsDir } : {}
+        ).catch(() => null);
+        let savedModel = resumeAnchorHint?.model?.trim() || stored?.model?.trim() || undefined;
+        let savedThought = resumeAnchorHint?.model?.trim()
+          ? (resumeAnchorHint.thoughtLevel?.trim() || undefined)
+          : (resumeAnchorHint?.thoughtLevel?.trim() || stored?.thoughtLevel?.trim() || undefined);
+        const savedMode = resumeAnchorHint?.mode?.trim() || stored?.mode?.trim() || undefined;
+
+        if (!savedModel) {
+          const candidates = await readTranscriptModelCandidates(
+            sessionId,
+            opts.baseBrainDir ? { baseBrainDir: opts.baseBrainDir } : {}
+          );
+          if (opts.adapter.resolveSelectableModel) {
+            const resolved = opts.adapter.resolveSelectableModel(candidates);
+            if (resolved) {
+              savedModel = resolved.modelId;
+              if (!savedThought && resolved.thoughtLevel) {
+                savedThought = resolved.thoughtLevel;
+              }
+            }
+          } else if (candidates[0]) {
+            savedModel = candidates[0];
+          }
+        }
+
+        initialModel = initialModel || savedModel;
+        initialThought = initialThought || (opts.cli.model?.trim() ? undefined : savedThought);
+        initialMode = initialMode || savedMode;
       }
-      if (opts.cli.thought) {
-        await opts.adapter.setConfigOption(sessionId, 'thought_level', opts.cli.thought).catch(() => {});
+
+      let modelFailed = false;
+      if (initialModel) {
+        const curControls = opts.adapter.getControlState?.();
+        if (curControls && curControls.modelId === initialModel) {
+          selectedModel = initialModel;
+        } else {
+          await opts.adapter
+            .setConfigOption(sessionId, 'model', initialModel)
+            .then(() => {
+              selectedModel = initialModel;
+            })
+            .catch(() => {
+              modelFailed = true;
+            });
+        }
       }
-      if (opts.cli.mode) {
-        await opts.adapter.setConfigOption(sessionId, 'mode', opts.cli.mode).catch(() => {});
+      if (!modelFailed && initialThought) {
+        const afterModel = opts.adapter.getControlState?.();
+        if (afterModel && afterModel.supportsThoughtLevel && afterModel.thoughtLevel === initialThought) {
+          selectedThought = initialThought;
+        } else if (!afterModel || afterModel.supportsThoughtLevel) {
+          await opts.adapter
+            .setConfigOption(sessionId, 'thought_level', initialThought)
+            .then(() => {
+              selectedThought = initialThought;
+            })
+            .catch(() => {});
+        }
+      }
+      if (initialMode) {
+        const afterThought = opts.adapter.getControlState?.();
+        if (afterThought && afterThought.modeId === initialMode) {
+          selectedMode = initialMode;
+        } else {
+          await opts.adapter
+            .setConfigOption(sessionId, 'mode', initialMode)
+            .then(() => {
+              selectedMode = initialMode;
+            })
+            .catch(() => {});
+        }
       }
     }
 
@@ -688,25 +793,98 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
         continue;
       }
       if (trimmed === '/new' || trimmed === '/clear') {
+        const prevControls = opts.adapter.getControlState?.();
+        const carryModel = prevControls ? (prevControls.modelId ?? undefined) : selectedModel;
+        const carryThought = prevControls
+          ? prevControls.supportsThoughtLevel
+            ? (prevControls.thoughtLevel ?? undefined)
+            : undefined
+          : selectedThought;
+        const carryMode = prevControls ? (prevControls.modeId ?? undefined) : selectedMode;
+
         await opts.adapter.closeSession(sessionId).catch(() => {});
         const created = await opts.adapter.newSession(opts.cwd);
         sessionId = created.sessionId;
+
+        if (opts.adapter.setConfigOption) {
+          let modelFailed = false;
+          const afterNew = opts.adapter.getControlState?.();
+          if (carryModel && (!afterNew || afterNew.modelId !== carryModel)) {
+            try {
+              await opts.adapter.setConfigOption(sessionId, 'model', carryModel);
+            } catch (err) {
+              modelFailed = true;
+              stderr.write(
+                `[oma] warning: failed to carry over model "${carryModel}": ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`
+              );
+            }
+          }
+          if (!modelFailed && carryThought) {
+            const afterModel = opts.adapter.getControlState?.();
+            if (
+              !afterModel ||
+              (afterModel.supportsThoughtLevel && afterModel.thoughtLevel !== carryThought)
+            ) {
+              try {
+                await opts.adapter.setConfigOption(sessionId, 'thought_level', carryThought);
+              } catch (err) {
+                stderr.write(
+                  `[oma] warning: failed to carry over thought level "${carryThought}": ${
+                    err instanceof Error ? err.message : String(err)
+                  }\n`
+                );
+              }
+            }
+          }
+          if (carryMode) {
+            const afterThought = opts.adapter.getControlState?.();
+            if (!afterThought || afterThought.modeId !== carryMode) {
+              try {
+                await opts.adapter.setConfigOption(sessionId, 'mode', carryMode);
+              } catch (err) {
+                stderr.write(
+                  `[oma] warning: failed to carry over mode "${carryMode}": ${
+                    err instanceof Error ? err.message : String(err)
+                  }\n`
+                );
+              }
+            }
+          }
+        }
+
         stdout.write(`[new session ${sessionId}]\n`);
         continue;
       }
       if (trimmed.startsWith('/model ') && opts.adapter.setConfigOption) {
-        await opts.adapter.setConfigOption(sessionId, 'model', trimmed.slice(7).trim());
-        stdout.write('[model updated]\n');
+        const value = trimmed.slice(7).trim();
+        if (value) {
+          await opts.adapter.setConfigOption(sessionId, 'model', value);
+          selectedModel = value;
+          if (splitModelThoughtSuffix(value)) {
+            selectedThought = undefined;
+          }
+          stdout.write('[model updated]\n');
+        }
         continue;
       }
       if (trimmed.startsWith('/thought ') && opts.adapter.setConfigOption) {
-        await opts.adapter.setConfigOption(sessionId, 'thought_level', trimmed.slice(9).trim());
-        stdout.write('[thought_level updated]\n');
+        const value = trimmed.slice(9).trim();
+        if (value) {
+          await opts.adapter.setConfigOption(sessionId, 'thought_level', value);
+          selectedThought = value;
+          stdout.write('[thought_level updated]\n');
+        }
         continue;
       }
       if (trimmed.startsWith('/mode ') && opts.adapter.setConfigOption) {
-        await opts.adapter.setConfigOption(sessionId, 'mode', trimmed.slice(6).trim());
-        stdout.write('[mode updated]\n');
+        const value = trimmed.slice(6).trim();
+        if (value) {
+          await opts.adapter.setConfigOption(sessionId, 'mode', value);
+          selectedMode = value;
+          stdout.write('[mode updated]\n');
+        }
         continue;
       }
 
@@ -861,6 +1039,34 @@ export function createAcpPlainAdapter(options: {
     async cancel(sessionId) {
       await client.cancel(sessionId);
     },
+    getControlState() {
+      const controls = extractSessionControlState(controlContext);
+      return {
+        modelId: controls.currentModelId,
+        supportsThoughtLevel: controls.supportsThoughtLevel,
+        thoughtLevel: controls.currentThoughtLevel,
+        modeId: controls.currentModeId,
+      };
+    },
+    resolveSelectableModel(candidates) {
+      if (extractSessionControlState(controlContext).availableModels.length === 0) {
+        return null;
+      }
+      for (const candidate of candidates) {
+        const resolved = resolveModelSelection(candidate, controlContext);
+        if (
+          resolved &&
+          resolved.matchKind !== 'fuzzy_config_model' &&
+          resolved.matchKind !== 'legacy_fuzzy'
+        ) {
+          return {
+            modelId: resolved.modelId,
+            ...(resolved.thoughtLevel ? { thoughtLevel: resolved.thoughtLevel } : {}),
+          };
+        }
+      }
+      return null;
+    },
     async setConfigOption(sessionId, configId, value) {
       if (configId === 'model') {
         const resolved = resolveModelSelection(value, controlContext);
@@ -868,17 +1074,30 @@ export function createAcpPlainAdapter(options: {
           const applied = await applyModelSelection(client, sessionId, resolved);
           if (applied.configOptions) {
             controlContext = { ...controlContext, configOptions: applied.configOptions };
+          } else if (controlContext.models) {
+            controlContext = {
+              ...controlContext,
+              models: { ...controlContext.models, currentModelId: applied.appliedModelId },
+            };
           }
           return;
         }
       }
       if (configId === 'thought_level') {
         const resolved = resolveThoughtLevel(value, controlContext.configOptions);
-        if (resolved.ok) {
+        const targetValue = resolved.ok
+          ? resolved.value
+          : resolved.reason === 'invalid'
+            ? clampThoughtLevelForChoices(
+                value,
+                extractSessionControlState(controlContext).availableThoughtLevels
+              )
+            : undefined;
+        if (targetValue) {
           const res = await client.setConfigOption({
             sessionId,
             configId: 'thought_level',
-            value: resolved.value,
+            value: targetValue,
           });
           controlContext = { ...controlContext, configOptions: res.configOptions };
         }
@@ -896,6 +1115,12 @@ export function createAcpPlainAdapter(options: {
             controlContext = { ...controlContext, configOptions: res.configOptions };
           } else {
             await client.setMode({ sessionId, modeId: resolved.modeId });
+            if (controlContext.modes) {
+              controlContext = {
+                ...controlContext,
+                modes: { ...controlContext.modes, currentModeId: resolved.modeId },
+              };
+            }
           }
         }
         return;

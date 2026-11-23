@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   blobId,
   connect,
@@ -25,6 +25,7 @@ import { DEFAULT_CONFIG, parseConfigToml } from '../src/config/config';
 import type { ExecCommandFn } from '../src/ecosystem/cli';
 import { PreviewStore } from '../src/preview/store';
 import type { GitExecFn } from '../src/state/git_status';
+import { getTranscriptPath } from '../src/state/session_metrics';
 import { COMPLETION_LIST_PREFIX, EDITOR_NODE_ID } from '../src/state/store';
 import { HIDE_CURSOR, SHOW_CURSOR } from '../src/termio/osc';
 import { SafeTermOutput } from '../src/termio/output';
@@ -35,6 +36,7 @@ import {
   getSwarmBeeAssets,
   SWARM_BEE_EFFECT_CSS,
   WELCOME_LOGO_HEIGHT,
+  WELCOME_LOGO_STYLESHEET,
   WELCOME_LOGO_WIDTH,
 } from '../src/ui/assets';
 import { computePickerData } from '../src/ui/PickerView';
@@ -8651,6 +8653,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(neonData.items.filter(i => i.id.includes('orchestrator')).map(i => i.id)).toEqual([
       'orchestrator',
     ]);
+    expect(neonData.items.find(i => i.id === 'orchestrator')?.mark).toEqual({
+      text: 'GO',
+      seed: 'google',
+      icon: 'provider:google',
+    });
+    expect(neonData.scopes?.some(s => s.id === 'provider:antigravity')).toBe(false);
+    expect(neonData.scopes?.find(s => s.id === 'provider:google')?.count).toBe(6);
     expect(neonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
     expect(neonData.level?.value).toBe('xhigh');
 
@@ -8681,10 +8690,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     // Highlight merged `orchestrator` & `gpt-oss-120b-medium`: disabled (0 steps)
     controller.store.setPickerSelected('orchestrator');
-    expect(
-      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
-        .level?.disabled,
-    ).toBe('Configure effort in Plan / Exec pills');
+    const orchPickedData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(orchPickedData.level?.disabled).toBe('Configure effort in Plan / Exec pills');
+    expect(orchPickedData.level?.detail).toBe('Google');
     controller.store.setPickerSelected('gpt-oss-120b-medium');
     expect(
       computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
@@ -8703,15 +8715,30 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     const orchNodes = replayNodes();
     expect(orchNodes.get('dock.composer.bar.model')?.p['role']).toBe('oma.composer.model.orchestrator');
+    expect(orchNodes.get('dock.composer.bar.model')?.p['mark']).toBe('working');
     expect(orchNodes.has('dock.composer.bar.model.effort')).toBe(false);
     expect(orchNodes.get('dock.composer.bar.planner')?.p['role']).toBe('oma.composer.planner');
+    expect(orchNodes.get('dock.composer.bar.planner')?.p['mark']).toBe('working');
     expect(orchNodes.get('dock.composer.bar.planner.tag')?.p['text']).toBe('Plan');
     expect(orchNodes.get('dock.composer.bar.planner.name')?.p['text']).toBe('Carbon');
     expect(orchNodes.get('dock.composer.bar.planner.effort')?.p['level']).toBe('high');
     expect(orchNodes.get('dock.composer.bar.executor')?.p['role']).toBe('oma.composer.executor');
+    expect(orchNodes.get('dock.composer.bar.executor')?.p['mark']).toBe('working');
     expect(orchNodes.get('dock.composer.bar.executor.tag')?.p['text']).toBe('Exec');
     expect(orchNodes.get('dock.composer.bar.executor.name')?.p['text']).toBe('Hydrogen');
     expect(orchNodes.get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Verify enhanced multi-layer Orchestrator animations stay within Tern CSS allowlist
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-glow');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-sheen');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-text');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-planner-pulse');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-executor-pulse');
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-mark='working']");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('prefers-reduced-motion: reduce');
+    for (const disallowed of ['url(', 'position: fixed', '@font-face', '@import', 'text-shadow']) {
+      expect(WELCOME_LOGO_STYLESHEET).not.toContain(disallowed);
+    }
 
     // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
@@ -8834,6 +8861,3315 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     controller.scheduler.renderNow();
     await waitFor(() => !replayNodes().has('layer.swarm.body.overview'));
     expect(replayNodes().has('layer.swarm.body.roster')).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('/new and /clear carry over model, thought_level, Orchestrator variant, and mode (including diff skipping, rapid double /new, error fallback, and legacy track)', async () => {
+    // -----------------------------------------------------------------------
+    // Part A: configOptions track (full carry-over, diff skip, Orchestrator,
+    //         rapid double /new race, and graceful degradation on failure)
+    // -----------------------------------------------------------------------
+    const tmpA = makeTempDir();
+    const agySettingsPath = join(tmpA, 'agy-settings.json');
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify({
+        orchestrator: {
+          planner: 'Gemini 4 Neon (Extra)',
+          executor: 'Claude Sonnet 5.5 (High)',
+        },
+      }),
+      'utf8',
+    );
+    const hostA = new FakeTernHost();
+    const sessionA = await createConnectedSession(hostA);
+    const acpA = new MockAcpHarness();
+
+    let sessionSeq = 0;
+    const sessionState = new Map<string, { model: string; thought: string; mode: string }>();
+    const setConfigCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    let holdNextModelSet: PromiseWithResolvers<void> | null = null;
+    let failNextModelSet = false;
+
+    const buildConfigOptionsFor = (sid: string) => {
+      const cur = sessionState.get(sid) ?? {
+        model: 'gemini-4-neon',
+        thought: 'high',
+        mode: 'default',
+      };
+      const isOrch = cur.model.includes('orchestrator');
+      const opts: Array<Record<string, unknown>> = [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: cur.model,
+          options: [
+            { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+            { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator Neon' },
+          ],
+        },
+      ];
+      if (!isOrch) {
+        opts.push({
+          id: 'thought_level',
+          name: 'Thought Level',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: cur.thought,
+          options:
+            cur.model === 'gemini-4-carbon'
+              ? [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                ]
+              : [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                  { value: 'xhigh', name: 'Extra' },
+                ],
+        });
+      }
+      opts.push({
+        id: 'mode',
+        name: 'Mode',
+        category: 'mode',
+        type: 'select',
+        currentValue: cur.mode,
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'accept-edits', name: 'Accept Edits' },
+          { value: 'auto', name: 'Auto' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      });
+      return opts;
+    };
+
+    acpA.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        sessionSeq += 1;
+        const sid = `sess-co-${sessionSeq}`;
+        // Server always initializes new sessions with defaults
+        sessionState.set(sid, { model: 'gemini-4-neon', thought: 'high', mode: 'default' });
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: buildConfigOptionsFor(sid) },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { sessionId: string; configId: string; value: string };
+        setConfigCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+        const reply = () => {
+          if (p.configId === 'model' && failNextModelSet) {
+            failNextModelSet = false;
+            server.send({
+              jsonrpc: '2.0',
+              id: msg.id,
+              error: { code: -32602, message: 'Model unavailable' },
+            });
+            return;
+          }
+          const cur = sessionState.get(p.sessionId) ?? {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          };
+          if (p.configId === 'model') {
+            cur.model = p.value;
+            if (cur.model === 'gemini-4-carbon' && cur.thought === 'xhigh') {
+              cur.thought = 'high';
+            }
+          } else if (p.configId === 'thought_level') {
+            cur.thought = p.value;
+          } else if (p.configId === 'mode') {
+            cur.mode = p.value;
+          }
+          sessionState.set(p.sessionId, cur);
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        };
+        if (p.configId === 'model' && holdNextModelSet) {
+          const gate = holdNextModelSet;
+          holdNextModelSet = null;
+          void gate.promise.then(reply);
+          return;
+        }
+        reply();
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerA = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmpA,
+      session: sessionA,
+      output: hostA.safeOutput,
+      acpSpawn: acpA.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmpA, 'sessions') }),
+      configPath: join(tmpA, 'config.toml'),
+      agySettingsPath,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runA = controllerA.run();
+    await controllerA.readyPromise;
+    await waitFor(
+      () => controllerA.store.getState().orchestratorSettings.planner === 'Gemini 4 Neon (Extra)',
+    );
+
+    // 1. Switch model + thought + mode, then run `/new` -> carries all three over
+    await controllerA.submitInput('/model gemini-4-carbon');
+    await controllerA.submitInput('/thought low');
+    await controllerA.submitInput('/mode accept-edits');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('accept-edits');
+
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-2');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('accept-edits');
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-2')).toEqual([
+      { sessionId: 'sess-co-2', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-co-2', configId: 'thought_level', value: 'low' },
+      { sessionId: 'sess-co-2', configId: 'mode', value: 'accept-edits' },
+    ]);
+
+    // 2. Diff-skip check: switch back to server default model + mode while keeping `low` thought,
+    //    then run `/clear` -> only `thought_level` RPC is sent
+    await controllerA.submitInput('/model gemini-4-neon');
+    await controllerA.submitInput('/mode default');
+    await controllerA.submitInput('/clear');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-3');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('default');
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-3')).toEqual([
+      { sessionId: 'sess-co-3', configId: 'thought_level', value: 'low' },
+    ]);
+
+    // 3. Orchestrator variant + mode carry-over without `thought_level`, preserving orchestratorSettings
+    await controllerA.submitInput('/model gemini-pro-orchestrator-neon');
+    await controllerA.submitInput('/mode plan');
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-4');
+    expect(controllerA.store.getState().controls.currentModelId).toBe(
+      'gemini-pro-orchestrator-neon',
+    );
+    expect(controllerA.store.getState().controls.supportsThoughtLevel).toBe(false);
+    expect(controllerA.store.getState().controls.currentModeId).toBe('plan');
+    expect(controllerA.store.getState().orchestratorSettings).toEqual({
+      planner: 'Gemini 4 Neon (Extra)',
+      executor: 'Claude Sonnet 5.5 (High)',
+    });
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-4')).toEqual([
+      { sessionId: 'sess-co-4', configId: 'model', value: 'gemini-pro-orchestrator-neon' },
+      { sessionId: 'sess-co-4', configId: 'mode', value: 'plan' },
+    ]);
+
+    // Idle Orchestrator session: `mark` stays unset; active streaming activates `mark="working"`, then clears
+    const replayNodesA = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of hostA.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') deleteSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+    expect(controllerA.store.isBusy).toBe(false);
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['role'] === 'oma.composer.model.orchestrator' &&
+        n.has('dock.composer.bar.planner') &&
+        n.has('dock.composer.bar.executor') &&
+        n.get('dock.composer.bar.model')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === undefined
+      );
+    });
+    controllerA.store.setStreaming(true);
+    controllerA.scheduler.renderNow();
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['mark'] === 'working' &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === 'working' &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === 'working'
+      );
+    });
+    controllerA.store.setStreaming(false);
+    controllerA.scheduler.renderNow();
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === undefined
+      );
+    });
+
+    // 4. Rapid double `/new` while carry-over `set_config_option(model)` is still in flight
+    await controllerA.submitInput('/model gemini-4-carbon');
+    await controllerA.submitInput('/thought medium');
+    await controllerA.submitInput('/mode auto');
+    const heldCarryOver = Promise.withResolvers<void>();
+    holdNextModelSet = heldCarryOver;
+    const firstNew = controllerA.submitInput('/new');
+    await waitFor(() => setConfigCalls.some(c => c.sessionId === 'sess-co-5' && c.configId === 'model'));
+    const secondNew = controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-6');
+    heldCarryOver.resolve();
+    await Promise.all([firstNew, secondNew]);
+    expect(controllerA.store.getState().sessionId).toBe('sess-co-6');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('medium');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('auto');
+
+    // 5. Graceful degradation when carry-over `model` RPC fails: new session succeeds,
+    //    `thought_level` is skipped, warning toast is shown, and `mode` is still restored
+    failNextModelSet = true;
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-7');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('auto');
+    expect(
+      controllerA.store
+        .getState()
+        .toasts.some(t => t.tone === 'warning' && t.text.includes('Failed to carry over model')),
+    ).toBe(true);
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-7')).toEqual([
+      { sessionId: 'sess-co-7', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-co-7', configId: 'mode', value: 'auto' },
+    ]);
+
+    await controllerA.shutdown({ cleanExit: true });
+    await runA;
+
+    // -----------------------------------------------------------------------
+    // Part B: Legacy `models` / `modes` track (no `configOptions`)
+    // -----------------------------------------------------------------------
+    const tmpB = makeTempDir();
+    const hostB = new FakeTernHost();
+    const sessionB = await createConnectedSession(hostB);
+    const acpB = new MockAcpHarness();
+
+    let legacySeq = 0;
+    const legacySetModelCalls: Array<{ sessionId: string; modelId: string }> = [];
+    const legacySetModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+
+    acpB.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        legacySeq += 1;
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: `sess-legacy-${legacySeq}`,
+            models: {
+              currentModelId: 'gemini-4-neon',
+              availableModels: [
+                { modelId: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+                { modelId: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+              ],
+            },
+            modes: {
+              currentModeId: 'default',
+              availableModes: [
+                { id: 'default', name: 'Default' },
+                { id: 'plan', name: 'Plan' },
+              ],
+            },
+          },
+        });
+      } else if (msg.method === 'session/set_model') {
+        const p = msg.params as { sessionId: string; modelId: string };
+        legacySetModelCalls.push({ sessionId: p.sessionId, modelId: p.modelId });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/set_mode') {
+        const p = msg.params as { sessionId: string; modeId: string };
+        legacySetModeCalls.push({ sessionId: p.sessionId, modeId: p.modeId });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerB = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmpB,
+      session: sessionB,
+      output: hostB.safeOutput,
+      acpSpawn: acpB.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmpB, 'sessions') }),
+      configPath: join(tmpB, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runB = controllerB.run();
+    await controllerB.readyPromise;
+    expect(controllerB.store.getState().sessionId).toBe('sess-legacy-1');
+
+    await controllerB.submitInput('/model gemini-4-carbon');
+    await controllerB.submitInput('/mode plan');
+    expect(controllerB.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerB.store.getState().controls.currentModeId).toBe('plan');
+
+    await controllerB.submitInput('/new');
+    await waitFor(() => controllerB.store.getState().sessionId === 'sess-legacy-2');
+    expect(controllerB.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerB.store.getState().controls.currentModeId).toBe('plan');
+    expect(legacySetModelCalls).toEqual([
+      { sessionId: 'sess-legacy-1', modelId: 'gemini-4-carbon' },
+      { sessionId: 'sess-legacy-2', modelId: 'gemini-4-carbon' },
+    ]);
+    expect(legacySetModeCalls).toEqual([
+      { sessionId: 'sess-legacy-1', modeId: 'plan' },
+      { sessionId: 'sess-legacy-2', modeId: 'plan' },
+    ]);
+
+    await controllerB.shutdown({ cleanExit: true });
+    await runB;
+  });
+
+  test('oma -c (--continue) and /resume restore saved model, thoughtLevel, Orchestrator variant, and mode (with CLI overrides and transcript.jsonl fallback)', async () => {
+    const tmp = makeTempDir();
+    const sessionsDir = join(tmp, 'sessions');
+    const brainDir = join(tmp, 'brain');
+    const previewStore = new PreviewStore({ sessionsDir });
+
+    // Pre-populate saved oma anchors for `sess-resume-c1` and `sess-resume-orch`
+    await previewStore.save({
+      sessionId: 'sess-resume-c1',
+      cwd: tmp,
+      title: 'Saved Carbon Session',
+      model: 'gemini-4-carbon',
+      thoughtLevel: 'low',
+      mode: 'accept-edits',
+      turnCount: 1,
+      updatedAt: '2026-11-23T08:00:00.000Z',
+      preview: [{ role: 'user', text: 'Continue carbon work' }],
+    });
+    await previewStore.save({
+      sessionId: 'sess-resume-orch',
+      cwd: tmp,
+      title: 'Saved Orchestrator Session',
+      model: 'gemini-pro-orchestrator-neon',
+      mode: 'plan',
+      turnCount: 2,
+      updatedAt: '2026-11-23T07:00:00.000Z',
+      preview: [{ role: 'user', text: 'Resume orchestrator work' }],
+    });
+
+    // Pre-populate agy transcript.jsonl without oma anchor for `sess-no-anchor-1` and `sess-no-anchor-2`
+    const noAnchor1Logs = join(brainDir, 'sess-no-anchor-1', '.system_generated', 'logs');
+    mkdirSync(noAnchor1Logs, { recursive: true });
+    writeFileSync(
+      join(noAnchor1Logs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const noAnchor2Logs = join(brainDir, 'sess-no-anchor-2', '.system_generated', 'logs');
+    mkdirSync(noAnchor2Logs, { recursive: true });
+    writeFileSync(
+      join(noAnchor2Logs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const makeMockServer = (
+      sessionList: Array<{ sessionId: string; cwd: string; title: string; updatedAt: string }>,
+    ) => {
+      const harness = new MockAcpHarness();
+      const loadedState = new Map<string, { model: string; thought: string; mode: string }>();
+      const setCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+
+      const buildConfigOptionsFor = (sid: string) => {
+        const cur = loadedState.get(sid) ?? {
+          model: 'gemini-4-neon',
+          thought: 'high',
+          mode: 'default',
+        };
+        const isOrch = cur.model.includes('orchestrator');
+        const opts: Array<Record<string, unknown>> = [
+          {
+            id: 'model',
+            name: 'Model',
+            category: 'model',
+            type: 'select',
+            currentValue: cur.model,
+            options: [
+              { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+              { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+              { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator Neon' },
+            ],
+          },
+        ];
+        if (!isOrch) {
+          opts.push({
+            id: 'thought_level',
+            name: 'Thought Level',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: cur.thought,
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'medium', name: 'Medium' },
+              { value: 'high', name: 'High' },
+              { value: 'xhigh', name: 'Extra' },
+            ],
+          });
+        }
+        opts.push({
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue: cur.mode,
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'accept-edits', name: 'Accept Edits' },
+            { value: 'auto', name: 'Auto' },
+            { value: 'plan', name: 'Plan' },
+          ],
+        });
+        return opts;
+      };
+
+      harness.setHandler((msg, server) => {
+        if (msg.method === 'initialize') {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+        } else if (msg.method === 'session/list') {
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessions: sessionList },
+          });
+        } else if (msg.method === 'session/new') {
+          const sid = 'sess-fresh-init';
+          loadedState.set(sid, { model: 'gemini-4-neon', thought: 'high', mode: 'default' });
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: sid, configOptions: buildConfigOptionsFor(sid) },
+          });
+        } else if (msg.method === 'session/load') {
+          const p = msg.params as { sessionId: string };
+          // Server returns default config on session/load rather than previous selection
+          loadedState.set(p.sessionId, {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          });
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: p.sessionId, configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        } else if (msg.method === 'session/set_config_option') {
+          const p = msg.params as { sessionId: string; configId: string; value: string };
+          setCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+          const cur = loadedState.get(p.sessionId) ?? {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          };
+          if (p.configId === 'model') cur.model = p.value;
+          else if (p.configId === 'thought_level') cur.thought = p.value;
+          else if (p.configId === 'mode') cur.mode = p.value;
+          loadedState.set(p.sessionId, cur);
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        } else if (msg.id !== undefined) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      });
+
+      return { harness, setCalls };
+    };
+
+    const conflictingDefaults = {
+      ...DEFAULT_CONFIG,
+      default_model: 'gemini-4-neon',
+      default_thought: 'xhigh',
+      default_mode: 'default',
+    };
+
+    // 1) `oma -c` restores saved model + thoughtLevel + mode over conflicting config.toml defaults
+    const s1 = makeMockServer([
+      {
+        sessionId: 'sess-resume-c1',
+        cwd: tmp,
+        title: 'Saved Carbon Session',
+        updatedAt: '2026-11-23T08:00:00.000Z',
+      },
+    ]);
+    const host1 = new FakeTernHost();
+    const term1 = await createConnectedSession(host1);
+    const ctrl1 = new AppController({
+      cli: parseCliArgs(['-c']),
+      config: conflictingDefaults,
+      cwd: tmp,
+      session: term1,
+      output: host1.safeOutput,
+      acpSpawn: s1.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run1 = ctrl1.run();
+    await ctrl1.readyPromise;
+    expect(ctrl1.store.getState().sessionId).toBe('sess-resume-c1');
+    expect(ctrl1.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(ctrl1.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(ctrl1.store.getState().controls.currentModeId).toBe('accept-edits');
+    // Anchor file on disk retains restored controls rather than getting overwritten with defaults
+    const anchorAfterC1 = await previewStore.load('sess-resume-c1');
+    expect(anchorAfterC1?.model).toBe('gemini-4-carbon');
+    expect(anchorAfterC1?.thoughtLevel).toBe('low');
+    expect(anchorAfterC1?.mode).toBe('accept-edits');
+    await ctrl1.shutdown({ cleanExit: true });
+    await run1;
+
+    // 2) `oma -c --model gemini-4-neon` explicit CLI flag overrides saved model
+    const s2 = makeMockServer([
+      {
+        sessionId: 'sess-resume-c1',
+        cwd: tmp,
+        title: 'Saved Carbon Session',
+        updatedAt: '2026-11-23T08:00:00.000Z',
+      },
+    ]);
+    const host2 = new FakeTernHost();
+    const term2 = await createConnectedSession(host2);
+    const ctrl2 = new AppController({
+      cli: parseCliArgs(['-c', '--model', 'gemini-4-neon']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term2,
+      output: host2.safeOutput,
+      acpSpawn: s2.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = ctrl2.run();
+    await ctrl2.readyPromise;
+    expect(ctrl2.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    await ctrl2.shutdown({ cleanExit: true });
+    await run2;
+
+    // Restore saved anchor for `sess-resume-c1` before Part 3
+    await previewStore.save({
+      sessionId: 'sess-resume-c1',
+      cwd: tmp,
+      title: 'Saved Carbon Session',
+      model: 'gemini-4-carbon',
+      thoughtLevel: 'low',
+      mode: 'accept-edits',
+      turnCount: 1,
+      updatedAt: '2026-11-23T08:00:00.000Z',
+      preview: [{ role: 'user', text: 'Continue carbon work' }],
+    });
+
+    // 3) In-session `/resume` restores Orchestrator anchor, `/mode` persists mode, and missing anchor falls back to transcript.jsonl
+    const s3 = makeMockServer([
+      {
+        sessionId: 'sess-resume-orch',
+        cwd: tmp,
+        title: 'Saved Orchestrator Session',
+        updatedAt: '2026-11-23T07:00:00.000Z',
+      },
+      {
+        sessionId: 'sess-no-anchor-1',
+        cwd: tmp,
+        title: 'Transcript Only Session',
+        updatedAt: '2026-11-23T06:00:00.000Z',
+      },
+    ]);
+    const host3 = new FakeTernHost();
+    const term3 = await createConnectedSession(host3);
+    const ctrl3 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term3,
+      output: host3.safeOutput,
+      acpSpawn: s3.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run3 = ctrl3.run();
+    await ctrl3.readyPromise;
+
+    await ctrl3.submitInput('/resume sess-resume-orch');
+    await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-resume-orch');
+    host3.input.emit('\r');
+    await waitFor(
+      () => ctrl3.store.getState().sessionId === 'sess-resume-orch' && !ctrl3.store.getState().isReplaying,
+    );
+    expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
+    expect(ctrl3.store.getState().controls.supportsThoughtLevel).toBe(false);
+    expect(ctrl3.store.getState().controls.currentModeId).toBe('plan');
+
+    // Switching `/mode` updates anchor JSON on disk
+    await ctrl3.submitInput('/mode auto');
+    await waitFor(() => ctrl3.store.getState().controls.currentModeId === 'auto');
+    expect((await previewStore.load('sess-resume-orch'))?.mode).toBe('auto');
+
+    // Resuming a session with no oma anchor recovers model + thought from transcript.jsonl (skipping worker model)
+    await ctrl3.submitInput('/resume sess-no-anchor-1');
+    await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-no-anchor-1');
+    host3.input.emit('\r');
+    await waitFor(
+      () => ctrl3.store.getState().sessionId === 'sess-no-anchor-1' && !ctrl3.store.getState().isReplaying,
+    );
+    expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(ctrl3.store.getState().controls.currentThoughtLevel).toBe('low');
+    await ctrl3.shutdown({ cleanExit: true });
+    await run3;
+
+    // 4) `oma -c` on a transcript-only session recovers Orchestrator variant (skipping internal worker model)
+    const s4 = makeMockServer([
+      {
+        sessionId: 'sess-no-anchor-2',
+        cwd: tmp,
+        title: 'Transcript Only Orch',
+        updatedAt: '2026-11-23T09:00:00.000Z',
+      },
+    ]);
+    const host4 = new FakeTernHost();
+    const term4 = await createConnectedSession(host4);
+    const ctrl4 = new AppController({
+      cli: parseCliArgs(['-c']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term4,
+      output: host4.safeOutput,
+      acpSpawn: s4.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run4 = ctrl4.run();
+    await ctrl4.readyPromise;
+    expect(ctrl4.store.getState().sessionId).toBe('sess-no-anchor-2');
+    expect(ctrl4.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
+    expect(ctrl4.store.getState().controls.supportsThoughtLevel).toBe(false);
+    await ctrl4.shutdown({ cleanExit: true });
+    await run4;
+  });
+
+  test('post-compaction history hiding for live agy CHECKPOINT /compact, [Show earlier]/[Hide earlier], /settings toggle, explicit ACP compaction, auto-compaction, and /resume replay', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const configPath = join(tmp, 'config.toml');
+
+    const replayLiveNodes = (host: FakeTernHost): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // -----------------------------------------------------------------------
+    // Part 1: Live `/compact` (agy 1.5.14 transcript.jsonl CHECKPOINT flow),
+    //         [Show earlier]/[Hide earlier], /copy & /export, /settings toggle,
+    //         and mid-turn auto-compaction via usage_update drop
+    // -----------------------------------------------------------------------
+    const sidLive = 'sess-compact-live';
+    const transcriptFileLive = getTranscriptPath(sidLive, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptFileLive, '..'), { recursive: true });
+    let stepSeq = 0;
+
+    const copiedTexts: string[] = [];
+    const host1 = new FakeTernHost();
+    const session1 = await createConnectedSession(host1);
+    const acp1 = new MockAcpHarness();
+
+    acp1.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity', version: '1.5.14' },
+            agentCapabilities: { loadSession: true, promptCapabilities: { image: true } },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sidLive, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const blocks = (msg.params?.['prompt'] as Array<{ type: string; text?: string }> | undefined) ?? [];
+        const promptText = blocks.find(b => b.type === 'text')?.text ?? '';
+        appendFileSync(
+          transcriptFileLive,
+          JSON.stringify({
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            step_index: stepSeq++,
+            content: `<USER_REQUEST>\n${promptText}\n</USER_REQUEST>`,
+          }) + '\n',
+          'utf8',
+        );
+
+        if (promptText.trim() === '/compact') {
+          // Real agy 1.5.14 behavior: NO compaction_update / agent_message_chunk over ACP,
+          // only CHECKPOINT in transcript.jsonl + usage_update + end_turn
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({
+              type: 'CHECKPOINT',
+              source: 'SYSTEM',
+              status: 'DONE',
+              step_index: stepSeq++,
+              created_at: '2026-11-23T10:30:00Z',
+              input_tokens: 800,
+              cache_read_tokens: 180000,
+              output_tokens: 450,
+              content:
+                '# Resuming from a compaction\n\n<summary>\nKey context summarized cleanly.\n</summary>\n\n# Conversation Logs',
+            }) + '\n',
+            'utf8',
+          );
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 12000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn', usage: { outputTokens: 450 } },
+          });
+        } else if (promptText === 'Auto-compact mid turn') {
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({
+              type: 'CHECKPOINT',
+              source: 'SYSTEM',
+              status: 'DONE',
+              step_index: stepSeq++,
+              created_at: '2026-11-23T10:31:00Z',
+              input_tokens: 500,
+              cache_read_tokens: 90000,
+              output_tokens: 300,
+              content: '<summary>\nAuto-compacted summary mid-turn.\n</summary>',
+            }) + '\n',
+            'utf8',
+          );
+          // Drop usage from 180k -> 14k mid-turn while streaming
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 14000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sidLive,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Continuing after auto-compaction' } },
+            },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn' },
+          });
+        } else {
+          appendFileSync(
+            transcriptFileLive,
+            JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 200, cache_read_tokens: 1000, output_tokens: 50 }) + '\n',
+            'utf8',
+          );
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sidLive, update: { sessionUpdate: 'usage_update', used: 180000, size: 1000000 } },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sidLive,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Reply to: ${promptText}` },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl1 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session1,
+      output: host1.safeOutput,
+      acpSpawn: acp1.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath,
+      clipboard: {
+        readImage: async () => null,
+        readText: async () => null,
+        writeText: async text => {
+          copiedTexts.push(text);
+          return true;
+        },
+        isRemoteSshWithoutDisplay: () => false,
+      },
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run1 = ctrl1.run();
+    await ctrl1.readyPromise;
+
+    await ctrl1.submitInput('First question');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 1);
+    await ctrl1.submitInput('Second question');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 2);
+
+    // Before compaction, both Turn 0 and Turn 1 are mounted in main
+    expect(replayLiveNodes(host1).has('main.t0-user')).toBe(true);
+    expect(replayLiveNodes(host1).has('main.t1-user')).toBe(true);
+    expect(replayLiveNodes(host1).has('main.compacted-history')).toBe(false);
+
+    // Send `/compact`
+    await ctrl1.submitInput('/compact');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 3);
+    await waitFor(() => replayLiveNodes(host1).has('main.compacted-history'));
+
+    const liveAfterCompact = replayLiveNodes(host1);
+    expect(liveAfterCompact.has('main.t0-user')).toBe(false);
+    expect(liveAfterCompact.has('main.t1-user')).toBe(false);
+    expect(liveAfterCompact.has('main.t2-user')).toBe(true);
+    expect(
+      host1.allOps.some(op => op[0] === 'del' && (op[1] === 'main.t0-user' || op[1] === 'main.t1-user')),
+    ).toBe(true);
+
+    // Banner text & summary card present
+    expect(JSON.stringify(liveAfterCompact.get('main.compacted-history.label')?.p['spans'])).toContain(
+      '2 earlier turns hidden after compaction',
+    );
+    expect(liveAfterCompact.get('main.compacted-history.toggle')?.p['text']).toBe('Show earlier');
+    const compactSection = [...liveAfterCompact.entries()].find(
+      ([, v]) => v.k === 'section' && v.p['role'] === 'omp.compaction',
+    );
+    expect(compactSection).toBeDefined();
+    expect(JSON.stringify(liveAfterCompact.get(`${compactSection![0]}.summary`)?.p ?? {})).toContain(
+      'Key context summarized cleanly.',
+    );
+
+    // Toggle `[Show earlier]` mounts Turns 0 & 1 and switches button to `[Hide earlier]`
+    host1.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.compacted-history.toggle', act: 'click' });
+    await waitFor(() => replayLiveNodes(host1).has('main.t0-user'));
+    const liveExpanded = replayLiveNodes(host1);
+    expect(liveExpanded.has('main.t1-user')).toBe(true);
+    expect(liveExpanded.get('main.compacted-history.toggle')?.p['text']).toBe('Hide earlier');
+
+    // Toggle `[Hide earlier]` hides Turns 0 & 1 again
+    host1.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.compacted-history.toggle', act: 'click' });
+    await waitFor(() => !replayLiveNodes(host1).has('main.t0-user'));
+
+    // Underlying transcript remains intact for `/copy 2` (Turn 0, since Turn 2 `/compact` has empty assistant reply) & `/export`
+    await ctrl1.submitInput('/copy 2');
+    expect(copiedTexts).toEqual(['Reply to: First question']);
+    const exportPath = join(tmp, 'compacted-export.md');
+    await ctrl1.submitInput(`/export ${exportPath}`);
+    expect(readFileSync(exportPath, 'utf8')).toContain('First question');
+
+    // `/settings` `ui.collapse_compacted` false reveals hidden turns & persists to config.toml
+    await ctrl1.submitInput('/settings');
+    await waitFor(() => ctrl1.store.getState().settings !== null);
+    host1.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.collapse_compacted',
+      value: false,
+    });
+    await waitFor(() => replayLiveNodes(host1).has('main.t0-user'));
+    await waitFor(() => existsSync(configPath));
+    expect(parseConfigToml(readFileSync(configPath, 'utf8')).config.ui.collapse_compacted).toBe(false);
+
+    // Toggle `ui.collapse_compacted` back on and close settings
+    host1.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.collapse_compacted',
+      value: true,
+    });
+    await waitFor(() => !replayLiveNodes(host1).has('main.t0-user'));
+    expect(parseConfigToml(readFileSync(configPath, 'utf8')).config.ui.collapse_compacted).toBe(true);
+    host1.input.emit('\x1b');
+    await waitFor(() => ctrl1.store.getState().settings === null);
+
+    // Mid-turn automatic compaction (Turn 3) collapses Turn 2 while keeping Turn 3 visible
+    await ctrl1.submitInput('Auto-compact mid turn');
+    await waitFor(() => !ctrl1.store.getState().isStreaming && ctrl1.store.transcript.turns.length === 4);
+    await waitFor(() => !replayLiveNodes(host1).has('main.t2-user'));
+    const liveAfterAuto = replayLiveNodes(host1);
+    expect(liveAfterAuto.has('main.t3-user')).toBe(true);
+    expect(JSON.stringify(liveAfterAuto.get('main.compacted-history.label')?.p['spans'])).toContain(
+      '3 earlier turns hidden after compaction',
+    );
+
+    await ctrl1.shutdown({ cleanExit: true });
+    await run1;
+
+    // -----------------------------------------------------------------------
+    // Part 2: Explicit ACP `compaction_update` / `compaction_summary_chunk` on Turn 1
+    // -----------------------------------------------------------------------
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    let promptIdx2 = 0;
+
+    acp2.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: 'sess-explicit-compact', configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const idx = promptIdx2++;
+        if (idx === 1) {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-explicit-compact',
+              update: { sessionUpdate: 'compaction_update', status: 'done', text: 'Compacted via ACP' },
+            },
+          });
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-explicit-compact',
+              update: { sessionUpdate: 'compaction_summary_chunk', text: 'Explicit ACP summary' },
+            },
+          });
+        }
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-explicit-compact',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Resp ${idx}` } },
+          },
+        });
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-explicit.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = ctrl2.run();
+    await ctrl2.readyPromise;
+    await ctrl2.submitInput('Turn zero');
+    await waitFor(() => !ctrl2.store.getState().isStreaming && ctrl2.store.transcript.turns.length === 1);
+    await ctrl2.submitInput('Turn one');
+    await waitFor(() => !ctrl2.store.getState().isStreaming && ctrl2.store.transcript.turns.length === 2);
+    await waitFor(() => !replayLiveNodes(host2).has('main.t0-user'));
+    expect(replayLiveNodes(host2).has('main.compacted-history')).toBe(true);
+    expect(replayLiveNodes(host2).has('main.t1-user')).toBe(true);
+    await ctrl2.shutdown({ cleanExit: true });
+    await run2;
+
+    // -----------------------------------------------------------------------
+    // Part 3: `/resume` / `session/load` on compacted session hides pre-compaction turns
+    //         on the initial rendered Tern frame (and does not settle hidden turns)
+    // -----------------------------------------------------------------------
+    const sidResume = 'sess-resume-compacted';
+    const transcriptResume = getTranscriptPath(sidResume, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptResume, '..'), { recursive: true });
+    writeFileSync(
+      transcriptResume,
+      [
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 0, content: '<USER_REQUEST>\nOld 1\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 2, content: '<USER_REQUEST>\nOld 2\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 4, content: '<USER_REQUEST>\n/compact\n</USER_REQUEST>' }),
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 5,
+          content: '<summary>\nResumed compaction summary\n</summary>',
+        }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 6, content: '<USER_REQUEST>\nFollow up\n</USER_REQUEST>' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await previewStore.save({
+      sessionId: sidResume,
+      cwd: tmp,
+      title: 'Compacted Resume Session',
+      updatedAt: '2026-11-23T10:32:00.000Z',
+      preview: [{ role: 'user', text: 'Follow up' }],
+    });
+
+    const host3 = new FakeTernHost();
+    const session3 = await createConnectedSession(host3);
+    const acp3 = new MockAcpHarness();
+
+    acp3.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = msg.params?.['sessionId'] as string;
+        const sendReplay = (sessionUpdate: string, text: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sid, update: { sessionUpdate, content: { type: 'text', text } } },
+          });
+        };
+        sendReplay('user_message_chunk', 'Old 1');
+        sendReplay('agent_message_chunk', 'Old answer 1');
+        sendReplay('user_message_chunk', 'Old 2');
+        sendReplay('agent_message_chunk', 'Old answer 2');
+        sendReplay('user_message_chunk', '/compact');
+        sendReplay('user_message_chunk', 'Follow up');
+        sendReplay('agent_message_chunk', 'Follow up answer');
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const ctrl3 = new AppController({
+      cli: parseCliArgs(['--resume', sidResume]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session3,
+      output: host3.safeOutput,
+      acpSpawn: acp3.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-resume.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      replayDrainQuietMs: 15,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run3 = ctrl3.run();
+    await ctrl3.readyPromise;
+    await waitFor(() => ctrl3.store.transcript.turns.length === 4 && !ctrl3.store.getState().isReplaying);
+    expect(ctrl3.store.transcript.turns[2]?.user?.text).toBe('/compact');
+    expect(ctrl3.store.transcript.turns[3]?.user?.text).toBe('Follow up');
+
+    const resumedLive = replayLiveNodes(host3);
+    expect(resumedLive.has('main.compacted-history')).toBe(true);
+    expect(resumedLive.has('main.t0-user')).toBe(false);
+    expect(resumedLive.has('main.t1-user')).toBe(false);
+    expect(resumedLive.has('main.t2-user')).toBe(true);
+    expect(resumedLive.has('main.t3-user')).toBe(true);
+
+    // Pre-compaction turns were never even added or settled on the resumed Tern frame
+    expect(
+      host3.allOps.some(
+        op => (op[0] === 'add' && (op[4].id === 'main.t0-user' || op[4].id === 'main.t1-user')) ||
+              (op[0] === 'settle' && (String(op[1]).startsWith('main.t0-') || String(op[1]).startsWith('main.t1-') || op[1] === 'main.turn-0' || op[1] === 'main.turn-1')),
+      ),
+    ).toBe(false);
+    // Boundary turn t2 WAS settled
+    expect(host3.allOps.some(op => op[0] === 'settle' && String(op[1]).startsWith('main.t2-'))).toBe(true);
+
+    await ctrl3.shutdown({ cleanExit: true });
+    await run3;
+
+    // -----------------------------------------------------------------------
+    // Part 4: `/resume` / `oma -c` with mid-turn auto-compaction renders `omp.compaction`
+    //         at chronological position (before post-compaction tool & final reply)
+    //         and installs pre-compaction blur neutralization rules
+    // -----------------------------------------------------------------------
+    expect(WELCOME_LOGO_STYLESHEET).toContain('omp.compaction.hidden');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('filter: none;');
+
+    const sidMid = 'sess-resume-midturn-compacted';
+    const transcriptMid = getTranscriptPath(sidMid, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptMid, '..'), { recursive: true });
+    writeFileSync(
+      transcriptMid,
+      [
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 0, content: '<USER_REQUEST>\nFirst topic\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, content: 'First answer', input_tokens: 100, output_tokens: 10 }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 2, content: '<USER_REQUEST>\nSecond topic\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, content: 'Second answer', input_tokens: 100, output_tokens: 10 }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 4, content: '<USER_REQUEST>\nInvestigate bug\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 5, content: 'Initial plan before compaction', input_tokens: 150, output_tokens: 20 }),
+        JSON.stringify({ type: 'GENERIC', step_index: 6, status: 'DONE', content: 'Tool 1 out' }),
+        JSON.stringify({ type: 'GENERIC', step_index: 7, status: 'DONE', content: 'Tool 2 out' }),
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 8,
+          content: '<summary>\nMid-turn resumed compaction\n</summary>',
+        }),
+        JSON.stringify({ type: 'GENERIC', step_index: 9, status: 'DONE', content: 'Post-compaction tool out' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 10, content: 'Final answer after compaction', input_tokens: 220, output_tokens: 30 }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const host4 = new FakeTernHost();
+    const session4 = await createConnectedSession(host4);
+    const acp4 = new MockAcpHarness();
+
+    acp4.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = msg.params?.['sessionId'] as string;
+        const sendChunk = (sessionUpdate: string, text: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sid, update: { sessionUpdate, content: { type: 'text', text } } },
+          });
+        };
+        const sendTool = (toolCallId: string, title: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title,
+              },
+            },
+          });
+        };
+        sendChunk('user_message_chunk', 'First topic');
+        sendChunk('agent_message_chunk', 'First answer');
+        sendChunk('user_message_chunk', 'Second topic');
+        sendChunk('agent_message_chunk', 'Second answer');
+        sendChunk('user_message_chunk', 'Investigate bug');
+        sendChunk('agent_message_chunk', 'Initial plan before compaction');
+        sendTool('mid-resume-t1', 'cmd 1');
+        sendTool('mid-resume-t2', 'cmd 2');
+        sendTool('mid-resume-t3', 'post-compact cmd');
+        sendChunk('agent_message_chunk', 'Final answer after compaction');
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayMainChildOrder = (host: FakeTernHost): string[] => {
+      let order: string[] = [];
+      const insertBefore = (id: string, before: string | null): void => {
+        if (before === null) {
+          order.push(id);
+          return;
+        }
+        const idx = order.indexOf(before);
+        if (idx >= 0) order.splice(idx, 0, id);
+        else order.push(id);
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          const parent = op[2];
+          if (op[4].id === 'main') {
+            order = (op[4].c ?? []).map(c => c.id);
+          } else if (parent === 'main') {
+            insertBefore(op[4].id, op[3]);
+          }
+        } else if (op[0] === 'del') {
+          order = order.filter(id => id !== op[1]);
+        } else if (op[0] === 'move' && op[2] === 'main') {
+          order = order.filter(id => id !== op[1]);
+          insertBefore(op[1], op[3]);
+        }
+      }
+      return order;
+    };
+
+    const ctrl4 = new AppController({
+      cli: parseCliArgs(['--resume', sidMid]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session4,
+      output: host4.safeOutput,
+      acpSpawn: acp4.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-resume-mid.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      replayDrainQuietMs: 15,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run4 = ctrl4.run();
+    await ctrl4.readyPromise;
+    await waitFor(() => ctrl4.store.transcript.turns.length === 3 && !ctrl4.store.getState().isReplaying);
+
+    const midResumedLive = replayLiveNodes(host4);
+    expect(midResumedLive.has('main.compacted-history')).toBe(true);
+    expect(midResumedLive.has('main.t0-user')).toBe(false);
+    expect(midResumedLive.has('main.t1-user')).toBe(false);
+    expect(midResumedLive.has('main.t2-user')).toBe(true);
+
+    const compactNodeEntry = [...midResumedLive.entries()].find(
+      ([, v]) => v.k === 'section' && v.p['role'] === 'omp.compaction',
+    );
+    expect(compactNodeEntry).toBeDefined();
+    const compactNodeId = compactNodeEntry![0];
+    const mainOrder = replayMainChildOrder(host4);
+    const compactIdx = mainOrder.indexOf(compactNodeId);
+    const preToolIdx = mainOrder.indexOf('main.t2-mid-resume-t2');
+    const postToolIdx = mainOrder.indexOf('main.t2-mid-resume-t3');
+    const finalReplyId = mainOrder.find(id => id.startsWith('main.t2-assistant-') && mainOrder.indexOf(id) > postToolIdx);
+
+    expect(compactIdx).toBeGreaterThan(preToolIdx);
+    expect(postToolIdx).toBeGreaterThan(compactIdx);
+    expect(finalReplyId).toBeDefined();
+    expect(mainOrder[mainOrder.length - 1]).not.toBe(compactNodeId);
+
+    await ctrl4.shutdown({ cleanExit: true });
+    await run4;
+  });
+
+  test('detects real agy 1.5.14 silent >10s transcript RUNNING tasks, MCP commands, >=10s unclassified tool promotion, and hidden-mode background cards', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 2_000_000;
+    const sessionId = 'sess-bg-live-e2e';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+    writeFileSync(transcriptFile, '', 'utf8');
+
+    const promptResolvers: Array<(res: { stopReason: string }) => void> = [];
+    let promptNum = 0;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptNum += 1;
+        if (promptNum === 1) {
+          // Scenario 1: Real agy 1.5.14 acp pattern - starts `run_command` in_progress and waits silently
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-agy-bg',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'echo step completed && sleep 13',
+                args: {
+                  CommandLine: 'echo step completed && sleep 13',
+                  WaitMsBeforeAsync: 10000,
+                },
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 2) {
+          // Scenario 2: MCP command (`onessh:exec` with kind: 'other') -> immediate jobs HUD
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-mcp-exec',
+                name: 'onessh:exec',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'onessh:exec',
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 3) {
+          // Scenario 3: Unclassified slow tool (`search_web` with kind: 'search') -> promotes >= 10s
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-slow-web',
+                name: 'search_web',
+                kind: 'search',
+                status: 'in_progress',
+                title: 'Deep search',
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 4) {
+          // Scenario 4: Detached handoff in `hidden` toolDisplayMode must stay visible as background
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-handoff-hidden',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'bun run watch',
+                args: { CommandLine: 'bun run watch', WaitMsBeforeAsync: 500 },
+                rawOutput: {
+                  exit_code: 0,
+                  output: [
+                    'Created At: 2026-11-23T11:35:28+08:00',
+                    'Tool is running as a background task with task id: sess-bg-live-e2e/task-91',
+                    'Task Description: bun run watch',
+                    'Log output:',
+                    'step completed cleanly',
+                  ].join('\n'),
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 5) {
+          // Scenario 5: Completed run_command printing background text in stdout must NOT light jobs
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-stdout-fp-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'rg background task src/',
+                args: { CommandLine: 'rg background task src/' },
+                rawOutput: {
+                  exit_code: 0,
+                  output: [
+                    'Command exited with code 0.',
+                    '',
+                    'Command output:',
+                    'Tool is running as a background task with task id: fake/task-999',
+                  ].join('\n'),
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 6) {
+          // Scenario 6: Detached bash settles via `was canceled` transcript SYSTEM_MESSAGE
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-cancel-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'sleep 99',
+                args: { CommandLine: 'sleep 99', WaitMsBeforeAsync: 10000 },
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 7) {
+          // Scenario 7: Detached bash settles via server-restart SYSTEM_MESSAGE
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-restart-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'tail -f app.log',
+                args: { CommandLine: 'tail -f app.log', WaitMsBeforeAsync: 500 },
+                rawOutput: {
+                  output: 'Tool is running as a background task with task id: sess-bg-live-e2e/task-702',
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 8) {
+          // Scenario 8: Detached invoke_subagent lights up agents WITHOUT lighting up jobs
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-subagent-only-e2e',
+                name: 'invoke_subagent',
+                status: 'completed',
+                title: 'invoke_subagent',
+                args: { name: 'explorer', task: 'Scan repo' },
+                rawOutput: { conversationId: 'sub-conv-88', status: 'running' },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.method === 'session/cancel') {
+        const resolve = promptResolvers.shift();
+        resolve?.({ stopReason: 'cancelled' });
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 25,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // --- 1. Real agy 1.5.14 acp silent >10s transcript RUNNING task ---
+    const p1 = controller.submitInput('Run slow build');
+    await waitFor(() => controller.store.transcript.getToolById('call-agy-bg') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+
+    // agy writes RUNNING entry into transcript.jsonl after 10s without emitting ACP tool_call_update
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: '2026-11-23T11:35:28+08:00',
+        content: [
+          'Created At: 2026-11-23T11:35:28+08:00',
+          `Tool is running as a background task with task id: ${sessionId}/task-2`,
+          'Task Description: echo step completed && sleep 13',
+          'Task logs are available at: file:///tmp/task-2.log',
+          'Log output:',
+          'step completed',
+        ].join('\n'),
+      }) + '\n',
+      'utf8',
+    );
+
+    await waitFor(() => controller.store.transcript.getToolById('call-agy-bg')?.backgroundRunning === true);
+    expect(controller.store.transcript.getToolById('call-agy-bg')?.backgroundTaskId).toBe(
+      `${sessionId}/task-2`,
+    );
+    await waitFor(() => {
+      const m = replayNodes();
+      const toolNode = m.get('main.t0-call-agy-bg');
+      const stateNode = m.get('main.t0-call-agy-bg.run.foot.state');
+      return (
+        JSON.stringify(toolNode?.p['meta'] ?? []).includes('background · task-2') &&
+        JSON.stringify(stateNode?.p['spans'] ?? []).includes('background')
+      );
+    });
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    // Command completes via ACP tool_call_update + transcript SYSTEM_MESSAGE -> clears HUD & must not resurrect
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-23T11:35:43+08:00',
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-2" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>`,
+      }) + '\n',
+      'utf8',
+    );
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-agy-bg',
+          status: 'completed',
+          rawOutput: { output: 'Command exited with code 0.\n', exit_code: 0 },
+        },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p1;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    await new Promise(r => setTimeout(r, 45));
+    expect(controller.store.transcript.getToolById('call-agy-bg')?.backgroundRunning).toBe(false);
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    // --- 2. MCP command tool (`onessh:exec`) lights up HUD jobs immediately ---
+    const p2 = controller.submitInput('Run remote command');
+    await waitFor(() => controller.store.transcript.getToolById('call-mcp-exec') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-mcp-exec', status: 'completed' },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p2;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 3. Unclassified slow tool (`search_web`) promotes at >= 10s via watch timer ---
+    const p3 = controller.submitInput('Run deep search');
+    await waitFor(() => controller.store.transcript.getToolById('call-slow-web') !== undefined);
+    clock += 2000;
+    await new Promise(r => setTimeout(r, 40));
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    clock += 9000;
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-slow-web', status: 'completed' },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p3;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 4. Detached handoff stays visible as background in `hidden` mode with HUD jobs lit ---
+    controller.store.setToolDisplayMode('hidden');
+    await controller.submitInput('Start hidden watch');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    const hiddenNodes = replayNodes();
+    expect(hiddenNodes.has('main.t3-call-handoff-hidden')).toBe(true);
+    expect(hiddenNodes.get('main.t3-call-handoff-hidden')?.p['status']).toBe('running');
+    expect(JSON.stringify(hiddenNodes.get('main.t3-call-handoff-hidden')?.p['meta'] ?? [])).toContain(
+      'background · task-91',
+    );
+
+    await controller.cancelPendingAndTurn();
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 5. Completed `run_command` with stdout fake background text must NOT trigger HUD jobs ---
+    await controller.submitInput('Search background string');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await new Promise(r => setTimeout(r, 35));
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    // --- 6. `was canceled with result` transcript SYSTEM_MESSAGE clears HUD jobs & backgroundRunning ---
+    const p6 = controller.submitInput('Run cancellable command');
+    await waitFor(() => controller.store.transcript.getToolById('call-cancel-e2e') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 20,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: '2026-11-23T11:40:00+08:00',
+        content: [
+          'Created At: 2026-11-23T11:40:00+08:00',
+          `Tool is running as a background task with task id: ${sessionId}/task-601`,
+          'Task Description: sleep 99',
+        ].join('\n'),
+      }) + '\n',
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getToolById('call-cancel-e2e')?.backgroundRunning === true);
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 21,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-23T11:40:05+08:00',
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-601" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>`,
+      }) + '\n',
+      'utf8',
+    );
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-cancel-e2e',
+          status: 'failed',
+          rawOutput: { output: 'Tool execution was canceled' },
+        },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p6;
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-cancel-e2e')?.backgroundRunning).toBe(false);
+
+    // --- 7. Server-restart notice clears detached task from HUD jobs ---
+    await controller.submitInput('Start tail log');
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-restart-e2e')?.backgroundRunning).toBe(true);
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'notice',
+          level: 'warning',
+          message: '[Notice] All your subagents and background tasks have been stopped due to server restart.',
+        },
+      },
+    });
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-restart-e2e')?.backgroundRunning).toBe(false);
+
+    // --- 8. Detached `invoke_subagent` lights up `agents` WITHOUT lighting up `jobs` ---
+    await controller.submitInput('Launch background explorer');
+    await waitFor(() => replayNodes().has('dock.hud.running.agents'));
+    const subOnlyNodes = replayNodes();
+    expect(subOnlyNodes.get('dock.hud.running.agents.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+    expect(subOnlyNodes.has('dock.hud.running.jobs')).toBe(false);
+
+    await controller.cancelPendingAndTurn();
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('embedded HTTP MCP todo tool, live HUD checklist, 60s auto-clear & /todo expand, silent auto-allow, /todo slash suite + <system-reminder>, and /resume replay', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let capturedNewSessionParams: Record<string, unknown> | undefined;
+    let capturedLoadSessionParams: Record<string, unknown> | undefined;
+    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
+    const sentPermissions: unknown[] = [];
+
+    const replaySessionId = 'sess-todo-replay';
+    const liveSessionId = 'sess-todo-live';
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/new') {
+        capturedNewSessionParams = msg.params;
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: liveSessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/list') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: replaySessionId,
+                cwd: tmp,
+                title: 'Resumed Todo Session',
+                updatedAt: '2026-11-23T14:00:00.000Z',
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/load') {
+        capturedLoadSessionParams = msg.params;
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'Plan migration' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'replay-todo-1',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'in_progress',
+              rawInput: {
+                op: 'init',
+                list: [
+                  { phase: 'Prep', items: ['Audit API', 'Check schema'] },
+                  { phase: 'Ship', items: ['Deploy build'] },
+                ],
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'replay-todo-1',
+              status: 'completed',
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'replay-todo-2',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'completed',
+              rawInput: {
+                op: 'done',
+                task: ['Audit API', 'Check schema'],
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Prep finished.' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: replaySessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/prompt') {
+        const blocks = ((msg.params?.prompt as Array<{ type?: string; text?: string }>) ?? []).map(
+          b => ({ type: b.type, text: b.text }),
+        );
+        sentPrompts.push(blocks);
+        const promptText = blocks.map(b => b.text ?? '').join('\n');
+        const mcpServers = (capturedNewSessionParams?.mcpServers as Array<{ name?: string; url?: string }>) ?? [];
+        const todoUrl = mcpServers.find(s => s.name === 'oma_todo')?.url;
+
+        if (promptText.includes('Start multi-phase work')) {
+          void (async () => {
+            // Simulate permission prompt for todo -> must be auto-allowed silently
+            h.send({
+              jsonrpc: '2.0',
+              id: 701,
+              method: 'session/request_permission',
+              params: {
+                sessionId: liveSessionId,
+                toolCall: {
+                  toolCallId: 'todo-live-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                },
+                options: [{ optionId: 'allow-once-id', name: 'Allow once', kind: 'allow_once' }],
+              },
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'in_progress',
+                  rawInput: {
+                    op: 'init',
+                    list: [
+                      { phase: 'Phase 1', items: ['Step A'] },
+                      { phase: 'Phase 2', items: ['Step B'] },
+                    ],
+                  },
+                },
+              },
+            });
+
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 11,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: {
+                    op: 'init',
+                    list: [
+                      { phase: 'Phase 1', items: ['Step A'] },
+                      { phase: 'Phase 2', items: ['Step B'] },
+                    ],
+                  },
+                },
+              }),
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'todo-live-1',
+                  status: 'completed',
+                },
+              },
+            });
+
+            // Complete Step A so Phase 1 is collapsed in HUD and Step B becomes active
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 12,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: { op: 'done', task: 'Step A' },
+                },
+              }),
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-2',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'done', task: 'Step A' },
+                },
+              },
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Phase 1 complete.' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
+        }
+
+        if (promptText.includes('Finish remaining work')) {
+          void (async () => {
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 13,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: { op: 'done', task: 'Step B' },
+                },
+              }),
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-3',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'done', task: 'Step B' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
+        }
+
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+
+      if (msg.id === 701) {
+        sentPermissions.push(msg.result);
+        return;
+      }
+
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    type ReplayedWireNode = { id: string; k: string; p: Record<string, unknown> };
+    const replayNodes = () => {
+      const nodes = new Map<string, ReplayedWireNode>();
+      const addSubtree = (n: WireNode) => {
+        nodes.set(n.id, { id: n.id, k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const child of n.c) addSubtree(child);
+      };
+      const delSubtree = (prefix: string) => {
+        for (const k of [...nodes.keys()]) {
+          if (k === prefix || k.startsWith(`${prefix}.`)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const clipboardWritten: string[] = [];
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      clipboard: {
+        isRemoteSshWithoutDisplay: () => false,
+        readImage: async () => null,
+        readText: async () => '',
+        writeText: async text => {
+          clipboardWritten.push(text);
+          return true;
+        },
+      },
+      editTodoExternal: async () => '# Edited Phase\n- [x] Task X\n- [ ] Task Y\n',
+      todoAutoClearDelayMs: 50,
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Verify session/new injected oma_todo HTTP MCP + _meta.antigravity.systemPrompt.append
+    const newMcp = capturedNewSessionParams?.mcpServers as Array<{ type?: string; name?: string; url?: string }>;
+    expect(newMcp).toHaveLength(1);
+    expect(newMcp[0]?.type).toBe('http');
+    expect(newMcp[0]?.name).toBe('oma_todo');
+    expect(newMcp[0]?.url).toContain('http://127.0.0.1:');
+    const newMeta = capturedNewSessionParams?._meta as { antigravity?: { systemPrompt?: { append?: string } } };
+    expect(newMeta?.antigravity?.systemPrompt?.append).toContain('mcp_oma_todo_todo');
+
+    // 2. Run multi-phase live MCP tool calls -> in-place omp.tool.todo + live HUD + silent auto-allow
+    await controller.submitInput('Start multi-phase work');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => {
+      const m = replayNodes();
+      return m.has('dock.activity.todo') && m.has('main.t0-todo-live-2');
+    });
+
+    // Silent auto-allow responded without creating approval card
+    expect(sentPermissions).toEqual([{ outcome: { outcome: 'selected', optionId: 'allow-once-id' } }]);
+
+    const liveNodes = replayNodes();
+    const card2 = liveNodes.get('main.t0-todo-live-2');
+    expect(card2?.p['role']).toBe('omp.tool.todo');
+    expect(card2?.p['title']).toBe('Todo');
+    expect(card2?.p['target']).toBe('1/2');
+    expect(card2?.p['preview']).toBe('none');
+    expect(liveNodes.has('main.plan')).toBe(false);
+    expect(liveNodes.has('dock.hud.running.jobs')).toBe(false);
+
+    const hudTodo = liveNodes.get('dock.activity.todo');
+    expect(hudTodo?.p['role']).toBe('omp.hud.todo');
+    expect(hudTodo?.p['mode']).toBe('hud');
+    const hudPhases = hudTodo?.p['phases'] as Array<{ title: string; collapsed?: boolean; items: Array<{ status: string }> }>;
+    expect(hudPhases).toHaveLength(2);
+    expect(hudPhases[0]?.collapsed).toBe(true);
+    expect(hudPhases[0]?.items[0]?.status).toBe('done');
+    expect(hudPhases[1]?.collapsed).toBeUndefined();
+    expect(hudPhases[1]?.items[0]?.status).toBe('active');
+
+    // 3. Complete remaining work -> 50ms auto-dismiss hides HUD, `/todo expand` reveals uncollapsed
+    await controller.submitInput('Finish remaining work');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.activity.todo'));
+
+    await controller.submitInput('/todo expand');
+    await waitFor(() => replayNodes().has('dock.activity.todo'));
+    const revealedPhases = replayNodes().get('dock.activity.todo')?.p['phases'] as Array<{ collapsed?: boolean }>;
+    expect(revealedPhases.every(p => p.collapsed === undefined)).toBe(true);
+
+    // 4. Full `/todo` slash commands + next-turn <system-reminder> injection
+    await controller.submitInput('/todo copy');
+    expect(clipboardWritten[0]).toContain('# Phase 1');
+
+    const exportPath = join(tmp, 'custom-todo.md');
+    await controller.submitInput(`/todo export ${exportPath}`);
+    expect(existsSync(exportPath)).toBe(true);
+
+    await controller.submitInput('/todo edit');
+    await waitFor(() => {
+      const p = replayNodes().get('dock.activity.todo')?.p['phases'] as Array<{ title: string }> | undefined;
+      return Boolean(p && p[0]?.title === 'Edited Phase');
+    });
+
+    await controller.submitInput('/todo append "Verify" Run final smoke check');
+    await controller.submitInput('/todo start smoke');
+    await controller.submitInput('/todo drop smoke');
+    await controller.submitInput('/todo rm smoke');
+    expect(controller.store.transcript.todoPhases.some(p => p.name === 'Verify')).toBe(false);
+
+    await controller.submitInput('Continue after manual todo edit');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    const lastOutbound = sentPrompts[sentPrompts.length - 1] ?? [];
+    expect(lastOutbound.some(b => (b.text ?? '').includes('<system-reminder>'))).toBe(true);
+    expect(lastOutbound.some(b => b.text === 'Continue after manual todo edit')).toBe(true);
+
+    await controller.submitInput('/todo import custom-todo.md');
+    expect(controller.store.transcript.todoPhases[0]?.name).toBe('Phase 1');
+
+    await controller.submitInput('/todo rm');
+    await waitFor(() => !replayNodes().has('dock.activity.todo'));
+
+    // 5. Switch session -> `session/load` receives mcpServers & deterministically reconstructs todo HUD/cards
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        !controller.store.getState().picker?.loading
+    );
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().sessionId === replaySessionId);
+    await waitFor(() => replayNodes().has('dock.activity.todo'));
+
+    const loadMcp = capturedLoadSessionParams?.mcpServers as Array<{ name?: string; url?: string }>;
+    expect(loadMcp?.[0]?.name).toBe('oma_todo');
+    const replayedNodes = replayNodes();
+    expect(replayedNodes.get('main.t0-replay-todo-2')?.p['target']).toBe('2/3');
+    expect(replayedNodes.has('main.plan')).toBe(false);
+    const replayedHudPhases = replayedNodes.get('dock.activity.todo')?.p['phases'] as Array<{ title: string; collapsed?: boolean }>;
+    expect(replayedHudPhases.map(p => p.title)).toEqual(['1. Prep', '2. Ship']);
+    expect(replayedHudPhases[0]?.collapsed).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('todo edge guards: unquoted append, non-oma todo approval, reminder separation/retry/replay, anchor persistence across /resume, disabled MCP, collapse re-arm, and edit error handling', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const sessId = 'sess-todo-guards';
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
+    const permissionResponses: unknown[] = [];
+    let failNextPrompt = false;
+    let replayReminderText = '';
+    let loadCount = 0;
+    let pendingExternalPromptId: number | string | undefined;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/list') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [{ sessionId: sessId, cwd: tmp, title: 'Guard Session', updatedAt: '2026-11-23T14:20:00.000Z' }],
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/load') {
+        loadCount += 1;
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sessId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: {
+                type: 'text',
+                text: replayReminderText
+                  ? `${replayReminderText}Hello resumed`
+                  : 'Hello resumed',
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sessId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'old-todo-1',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'completed',
+              rawInput: { op: 'init', items: ['Old phantom task'] },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/prompt') {
+        const blocks = ((msg.params?.prompt as Array<{ type?: string; text?: string }>) ?? []).map(
+          b => ({ type: b.type, text: b.text }),
+        );
+        sentPrompts.push(blocks);
+
+        if (failNextPrompt) {
+          failNextPrompt = false;
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'transient prompt failure' },
+          });
+          return;
+        }
+
+        const joined = blocks.map(b => b.text ?? '').join('\n');
+        if (joined.includes('Retry succeeds')) {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sessId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'old-todo-1',
+                name: 'mcp_oma_todo_todo',
+                title: 'Run mcp_oma_todo_todo',
+                kind: 'other',
+                status: 'completed',
+                rawInput: { op: 'init', items: ['Old phantom task'] },
+              },
+            },
+          });
+        }
+        if (joined.includes('Ask external todo')) {
+          pendingExternalPromptId = msg.id;
+          h.send({
+            jsonrpc: '2.0',
+            id: 888,
+            method: 'session/request_permission',
+            params: {
+              sessionId: sessId,
+              toolCall: {
+                toolCallId: 'ext-todo-1',
+                name: 'todo',
+                title: 'Todo',
+              },
+              options: [{ optionId: 'allow-ext', name: 'Allow', kind: 'allow_once' }],
+            },
+          });
+          return;
+        }
+
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+
+      if (msg.id === 888) {
+        permissionResponses.push(msg.result);
+        if (pendingExternalPromptId !== undefined) {
+          const replyId = pendingExternalPromptId;
+          pendingExternalPromptId = undefined;
+          h.send({ jsonrpc: '2.0', id: replyId, result: { stopReason: 'end_turn' } });
+        }
+        return;
+      }
+
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      clipboard: {
+        isRemoteSshWithoutDisplay: () => false,
+        readImage: async () => null,
+        readText: async () => '',
+        writeText: async () => true,
+      },
+      editTodoExternal: async () => {
+        throw new Error('editor binary missing');
+      },
+      todoAutoClearDelayMs: 40,
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Unquoted multi-word `/todo append` must NOT create phase "Fix"
+    await controller.submitInput('/todo append Fix login bug');
+    expect(controller.store.transcript.todoPhases).toEqual([
+      { name: 'Todos', tasks: [{ content: 'Fix login bug', status: 'in_progress' }] },
+    ]);
+
+    // Existing phase fuzzy match still works without quotes
+    await controller.submitInput('/todo append todo Second check');
+    expect(controller.store.transcript.todoPhases[0]?.tasks).toHaveLength(2);
+
+    // `/todo edit` editor launch error is caught gracefully with toast
+    await controller.submitInput('/todo edit');
+    expect(controller.store.getState().toasts.some(t => t.text.includes('editor binary missing'))).toBe(true);
+
+    // `/todo expand` then `/todo collapse` after completing all tasks re-arms auto-clear
+    await controller.submitInput('/todo done');
+    await controller.submitInput('/todo expand');
+    expect(controller.store.transcript.plan?.phases?.[0]?.items.length).toBe(2);
+    const opsBeforeCollapse = host.allOps.length;
+    await controller.submitInput('/todo collapse');
+    await waitFor(() =>
+      host.allOps
+        .slice(opsBeforeCollapse)
+        .some(op => op[0] === 'del' && (op[1] === 'dock.activity.todo' || op[1] === 'dock.activity'))
+    );
+
+    // 2. Failed prompt preserves `<system-reminder>`, next prompt delivers it with `\n\n` separator
+    failNextPrompt = true;
+    await controller.submitInput('First attempt fails');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(sentPrompts).toHaveLength(1);
+    expect(sentPrompts[0]?.[0]?.text).toContain('<system-reminder>');
+    expect(sentPrompts[0]?.[0]?.text?.endsWith('\n\n')).toBe(true);
+
+    await controller.submitInput('Retry succeeds');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(sentPrompts).toHaveLength(2);
+    expect(sentPrompts[1]?.[0]?.text).toContain('<system-reminder>');
+    replayReminderText = sentPrompts[1]![0]!.text!;
+
+    // 3. Bare external `name: 'todo'` must NOT be silently auto-allowed
+    await controller.submitInput('Ask external todo');
+    await waitFor(() => controller.store.approvals.hasPending());
+    expect(permissionResponses).toEqual([]);
+    expect(controller.store.transcript.getToolById('ext-todo-1')?.isOmaTodo).toBeUndefined();
+    const decided = controller.store.approvals.decide('allow');
+    expect(decided?.optionId).toBe('allow-ext');
+    await waitFor(() => !controller.store.getState().isStreaming && permissionResponses.length === 1);
+
+    // 4. `/todo rm` without subsequent prompt persists cleared state across `/resume`,
+    //    and replayed `<system-reminder>` is stripped from user bubble
+    await controller.submitInput('/todo rm');
+    expect(controller.store.transcript.todoPhases).toEqual([]);
+    let persistedTodo: Awaited<ReturnType<PreviewStore['load']>> = null;
+    for (let i = 0; i < 50; i++) {
+      persistedTodo = await previewStore.load(sessId);
+      if (
+        persistedTodo?.todoState?.toolCallCount === 1 &&
+        persistedTodo.todoState.phases.length === 0
+      ) {
+        break;
+      }
+      await Bun.sleep(10);
+    }
+    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1 });
+
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        !controller.store.getState().picker?.loading
+    );
+    host.input.emit('\r');
+    await waitFor(
+      () =>
+        loadCount === 1 &&
+        !controller.store.getState().isReplaying &&
+        controller.store.transcript.turns.length === 1
+    );
+    expect(controller.store.transcript.todoPhases).toEqual([]);
+    const replayedUserText = controller.store.transcript.turns[0]?.user?.text ?? '';
+    expect(replayedUserText).toBe('Hello resumed');
+    expect(replayedUserText).not.toContain('<system-reminder>');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // 5. Disabled MCP does not inject todo prompt append into session/new
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    let disabledNewParams: Record<string, unknown> | undefined;
+    acp2.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: 'agy', version: '1.5.14' } },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        disabledNewParams = msg.params;
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's-disabled', configOptions: DEFAULT_CONFIG_OPTIONS } });
+        return;
+      }
+      if (msg.id !== undefined) h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+    });
+    const controller2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions2') }),
+      configPath: join(tmp, 'config2.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      enableTodoMcp: false,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = controller2.run();
+    await controller2.readyPromise;
+    expect(disabledNewParams?.mcpServers).toEqual([]);
+    expect(disabledNewParams?._meta).toBeUndefined();
+    await controller2.shutdown({ cleanExit: true });
+    await run2;
+  });
+
+  test('post-background wakeup holds OSC 7501 state=done across pre-tool progress text, planner tool calls, and error retries until authoritative planner_final in transcript.jsonl', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const sessionId = 'sess-bg-osc-authority';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+      if (msg.method === 'session/prompt') {
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'bg-osc-1',
+              name: 'run_command',
+              title: 'Run tests',
+              kind: 'execute',
+              status: 'in_progress',
+              rawInput: { CommandLine: 'bun test' },
+            },
+          },
+        });
+        // Scenario 1: agy already promoted task to RUNNING in transcript.jsonl before end_turn arrives
+        writeFileSync(
+          transcriptFile,
+          [
+            JSON.stringify({
+              type: 'USER_INPUT',
+              step_index: 1,
+              source: 'USER_EXPLICIT',
+              content: '<USER_REQUEST>Fix all</USER_REQUEST>',
+            }),
+            JSON.stringify({
+              type: 'GENERIC',
+              step_index: 2,
+              status: 'RUNNING',
+              created_at: '2026-11-23T14:40:00+08:00',
+              content: [
+                `Tool is running as a background task with task id: ${sessionId}/task-1`,
+                'Task Description: bun test',
+              ].join('\n'),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 40,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const countOscDone = () => host.osc7501.filter(s => s.includes('state=done')).length;
+
+    await controller.submitInput('Fix all');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // Must stay busy with 0 OSC done notifications right after end_turn
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    expect(countOscDone()).toBe(0);
+
+    // Scenario 2: background task finishes via SYSTEM_MESSAGE; model emits mid-turn progress text,
+    // enters silent pause longer than backgroundDoneGraceMs, invokes planner tool_call + hits empty retry
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'SYSTEM_MESSAGE',
+        source: 'SYSTEM',
+        status: 'DONE',
+        step_index: 3,
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-1" finished with result:\nok\n</SYSTEM_MESSAGE>`,
+      })}\n`,
+      'utf8',
+    );
+    await waitFor(() => !controller.store.hasActiveBackgroundTasks());
+    expect(countOscDone()).toBe(0);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Continuing edits now.' },
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 4,
+        status: 'DONE',
+        content: 'Continuing edits now.',
+        tool_calls: [{ name: 'edit_file' }],
+      }) + '\n',
+      'utf8',
+    );
+    await Bun.sleep(100);
+    expect(countOscDone()).toBe(0);
+
+    // Empty output error + retry step still holds OSC done
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({ type: 'GENERIC', status: 'DONE', step_index: 5, content: 'edited' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 6, status: 'DONE', thinking: 'thinking' }),
+        JSON.stringify({ type: 'ERROR_MESSAGE', step_index: 7, status: 'DONE', content: 'empty output' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await Bun.sleep(100);
+    expect(countOscDone()).toBe(0);
+
+    // Scenario 3: Authoritative final PLANNER_RESPONSE (no tool_calls + non-empty content) -> emits OSC done once
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'All done.' },
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 8,
+        status: 'DONE',
+        content: 'All done.',
+        input_tokens: 100,
+        output_tokens: 20,
+      })}\n`,
+      'utf8',
+    );
+
+    await waitFor(() => countOscDone() === 1);
+    await Bun.sleep(90);
+    expect(countOscDone()).toBe(1);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('background schedule timers, cron max-iterations, manage_task kill/list, and same-poll unlabeled task completion decrement HUD jobs count to 0 and settle /jobs overlay', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const sessionId = '6af6570b-schedule-e2e';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    let activePromptId: string | number | undefined;
+    let promptSeq = 0;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+      if (msg.method === 'session/prompt') {
+        activePromptId = msg.id;
+        promptSeq += 1;
+        return;
+      }
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const replayCurrentWireNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSubtree(child);
+        }
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          addSubtree(op[4]);
+        } else if (op[0] === 'del') {
+          deleteSubtree(op[1]);
+        } else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 40,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const emitScheduleTool = (
+      toolCallId: string,
+      rawInput: Record<string, unknown>,
+      outputText: string,
+    ) => {
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            name: 'schedule',
+            title: 'schedule',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput,
+          },
+        },
+      });
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: 'completed',
+            content: [{ type: 'content', content: { type: 'text', text: outputText } }],
+          },
+        },
+      });
+    };
+
+    // Turn 1: launch one labeled one-shot timer (task-1) + one recurring cron (task-3)
+    await controller.submitInput('Start monitors');
+    await waitFor(() => promptSeq === 1 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-1',
+      { DurationSeconds: 20, Prompt: 'Check server d73d9d79 status' },
+      `Tool is running as a background task with task id: ${sessionId}/task-1\nTask Description: Timer: 20s, Prompt: Check server d73d9d79 status`,
+    );
+    emitScheduleTool(
+      'tc-sched-3',
+      { CronExpression: '*/2 * * * *', MaxIterations: 2, Prompt: 'Poll panel HTTP 200 and cancel when ready' },
+      `Tool is running as a background task with task id: ${sessionId}/task-3\nTask Description: Cron: */2 * * * *, Prompt: Poll panel HTTP 200 and cancel when ready`,
+    );
+    writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'USER_INPUT',
+          step_index: 1,
+          source: 'USER_EXPLICIT',
+          content: '<USER_REQUEST>Start monitors</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 2,
+          status: 'RUNNING',
+          created_at: '2026-11-23T06:00:00Z',
+          content: `Tool is running as a background task with task id: ${sessionId}/task-1\nTask Description: Timer: 20s, Prompt: Check server d73d9d79 status`,
+        }),
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 3,
+          status: 'RUNNING',
+          created_at: '2026-11-23T06:00:01Z',
+          content: `Tool is running as a background task with task id: ${sessionId}/task-3\nTask Description: Cron: */2 * * * *, Prompt: Poll panel HTTP 200 and cancel when ready`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const p1 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p1, result: { stopReason: 'end_turn' } });
+
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+    await waitFor(() =>
+      replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans'] !== undefined,
+    );
+    expect(replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([
+      { t: '2', s: 'num' },
+    ]);
+
+    // Timer task-1 fires -> completes; Cron task-3 ticks -> stays running (runningJobCount === 1)
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 4,
+          created_at: '2026-11-23T06:00:20Z',
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:00:20Z sender=${sessionId}/task-1 priority=MESSAGE_PRIORITY_HIGH content=Check server d73d9d79 status\n</SYSTEM_MESSAGE>`,
+        }),
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 5,
+          created_at: '2026-11-23T06:02:00Z',
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:02:00Z sender=${sessionId}/task-3 priority=MESSAGE_PRIORITY_HIGH content=Poll panel HTTP 200 and cancel when ready\n</SYSTEM_MESSAGE>`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 1);
+    await waitFor(() => {
+      const spans = replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans'];
+      return Array.isArray(spans) && (spans[0] as { t?: string } | undefined)?.t === '1';
+    });
+
+    // Turn 2: unlabeled one-shot timer (no taskId in ACP tool output) starts & fires in the same transcript poll
+    await controller.submitInput('Unlabeled same-poll timer');
+    await waitFor(() => promptSeq === 2 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-unlabeled',
+      { DurationSeconds: 5, Prompt: 'Quick unlabeled check' },
+      'Timer scheduled in background.',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+
+    const p2 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p2, result: { stopReason: 'end_turn' } });
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 6,
+          status: 'RUNNING',
+          created_at: new Date().toISOString(),
+          content: `Tool is running as a background task with task id: ${sessionId}/task-2\nTask Description: Timer: 5s, Prompt: Quick unlabeled check`,
+        }),
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 7,
+          created_at: new Date().toISOString(),
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:02:10Z sender=${sessionId}/task-2 priority=MESSAGE_PRIORITY_HIGH content=Quick unlabeled check\n</SYSTEM_MESSAGE>`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await waitFor(() => {
+      const snap = controller.store.transcript.getBackgroundJobsSnapshot();
+      return snap.runningJobCount === 1 && snap.recent.some((j) => j.toolCallId === 'tc-sched-unlabeled' && j.status === 'completed');
+    });
+
+    // Turn 3: launch two more timers (task-4 & task-5), then kill task-5 via manage_task, complete cron task-3, and sweep via manage_task list
+    await controller.submitInput('Two more timers and cleanup');
+    await waitFor(() => promptSeq === 3 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-4',
+      { DurationSeconds: 45, Prompt: 'Wait 45s for server' },
+      `Tool is running as a background task with task id: ${sessionId}/task-4\nTask Description: Timer: 45s, Prompt: Wait 45s for server`,
+    );
+    emitScheduleTool(
+      'tc-sched-5',
+      { DurationSeconds: 45, Prompt: 'dummy timer' },
+      `Tool is running as a background task with task id: ${sessionId}/task-5\nTask Description: Timer: 45s, Prompt: dummy timer`,
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 3);
+
+    // Kill task-5 via manage_task(Action="kill") -> runningJobCount decrements to 2
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-kill-5',
+          name: 'manage_task',
+          title: 'manage_task',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { Action: 'kill', TaskId: `${sessionId}/task-5` },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-kill-5',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: `Task "${sessionId}/task-5" cancelled.` } }],
+        },
+      },
+    });
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+    expect(
+      controller.store.transcript.getBackgroundJobsSnapshot().recent.find((j) => j.toolCallId === 'tc-sched-5')?.status,
+    ).toBe('cancelled');
+
+    // Cron task-3 reaches max iterations -> runningJobCount decrements to 1
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'SYSTEM_MESSAGE',
+        source: 'SYSTEM',
+        status: 'DONE',
+        step_index: 8,
+        created_at: new Date().toISOString(),
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:04:00Z sender=${sessionId}/task-3 priority=MESSAGE_PRIORITY_HIGH content=Cron schedule completed after reaching its maximum of 2 iterations.\n</SYSTEM_MESSAGE>`,
+      })}\n`,
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 1);
+
+    // manage_task(Action="list") reports "No background tasks are currently running." -> remaining task-4 settles and count hits 0
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-list-empty',
+          name: 'manage_task',
+          title: 'manage_task',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { Action: 'list' },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-list-empty',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'No background tasks are currently running.' } }],
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 9,
+        status: 'DONE',
+        content: 'All scheduled monitors have finished.',
+      })}\n`,
+      'utf8',
+    );
+    const p3 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p3, result: { stopReason: 'end_turn' } });
+
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 0);
+    await waitFor(() => replayCurrentWireNodes().get('dock.hud.running.jobs') === undefined);
+
+    const finalSnap = controller.store.transcript.getBackgroundJobsSnapshot();
+    expect(finalSnap.running).toEqual([]);
+    expect(finalSnap.runningJobCount).toBe(0);
+    expect(finalSnap.recent.length).toBe(7);
+    const settledSchedules = finalSnap.recent.filter((j) => j.type === 'schedule');
+    expect(settledSchedules.length).toBe(5);
+    expect(finalSnap.recent.every((j) => j.status !== 'running')).toBe(true);
+
+    // Open `/jobs` overlay and verify settled counts and list
+    await controller.submitInput('/jobs');
+    await waitFor(() => controller.store.getState().infoOverlay?.kind === 'jobs');
+    const nodes = replayCurrentWireNodes();
+    expect(nodes.get('layer.info')?.p['role']).toBe('omp.overlay.jobs');
+    expect(nodes.get('layer.info.body.actions.summary')?.p['text']).toBe('7 recent');
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

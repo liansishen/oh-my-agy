@@ -3,10 +3,16 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import { join, posix, resolve, win32 } from 'node:path';
+import type { TodoPhase, TodoTask, TodoTaskStatus } from '../state/todo';
 
 export interface SessionPreviewTurn {
   readonly role: 'user' | 'assistant';
   readonly text: string;
+}
+
+export interface PersistedSessionTodoState {
+  readonly phases: readonly TodoPhase[];
+  readonly toolCallCount: number;
 }
 
 export interface SessionAnchorRecord {
@@ -20,6 +26,7 @@ export interface SessionAnchorRecord {
   readonly turnCount?: number;
   readonly updatedAt: string;
   readonly preview: readonly SessionPreviewTurn[];
+  readonly todoState?: PersistedSessionTodoState;
 }
 
 export type SaveSessionPreviewInput = Omit<SessionAnchorRecord, 'version' | 'updatedAt'> & {
@@ -152,6 +159,68 @@ function normalizePreviewTurns(
     : valid;
 }
 
+const VALID_TODO_TASK_STATUSES = new Set<TodoTaskStatus>([
+  'pending',
+  'in_progress',
+  'completed',
+  'abandoned',
+]);
+
+function normalizePersistedTodoState(raw: unknown): PersistedSessionTodoState | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return undefined;
+  }
+  const rec = raw as Record<string, unknown>;
+  if (!Array.isArray(rec['phases'])) {
+    return undefined;
+  }
+  const rawCount = rec['toolCallCount'];
+  if (typeof rawCount !== 'number' || !Number.isFinite(rawCount) || rawCount < 0) {
+    return undefined;
+  }
+
+  const phases: TodoPhase[] = [];
+  for (const phaseRaw of rec['phases']) {
+    if (typeof phaseRaw !== 'object' || phaseRaw === null || Array.isArray(phaseRaw)) {
+      return undefined;
+    }
+    const pObj = phaseRaw as Record<string, unknown>;
+    const name = typeof pObj['name'] === 'string' ? pObj['name'].trim() : '';
+    if (!name || !Array.isArray(pObj['tasks'])) {
+      return undefined;
+    }
+    const tasks: TodoTask[] = [];
+    for (const taskRaw of pObj['tasks']) {
+      if (typeof taskRaw !== 'object' || taskRaw === null || Array.isArray(taskRaw)) {
+        return undefined;
+      }
+      const tObj = taskRaw as Record<string, unknown>;
+      const content = typeof tObj['content'] === 'string' ? tObj['content'].trim() : '';
+      const status = tObj['status'] as TodoTaskStatus;
+      if (!content || !VALID_TODO_TASK_STATUSES.has(status)) {
+        return undefined;
+      }
+      const note =
+        typeof tObj['note'] === 'string' && tObj['note'].trim().length > 0
+          ? tObj['note'].trim()
+          : undefined;
+      tasks.push({
+        content,
+        status,
+        ...(note !== undefined ? { note } : {}),
+      });
+    }
+    if (tasks.length > 0) {
+      phases.push({ name, tasks });
+    }
+  }
+
+  return {
+    phases,
+    toolCallCount: Math.floor(rawCount),
+  };
+}
+
 /**
  * Validates and normalizes an unknown JSON object into a {@link SessionAnchorRecord}.
  * Returns `null` if required fields (`sessionId`) are missing or invalid.
@@ -185,6 +254,7 @@ export function parseSessionAnchorJson(raw: unknown): SessionAnchorRecord | null
       : undefined;
 
   const preview = normalizePreviewTurns(obj['preview'] as SessionPreviewTurn[] | undefined);
+  const todoState = normalizePersistedTodoState(obj['todoState']);
 
   return {
     version: 1,
@@ -197,6 +267,7 @@ export function parseSessionAnchorJson(raw: unknown): SessionAnchorRecord | null
     ...(turnCount !== undefined ? { turnCount } : {}),
     updatedAt,
     preview,
+    ...(todoState !== undefined ? { todoState } : {}),
   };
 }
 
@@ -357,6 +428,7 @@ export async function saveSessionPreview(
   await mkdir(dir, { recursive: true });
 
   const filePath = getSessionFilePath(input.sessionId, options);
+  const todoState = normalizePersistedTodoState(input.todoState);
   const record: SessionAnchorRecord = {
     version: 1,
     sessionId: input.sessionId.trim(),
@@ -368,6 +440,7 @@ export async function saveSessionPreview(
     ...(input.turnCount !== undefined ? { turnCount: Math.max(0, Math.floor(input.turnCount)) } : {}),
     updatedAt: input.updatedAt ?? new Date().toISOString(),
     preview: normalizePreviewTurns(input.preview),
+    ...(todoState !== undefined ? { todoState } : {}),
   };
 
   const payload = `${JSON.stringify(record, null, 2)}\n`;

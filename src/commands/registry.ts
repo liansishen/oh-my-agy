@@ -32,7 +32,8 @@ export type BuiltinCommandId =
   | 'logout'
   | 'export'
   | 'jobs'
-  | 'git';
+  | 'git'
+  | 'todo';
 
 export interface AcpAvailableCommandLike {
   readonly name: string;
@@ -385,6 +386,18 @@ export const EXTRA_BUILTIN_COMMANDS: readonly SlashCommandDef[] = [
     takesArgs: false,
     autoExecuteOnEnter: true,
     builtinId: 'jobs',
+  },
+  {
+    name: 'todo',
+    aliases: [],
+    description:
+      'Manage session todo list (expand, collapse, append, start, done, drop, rm, copy, export, import, edit)',
+    source: 'oma',
+    icon: 'check',
+    argHint: '[subcommand]',
+    takesArgs: true,
+    autoExecuteOnEnter: true,
+    builtinId: 'todo',
   },
 ];
 

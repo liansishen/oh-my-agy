@@ -1,4 +1,5 @@
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   connect,
@@ -38,12 +39,14 @@ import {
 import { normalizeDisplayPath, sameDir, toFileUri } from '../acp/path';
 import {
   AcpRpcError,
+  extractNoticeText,
   extractSessionTier,
   isElicitationCreateRequest,
   isRequestPermissionRequest,
   type AcpIncomingRequest,
   type AuthMethod,
   type ContentBlock,
+  type McpServerConfig,
   type SessionUpdateParams,
 } from '../acp/protocol';
 import {
@@ -84,6 +87,7 @@ import {
 import { nextCodePointOffset, prevCodePointOffset } from '../editor/draft';
 import { extractFileMentions } from '../editor/trigger';
 import { WorkspaceFileIndexer } from '../filesearch/indexer';
+import { EmbeddedTodoMcpServer, type TodoServerUpdateEvent } from '../mcp/todo_server';
 import {
   getDataDir,
   PreviewStore,
@@ -109,6 +113,7 @@ import {
 } from '../state/git_tui';
 import {
   areSessionMetricsEqual,
+  readTranscriptModelCandidates,
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
 } from '../state/session_metrics';
@@ -123,6 +128,23 @@ import {
   type ResumeSessionEntry,
   type SkillItem,
 } from '../state/store';
+import {
+  applyTodoOperation,
+  areAllTodosFinished,
+  cloneTodoPhases,
+  findTodoPhaseFuzzy,
+  findTodoTaskFuzzy,
+  formatPhaseDisplayTitle,
+  formatTodoMarkdown,
+  formatUserTodoSyncReminder,
+  isOmaTodoToolName,
+  normalizeSingleInProgress,
+  OMA_TODO_SYSTEM_PROMPT_APPEND,
+  parseTodoMarkdown,
+  TODO_AUTO_CLEAR_DELAY_MS,
+  TODO_HELP_TEXT,
+  type TodoPhase,
+} from '../state/todo';
 import {
   buildElicitationContent,
   type AttachmentItem,
@@ -165,6 +187,7 @@ const MAX_EMBEDDED_FILE_BYTES = 256 * 1024;
 const DONE_TO_IDLE_DELAY_MS = 1500;
 const DEFAULT_BACKGROUND_DONE_GRACE_MS = 2000;
 const DEFAULT_BACKGROUND_WAKEUP_GRACE_MS = 10_000;
+const DEFAULT_BACKGROUND_TRANSCRIPT_STALL_MS = 180_000;
 const DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS = 120;
 const DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS = 250;
 const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
@@ -234,6 +257,8 @@ export interface AppControllerOptions {
   readonly baseBrainDir?: string;
   /** Optional polling interval override (ms) for `watchSwarmBoard`. */
   readonly swarmPollIntervalMs?: number;
+  /** Optional polling interval override (ms) for in-flight tool background promotion & transcript sync. Default: 1000. */
+  readonly toolWatchIntervalMs?: number;
   /** Optional subprocess runner injected into `src/ecosystem/cli.ts` for offline deterministic tests. */
   readonly ecosystemRunner?: ExecCommandFn;
   /** Optional override path to `oma` `config.toml` (for offline deterministic tests). */
@@ -256,6 +281,12 @@ export interface AppControllerOptions {
   readonly replayDrainQuietMs?: number;
   /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
   readonly terminalRows?: number;
+  /** Optional delay override (ms) before auto-hiding completed HUD todos (< 0 disables auto-hide). Default: 60000. */
+  readonly todoAutoClearDelayMs?: number;
+  /** Enable embedded HTTP MCP `todo` tool server injection (default: true). */
+  readonly enableTodoMcp?: boolean;
+  /** Optional external editor hook override for `/todo edit` in offline tests. */
+  readonly editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
 }
 
 function cloneConfig(config: OmaConfig): OmaConfig {
@@ -267,6 +298,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
     recent_models: [...(config.recent_models ?? [])],
     ui: {
       auto_collapse_thought: config.ui.auto_collapse_thought,
+      collapse_compacted: config.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
       osc_7501: config.ui.osc_7501,
@@ -333,6 +365,75 @@ function guessMimeType(filePath: string): string {
   }
 }
 
+interface TodoShellToken {
+  readonly value: string;
+  readonly quoted: boolean;
+}
+
+function tokenizeTodoShellArgs(raw: string): TodoShellToken[] {
+  const tokens: TodoShellToken[] = [];
+  let cur = '';
+  let quote: '"' | "'" | null = null;
+  let hadQuotes = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '\\' && i + 1 < raw.length) {
+        const next = raw[i + 1]!;
+        if (next === '"' || next === '\\') {
+          cur += next;
+          i++;
+          continue;
+        }
+      }
+      if (ch === '"') {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+
+    if (ch === '\\' && i + 1 < raw.length) {
+      cur += raw[++i]!;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hadQuotes = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur.length > 0 || hadQuotes) {
+        if (cur.length > 0) {
+          tokens.push({ value: cur, quoted: hadQuotes });
+        }
+        cur = '';
+        hadQuotes = false;
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.length > 0) {
+    tokens.push({ value: cur, quoted: hadQuotes });
+  }
+  return tokens;
+}
+
+function splitTodoShellArgs(raw: string): string[] {
+  return tokenizeTodoShellArgs(raw).map(t => t.value);
+}
+
 function looksBinary(bytes: Uint8Array): boolean {
   const checkLen = Math.min(bytes.byteLength, 8192);
   for (let i = 0; i < checkLen; i++) {
@@ -351,6 +452,24 @@ function extractMentionedPaths(text: string): string[] {
     }
   }
   return found;
+}
+
+interface SessionControlCarryOver {
+  readonly modelId: string | null;
+  readonly thoughtLevel: string | null;
+  readonly modeId: string | null;
+}
+
+interface ResumeAnchorHint {
+  readonly model?: string;
+  readonly thoughtLevel?: string;
+  readonly mode?: string;
+}
+
+interface InitialSessionOutcome {
+  readonly kind: 'new' | 'resumed';
+  readonly epoch: number;
+  readonly anchorHint?: ResumeAnchorHint;
 }
 
 export class AppController {
@@ -374,6 +493,7 @@ export class AppController {
   readonly #swarmDir?: string;
   readonly #baseBrainDir?: string;
   readonly #swarmPollIntervalMs?: number;
+  readonly #toolWatchIntervalMs: number;
   readonly #ecosystemRunner?: ExecCommandFn;
   readonly #configPath: string;
   readonly #agySettingsPath: string;
@@ -385,9 +505,17 @@ export class AppController {
   readonly #backgroundWakeupGraceMs: number;
   readonly #replayDrainInitialQuietMs: number;
   readonly #replayDrainActiveQuietMs: number;
+  readonly #todoAutoClearDelayMs: number;
+  readonly #enableTodoMcp: boolean;
+  readonly #editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
   readonly #metricsTracker: SessionMetricsTracker;
 
   #acpClient: AcpClient | null = null;
+  #todoServer: EmbeddedTodoMcpServer | null = null;
+  #todoExpanded = false;
+  #todoHudDismissed = false;
+  #todoAutoClearTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #pendingTodoSyncReminder: string | null = null;
   #swarmWatcher: SwarmBoardWatcher | null = null;
   #swarmWatcherSessionId: string | null = null;
   #lastTpsStoreFlushAt = 0;
@@ -402,6 +530,8 @@ export class AppController {
   #workingStartedAt: number | undefined = undefined;
   #pendingBackgroundDone = false;
   #awaitingPostToolWakeup = false;
+  #backgroundResumeAnchorStepSeq = 0;
+  #backgroundWaitLastProgressAt = 0;
   #awaitingSwarmCoordinatorReply = false;
   #swarmCoordinatorReplied = false;
   #deferredSettleTurnIndex: number | null = null;
@@ -415,6 +545,7 @@ export class AppController {
   #replayingSessionEpoch: number | null = null;
   #creatingSessionEpoch: number | null = null;
   #pendingNewSessionUpdates: SessionUpdateParams[] = [];
+  #pendingCarryOverControls: SessionControlCarryOver | null = null;
   #suppressedMentionPaths = new Set<string>();
   #configWriteBlockedReason: string | null = null;
   #configVerifiedWritable = false;
@@ -431,6 +562,8 @@ export class AppController {
   #memberBeeBlobCache: Record<string, BeeMemberBlobPair> = {};
   #doneIdleTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #backgroundDoneTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #toolWatchTimer: ReturnType<typeof setInterval> | undefined = undefined;
+  #lastWatchedRunningJobs = -1;
   #replayDrainActive = false;
   #replayDrainResolve: (() => void) | null = null;
   #replayDrainReject: ((err: Error) => void) | null = null;
@@ -456,6 +589,7 @@ export class AppController {
     this.#swarmDir = options.swarmDir;
     this.#baseBrainDir = options.baseBrainDir;
     this.#swarmPollIntervalMs = options.swarmPollIntervalMs;
+    this.#toolWatchIntervalMs = Math.max(10, options.toolWatchIntervalMs ?? 1000);
     this.#ecosystemRunner = options.ecosystemRunner;
     this.#configPath = options.configPath ?? getConfigPath();
     this.#configWriteBlockedReason = options.configParseError ?? null;
@@ -480,6 +614,12 @@ export class AppController {
       options.replayDrainQuietMs !== undefined
         ? Math.max(0, options.replayDrainQuietMs)
         : DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS;
+    this.#todoAutoClearDelayMs =
+      options.todoAutoClearDelayMs !== undefined
+        ? options.todoAutoClearDelayMs
+        : TODO_AUTO_CLEAR_DELAY_MS;
+    this.#enableTodoMcp = options.enableTodoMcp ?? true;
+    this.#editTodoExternal = options.editTodoExternal;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
       now: this.#now,
@@ -504,6 +644,7 @@ export class AppController {
       cwd: initialCwd,
       autoAllowTools: this.#config.approval.auto_allow_tools,
       autoCollapseThought: this.#config.ui.auto_collapse_thought,
+      collapseCompacted: this.#config.ui.collapse_compacted,
       toolDisplayMode: normalizeToolDisplayMode(this.#config.ui.tool_display),
       recentModels: this.#config.recent_models,
       hour12: this.session.caps.hour12,
@@ -757,6 +898,10 @@ export class AppController {
     }
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
+    this.#clearToolWatchTimer();
+    this.#clearTodoAutoClearTimer();
+    this.#todoServer?.dispose();
+    this.#todoServer = null;
     this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
@@ -906,17 +1051,26 @@ export class AppController {
     this.#cancelReplayDrain(new Error('Superseded by session switch'));
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
+    this.#clearToolWatchTimer();
     this.#clearDoneIdleTimer();
+    this.#clearTodoAutoClearTimer();
+    this.#todoExpanded = false;
+    this.#todoHudDismissed = false;
+    this.#pendingTodoSyncReminder = null;
+    this.#todoServer?.setActiveSessionId(null);
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
     this.#awaitingPostToolWakeup = false;
+    this.#backgroundResumeAnchorStepSeq = 0;
+    this.#backgroundWaitLastProgressAt = 0;
     this.#awaitingSwarmCoordinatorReply = false;
     this.#swarmCoordinatorReplied = false;
     this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.#activePromptTask = null;
     this.#pendingNewSessionUpdates = [];
+    this.#pendingCarryOverControls = null;
 
     if (mode === 'replaying') {
       this.#creatingSessionEpoch = null;
@@ -996,10 +1150,10 @@ export class AppController {
         { supportsLogout: client.supportsLogout }
       );
 
-      await this.#openInitialSession(client, retrySessionId);
+      const initialOutcome = await this.#openInitialSession(client, retrySessionId);
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
-      await this.#applyInitialPreferences(client);
+      await this.#applyInitialPreferences(client, initialOutcome, Boolean(retrySessionId));
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
       this.store.setConnectionStatus('ready');
@@ -1044,13 +1198,18 @@ export class AppController {
     }
   }
 
-  async #openInitialSession(client: AcpClient, retrySessionId?: string): Promise<void> {
+  async #openInitialSession(
+    client: AcpClient,
+    retrySessionId?: string
+  ): Promise<InitialSessionOutcome> {
     const cwd = this.store.getState().cwd;
 
     if (retrySessionId) {
       try {
-        await this.#loadSessionWithReplay(client, retrySessionId, cwd);
-        return;
+        const loaded = await this.#loadSessionWithReplay(client, retrySessionId, cwd);
+        if (loaded) {
+          return { kind: 'resumed', epoch: this.#sessionEpoch };
+        }
       } catch (err) {
         if (!this.#isAcpClientLive(client)) throw err;
         // Fallback to new session if previous session cannot be reloaded
@@ -1069,8 +1228,24 @@ export class AppController {
       if (target.sessionId) {
         const targetCwd = target.cwd || cwd;
         try {
-          await this.#loadSessionWithReplay(client, target.sessionId, targetCwd, target.title);
-          return;
+          const loaded = await this.#loadSessionWithReplay(
+            client,
+            target.sessionId,
+            targetCwd,
+            target.title
+          );
+          if (loaded) {
+            const anchorHint: ResumeAnchorHint = {
+              ...(target.model ? { model: target.model } : {}),
+              ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
+              ...(target.mode ? { mode: target.mode } : {}),
+            };
+            return {
+              kind: 'resumed',
+              epoch: this.#sessionEpoch,
+              ...(Object.keys(anchorHint).length > 0 ? { anchorHint } : {}),
+            };
+          }
         } catch (err) {
           if (!this.#isAcpClientLive(client)) throw err;
           if (err instanceof AcpRpcError && err.isAuthRequired()) {
@@ -1093,13 +1268,15 @@ export class AppController {
         sessions.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
         const latest = sessions[0];
         if (latest) {
-          await this.#loadSessionWithReplay(
+          const loaded = await this.#loadSessionWithReplay(
             client,
             latest.sessionId,
             cwd,
             latest.title ?? undefined
           );
-          return;
+          if (loaded) {
+            return { kind: 'resumed', epoch: this.#sessionEpoch };
+          }
         }
       } catch (err) {
         if (!this.#isAcpClientLive(client)) throw err;
@@ -1112,7 +1289,10 @@ export class AppController {
 
     const createEpoch = this.#beginSessionTransition('creating');
     try {
-      const created = await client.newSession({ cwd, mcpServers: [] });
+      const created = await client.newSession({
+        cwd,
+        ...this.#buildSessionBootstrapOptions(),
+      });
       if (this.#shuttingDown || !this.#isAcpClientLive(client) || createEpoch !== this.#sessionEpoch) {
         throw new Error('ACP connection closed while creating session');
       }
@@ -1125,6 +1305,7 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#todoServer?.setActiveSessionId(created.sessionId);
       this.#lastCommittedSessionId = created.sessionId;
       this.#lastCommittedCwd = cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
@@ -1134,6 +1315,7 @@ export class AppController {
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
+      return { kind: 'new', epoch: createEpoch };
     } finally {
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
@@ -1205,7 +1387,11 @@ export class AppController {
     sessionId: string,
     cwd: string,
     knownTitle?: string,
-    existingEpoch?: number
+    existingEpoch?: number,
+    options?: {
+      readonly restoreSavedControls?: boolean;
+      readonly anchorHint?: ResumeAnchorHint;
+    }
   ): Promise<boolean> {
     const loadEpoch =
       existingEpoch !== undefined
@@ -1216,7 +1402,7 @@ export class AppController {
       const loaded = await client.loadSession({
         sessionId,
         cwd,
-        mcpServers: [],
+        ...this.#buildSessionBootstrapOptions(),
       });
 
       if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
@@ -1235,7 +1421,28 @@ export class AppController {
       }
 
       this.store.transcript.finalizeReplayedTurns();
-      this.store.setReplaying(false);
+      const storedTodoAnchor = await this.#previewStore.load(loaded.sessionId).catch(() => null);
+      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
+        return false;
+      }
+      if (
+        storedTodoAnchor?.todoState &&
+        storedTodoAnchor.todoState.toolCallCount >= this.store.transcript.todoToolCallCount &&
+        JSON.stringify(storedTodoAnchor.todoState.phases) !==
+          JSON.stringify(this.store.transcript.todoPhases)
+      ) {
+        this.store.transcript.setTodoPhases(storedTodoAnchor.todoState.phases, {
+          source: 'user',
+        });
+        this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
+          'resumed session todo state',
+          storedTodoAnchor.todoState.phases,
+          storedTodoAnchor.todoState.phases.length === 0
+        );
+      }
+      this.#todoServer?.setActiveSessionId(loaded.sessionId);
+      this.#todoServer?.seedSession(loaded.sessionId, this.store.transcript.todoPhases);
+      this.#scheduleTodoAutoClearIfDone();
       const loadedTier = client.currentTier ?? extractSessionTier(loaded._meta);
       this.store.applySessionSnapshot({
         sessionId: loaded.sessionId,
@@ -1251,16 +1458,43 @@ export class AppController {
 
       this.#bindSessionMetrics(loaded.sessionId, false);
       await this.#syncSessionMetricsFromTranscript();
+      this.#metricsTracker.markTranscriptBackgroundBaseline();
+      const terminalBgRecords = this.#metricsTracker
+        .getTranscriptBackgroundTasks()
+        .filter(rec => rec.status !== 'running');
+      if (terminalBgRecords.length > 0) {
+        this.store.transcript.syncTranscriptBackgroundTasks(terminalBgRecords);
+      }
       if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
       if (!this.#isAcpClientLive(client)) {
         throw new Error('ACP connection closed during session restore');
       }
+      if (options?.restoreSavedControls) {
+        const savedControls = await this.#resolveResumedSessionControls(
+          loaded.sessionId,
+          options.anchorHint
+        );
+        if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
+        if (!this.#isAcpClientLive(client)) {
+          throw new Error('ACP connection closed during session restore');
+        }
+        if (savedControls) {
+          await this.#applyCarryOverControls(client, loaded.sessionId, savedControls, loadEpoch);
+          if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
+          if (!this.#isAcpClientLive(client)) {
+            throw new Error('ACP connection closed during session restore');
+          }
+        }
+      }
       void this.#refreshGitStatus({ force: true });
 
+      this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(true);
 
       // Settle historical completed turns (keep the last turn unsettled so reveal/copy stays crisp)
-      const turns = this.store.transcript.getVisibleTurns();
+      const turns = this.store.transcript.getVisibleTranscriptSlice(
+        this.store.collapseCompacted
+      ).turns;
       let settledAny = false;
       for (let i = 0; i < turns.length - 1; i++) {
         const turn = turns[i];
@@ -1291,45 +1525,119 @@ export class AppController {
     }
   }
 
-  async #applyInitialPreferences(client: AcpClient): Promise<void> {
+  async #applyInitialPreferences(
+    client: AcpClient,
+    outcome: InitialSessionOutcome,
+    preferSavedOverCli = false
+  ): Promise<void> {
     const state = this.store.getState();
     const sessionId = state.sessionId;
     if (!sessionId) return;
 
-    const desiredModel = this.#cli.model?.trim() || this.#config.default_model?.trim();
-    const desiredThought = this.#cli.thought?.trim() || this.#config.default_thought?.trim();
-    const desiredMode = this.#cli.mode?.trim() || this.#config.default_mode?.trim();
-
-    if (desiredModel) {
-      const resolved = resolveModelSelection(desiredModel, {
-        configOptions: [...state.configOptions],
-        models: state.models,
-        modes: state.modes,
-      });
-      if (resolved) {
-        try {
-          const applied = await applyModelSelection(
-            client,
-            sessionId,
-            resolved,
-            desiredThought || undefined
-          );
-          if (applied.configOptions) {
-            this.store.updateConfigOptions(applied.configOptions);
+    const applyModelAndThoughtPreference = async (
+      desiredModel: string,
+      desiredThought: string
+    ): Promise<void> => {
+      if (desiredModel) {
+        const curState = this.store.getState();
+        const resolved = resolveModelSelection(desiredModel, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (resolved) {
+          try {
+            const applied = await applyModelSelection(
+              client,
+              sessionId,
+              resolved,
+              desiredThought || undefined
+            );
+            if (applied.configOptions) {
+              this.store.updateConfigOptions(applied.configOptions);
+            } else {
+              this.store.updateCurrentModelId(applied.appliedModelId);
+            }
+          } catch (err) {
+            this.store.pushToast(
+              `Failed to apply initial model "${desiredModel}": ${err instanceof Error ? err.message : String(err)}`,
+              'warning'
+            );
           }
-        } catch (err) {
-          this.store.pushToast(
-            `Failed to apply initial model "${desiredModel}": ${err instanceof Error ? err.message : String(err)}`,
-            'warning'
-          );
         }
+      } else if (desiredThought) {
+        await this.#applyThoughtLevel(desiredThought, true);
       }
-    } else if (desiredThought) {
-      await this.#applyThoughtLevel(desiredThought, true);
+    };
+
+    if (outcome.kind === 'new') {
+      const desiredModel = this.#cli.model?.trim() || this.#config.default_model?.trim() || '';
+      const desiredThought =
+        this.#cli.thought?.trim() || this.#config.default_thought?.trim() || '';
+      const desiredMode = this.#cli.mode?.trim() || this.#config.default_mode?.trim() || '';
+
+      await applyModelAndThoughtPreference(desiredModel, desiredThought);
+      if (desiredMode) {
+        await this.#applyMode(desiredMode, true);
+      }
+      return;
     }
 
-    if (desiredMode) {
-      await this.#applyMode(desiredMode, true);
+    const saved = await this.#resolveResumedSessionControls(sessionId, outcome.anchorHint);
+    if (
+      this.#shuttingDown ||
+      !this.#isAcpClientLive(client) ||
+      outcome.epoch !== this.#sessionEpoch
+    ) {
+      return;
+    }
+
+    const cliModel = preferSavedOverCli ? '' : (this.#cli.model?.trim() || '');
+    const cliThought = preferSavedOverCli ? '' : (this.#cli.thought?.trim() || '');
+    const cliMode = preferSavedOverCli ? '' : (this.#cli.mode?.trim() || '');
+
+    if (cliModel) {
+      await applyModelAndThoughtPreference(
+        cliModel,
+        cliThought || this.#config.default_thought?.trim() || ''
+      );
+    } else if (saved?.modelId || saved?.thoughtLevel) {
+      await this.#applyCarryOverControls(
+        client,
+        sessionId,
+        {
+          modelId: saved.modelId,
+          thoughtLevel: cliThought || saved.thoughtLevel,
+          modeId: null,
+        },
+        outcome.epoch
+      );
+    } else {
+      await applyModelAndThoughtPreference(
+        this.#config.default_model?.trim() || '',
+        cliThought || this.#config.default_thought?.trim() || ''
+      );
+    }
+
+    if (
+      this.#shuttingDown ||
+      !this.#isAcpClientLive(client) ||
+      outcome.epoch !== this.#sessionEpoch
+    ) {
+      return;
+    }
+
+    if (cliMode) {
+      await this.#applyMode(cliMode, true);
+    } else if (saved?.modeId) {
+      await this.#applyCarryOverControls(
+        client,
+        sessionId,
+        { modelId: null, thoughtLevel: null, modeId: saved.modeId },
+        outcome.epoch
+      );
+    } else if (this.#config.default_mode?.trim()) {
+      await this.#applyMode(this.#config.default_mode.trim(), true);
     }
   }
 
@@ -1387,6 +1695,11 @@ export class AppController {
       this.#noteReplayDrainActivity();
     }
     const prevBusy = this.store.isBusy;
+    const isReplayingBefore = this.store.getState().isReplaying;
+    const prevUsageUsed =
+      !isReplayingBefore && params.update.sessionUpdate === 'usage_update'
+        ? (this.store.getState().usage?.used ?? 0)
+        : 0;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
       this.store.traffic.recordSystem(
@@ -1400,6 +1713,12 @@ export class AppController {
     const update = params.update;
 
     if (!isReplaying) {
+      if (update.sessionUpdate === 'usage_update') {
+        const nextUsageUsed = this.store.getState().usage?.used ?? 0;
+        if (prevUsageUsed >= 1_000 && nextUsageUsed > 0 && nextUsageUsed <= prevUsageUsed * 0.7) {
+          void this.#syncSessionMetricsFromTranscript();
+        }
+      }
       // Live streaming TPS tracking from assistant text & thought deltas
       if (
         update.sessionUpdate === 'agent_message_chunk' ||
@@ -1456,6 +1775,29 @@ export class AppController {
         } else {
           this.#metricsTracker.resumeAfterTools();
         }
+        this.#syncToolWatchTimer();
+      } else if (update.sessionUpdate === 'notice') {
+        const noticeText = extractNoticeText(update);
+        if (
+          /\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i.test(
+            noticeText
+          ) &&
+          !this.store.getState().isStreaming &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply
+        ) {
+          this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
+          this.#clearBackgroundDoneTimer();
+          if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+            this.osc.setStatusIdle();
+          }
+        }
+        this.#syncToolWatchTimer();
       }
 
       const isThoughtChunk = update.sessionUpdate === 'agent_thought_chunk';
@@ -1504,6 +1846,11 @@ export class AppController {
         // The last background tool just finished; give the model a generous wakeup
         // window (TTFT) before emitting OSC 7501 `state=done`.
         this.#awaitingPostToolWakeup = true;
+        this.#backgroundResumeAnchorStepSeq = Math.max(
+          this.#backgroundResumeAnchorStepSeq,
+          this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0
+        );
+        this.#backgroundWaitLastProgressAt = this.#now();
       }
 
       this.#reconcileBackgroundActivity(prevBusy);
@@ -1517,10 +1864,14 @@ export class AppController {
         isThoughtChunk || isMessageChunk || isToolRunningUpdate || isUsageAfterReply;
 
       if (this.#pendingBackgroundDone && isLiveActivityUpdate) {
-        if (isMessageChunk) {
+        this.#backgroundWaitLastProgressAt = this.#now();
+        if (isMessageChunk && !this.#metricsTracker.hasTranscriptData) {
           this.#awaitingPostToolWakeup = false;
         } else if (isThoughtChunk) {
           this.#awaitingPostToolWakeup = true;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          this.#syncToolWatchTimer();
         }
         const stateAfter = this.store.getState();
         this.#clearDoneIdleTimer();
@@ -1579,6 +1930,21 @@ export class AppController {
           .respondToServerRequest(req.id, { outcome: { outcome: 'cancelled' } })
           .catch(() => {});
         return;
+      }
+      if (isOmaTodoToolName(req.params.toolCall.name, req.params.toolCall.title)) {
+        const options = req.params.options ?? [];
+        const allowOpt =
+          options.find(o => o.kind === 'allow_once') ??
+          options.find(o => o.kind === 'allow_always') ??
+          options[0];
+        if (allowOpt) {
+          void client
+            .respondToServerRequest(req.id, {
+              outcome: { outcome: 'selected', optionId: allowOpt.optionId },
+            })
+            .catch(() => {});
+          return;
+        }
       }
       const thoughtOpts = {
         autoCollapseThought: this.store.autoCollapseThought,
@@ -1666,6 +2032,8 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
     this.#awaitingPostToolWakeup = false;
+    this.#backgroundResumeAnchorStepSeq = 0;
+    this.#backgroundWaitLastProgressAt = 0;
     this.#awaitingSwarmCoordinatorReply = false;
     this.#swarmCoordinatorReplied = false;
     this.#deferredSettleTurnIndex = null;
@@ -3177,6 +3545,9 @@ export class AppController {
       setMode: async (mode: string) => {
         await this.#applyMode(mode, false);
       },
+      handleTodo: async (argsText: string) => {
+        await this.#handleTodoCommand(argsText);
+      },
       openHelp: () => {
         this.#pickerLoadToken += 1;
         this.store.openHelp();
@@ -3229,6 +3600,7 @@ export class AppController {
     this.#promptSubmitting = true;
     const sessionId = state.sessionId;
     const promptEpoch = this.#sessionEpoch;
+    const isCompactPrompt = /^\/compact(?:\s|$)/i.test(text.trim());
     const suppressedMentions = preserveDraft
       ? new Set<string>()
       : new Set(this.#suppressedMentionPaths);
@@ -3296,10 +3668,19 @@ export class AppController {
             return;
           }
 
+          const reminderToSend = !isCompactPrompt ? this.#pendingTodoSyncReminder : null;
+          const outboundPrompt = reminderToSend
+            ? [{ type: 'text' as const, text: `${reminderToSend}\n\n` }, ...promptBlocks]
+            : promptBlocks;
+
           const result = await client.prompt({
             sessionId,
-            prompt: promptBlocks,
+            prompt: outboundPrompt,
           });
+
+          if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
+            this.#pendingTodoSyncReminder = null;
+          }
 
         if (
           this.#shuttingDown ||
@@ -3319,6 +3700,20 @@ export class AppController {
           }
         );
         this.store.setStreaming(false);
+
+        if (result.stopReason === 'end_turn') {
+          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
+          if (
+            this.#shuttingDown ||
+            promptEpoch !== this.#sessionEpoch ||
+            this.store.getState().sessionId !== sessionId
+          ) {
+            return;
+          }
+          if (isCompactPrompt && finishedTurn && !finishedTurn.notices.some(n => n.kind === 'compaction')) {
+            this.store.transcript.markCompactionCompleted(finishedTurn.index);
+          }
+        }
 
         const hasBgTools = this.store.hasActiveBackgroundTasks();
         const swarmActive = this.store.isSwarmWorking;
@@ -3347,6 +3742,8 @@ export class AppController {
           this.#applySessionMetricsSnapshot(endedSnap);
           this.#pendingBackgroundDone = false;
           this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
           this.#awaitingSwarmCoordinatorReply = false;
           this.#swarmCoordinatorReplied = false;
           this.#deferredSettleTurnIndex = null;
@@ -3363,6 +3760,11 @@ export class AppController {
           this.#pendingBackgroundDone =
             hasBgTools || (!needSwarmReply && this.#swarmCoordinatorReplied);
           this.#awaitingPostToolWakeup = false;
+          if (this.#pendingBackgroundDone) {
+            this.#backgroundResumeAnchorStepSeq =
+              this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
+            this.#backgroundWaitLastProgressAt = this.#now();
+          }
           if (finishedTurn) {
             this.#deferredSettleTurnIndex = finishedTurn.index;
           }
@@ -3386,6 +3788,7 @@ export class AppController {
         }
 
         // Authoritatively calibrate post-turn TPS + cumulative tokens from transcript.jsonl and refresh git
+        this.#syncToolWatchTimer();
         void this.#syncSessionMetricsFromTranscript();
         void this.#refreshGitStatus();
         void this.#persistSessionAnchorAndOsc().catch(() => {});
@@ -3405,9 +3808,12 @@ export class AppController {
         const endedSnap = this.#metricsTracker.endStreamTurn();
         this.#applySessionMetricsSnapshot(endedSnap);
         this.store.setStreaming(false);
+        this.#syncToolWatchTimer();
         if (!this.store.isBusy) {
           this.#pendingBackgroundDone = false;
           this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
           this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
@@ -3590,6 +3996,8 @@ export class AppController {
       } else {
         this.#pendingBackgroundDone = false;
         this.#awaitingPostToolWakeup = false;
+        this.#backgroundResumeAnchorStepSeq = 0;
+        this.#backgroundWaitLastProgressAt = 0;
         this.#awaitingSwarmCoordinatorReply = false;
         this.#deferredSettleTurnIndex = null;
         this.#workingStartedAt = undefined;
@@ -3613,6 +4021,8 @@ export class AppController {
     } else if (cancelledBg > 0) {
       this.#pendingBackgroundDone = false;
       this.#awaitingPostToolWakeup = false;
+      this.#backgroundResumeAnchorStepSeq = 0;
+      this.#backgroundWaitLastProgressAt = 0;
       this.#awaitingSwarmCoordinatorReply = false;
       this.#deferredSettleTurnIndex = null;
       this.#workingStartedAt = undefined;
@@ -3635,6 +4045,7 @@ export class AppController {
       this.#restoreOscAfterBlock();
     }
 
+    this.#clearToolWatchTimer();
     this.scheduler.renderNow();
     this.syncFocus();
   }
@@ -3706,6 +4117,11 @@ export class AppController {
 
   #reconcileBackgroundActivity(prevBusy: boolean): void {
     if (this.#shuttingDown) return;
+    this.#reconcileBackgroundActivityCore(prevBusy);
+    this.#syncToolWatchTimer();
+  }
+
+  #reconcileBackgroundActivityCore(prevBusy: boolean): void {
     const state = this.store.getState();
 
     if (state.isStreaming) {
@@ -4033,6 +4449,7 @@ export class AppController {
             updatedAt: cached.updatedAt || '',
             ...(cached.model ? { model: cached.model } : {}),
             ...(cached.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+            ...(cached.mode ? { mode: cached.mode } : {}),
             ...(cached.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
             ...(cached.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
           });
@@ -4069,6 +4486,7 @@ export class AppController {
           updatedAt: s.updatedAt || cached?.updatedAt || '',
           ...(cached?.model ? { model: cached.model } : {}),
           ...(cached?.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+          ...(cached?.mode ? { mode: cached.mode } : {}),
           ...(cached?.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
           ...(cached?.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
         };
@@ -4471,6 +4889,7 @@ export class AppController {
           await client.cancel(oldSessionId).catch(() => {});
         }
         await client.closeSession(oldSessionId).catch(() => {});
+        this.#todoServer?.clearSession(oldSessionId);
       }
 
       if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) {
@@ -4495,7 +4914,8 @@ export class AppController {
         sessionId,
         targetCwd,
         meta?.title,
-        switchEpoch
+        switchEpoch,
+        { restoreSavedControls: true }
       );
       if (
         !applied ||
@@ -4540,19 +4960,220 @@ export class AppController {
     }
   }
 
+  async #resolveResumedSessionControls(
+    sessionId: string,
+    anchorHint?: ResumeAnchorHint
+  ): Promise<SessionControlCarryOver | null> {
+    const storedAnchor = await this.#previewStore.load(sessionId).catch(() => null);
+    let modelId = anchorHint?.model?.trim() || storedAnchor?.model?.trim() || null;
+    let thoughtLevel = anchorHint?.model?.trim()
+      ? (anchorHint.thoughtLevel?.trim() || null)
+      : (anchorHint?.thoughtLevel?.trim() || storedAnchor?.thoughtLevel?.trim() || null);
+    const modeId = anchorHint?.mode?.trim() || storedAnchor?.mode?.trim() || null;
+
+    const curState = this.store.getState();
+    if (modelId && curState.controls.availableModels.length > 0) {
+      const resolved = resolveModelSelection(modelId, {
+        configOptions: [...curState.configOptions],
+        models: curState.models,
+        modes: curState.modes,
+      });
+      if (
+        resolved &&
+        resolved.matchKind !== 'fuzzy_config_model' &&
+        resolved.matchKind !== 'legacy_fuzzy'
+      ) {
+        modelId = resolved.modelId;
+        if (!thoughtLevel && resolved.thoughtLevel) {
+          thoughtLevel = resolved.thoughtLevel;
+        }
+      }
+    } else if (!modelId && curState.controls.availableModels.length > 0) {
+      const candidates = await readTranscriptModelCandidates(sessionId, {
+        ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
+      });
+      for (const candidate of candidates) {
+        const resolved = resolveModelSelection(candidate, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (
+          resolved &&
+          resolved.matchKind !== 'fuzzy_config_model' &&
+          resolved.matchKind !== 'legacy_fuzzy'
+        ) {
+          modelId = resolved.modelId;
+          if (!thoughtLevel && resolved.thoughtLevel) {
+            thoughtLevel = resolved.thoughtLevel;
+          }
+          break;
+        }
+      }
+    }
+
+    return modelId || thoughtLevel || modeId
+      ? { modelId, thoughtLevel, modeId }
+      : null;
+  }
+
+  async #applyCarryOverControls(
+    client: AcpClient,
+    sessionId: string,
+    carryOver: SessionControlCarryOver,
+    createEpoch: number
+  ): Promise<void> {
+    const isStale = (): boolean =>
+      this.#shuttingDown || createEpoch !== this.#sessionEpoch || !this.#isAcpClientLive(client);
+
+    let modelRestoreFailed = false;
+    let curState = this.store.getState();
+
+    // 1. Model
+    if (
+      carryOver.modelId &&
+      carryOver.modelId !== curState.controls.currentModelId &&
+      curState.controls.availableModels.length > 0
+    ) {
+      const resolved = resolveModelSelection(carryOver.modelId, {
+        configOptions: [...curState.configOptions],
+        models: curState.models,
+        modes: curState.modes,
+      });
+      if (
+        resolved &&
+        resolved.matchKind !== 'fuzzy_config_model' &&
+        resolved.matchKind !== 'legacy_fuzzy'
+      ) {
+        try {
+          const applied = await applyModelSelection(client, sessionId, resolved);
+          if (isStale()) return;
+          if (applied.configOptions) {
+            this.store.updateConfigOptions(applied.configOptions);
+          } else {
+            this.store.updateCurrentModelId(applied.appliedModelId);
+          }
+        } catch (err) {
+          modelRestoreFailed = true;
+          if (isStale()) return;
+          this.store.pushToast(
+            `Failed to carry over model "${carryOver.modelId}": ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            'warning',
+            { ttl: 3000 }
+          );
+        }
+      }
+    }
+
+    // 2. Thought level
+    if (!modelRestoreFailed && carryOver.thoughtLevel) {
+      curState = this.store.getState();
+      if (
+        curState.controls.supportsThoughtLevel &&
+        curState.controls.currentThoughtLevel !== carryOver.thoughtLevel
+      ) {
+        const resolvedThought = resolveThoughtLevel(carryOver.thoughtLevel, [
+          ...curState.configOptions,
+        ]);
+        const targetThought = resolvedThought.ok
+          ? resolvedThought.value
+          : resolvedThought.reason === 'invalid'
+            ? clampThoughtLevelForChoices(
+                carryOver.thoughtLevel,
+                curState.controls.availableThoughtLevels
+              )
+            : undefined;
+        if (targetThought && targetThought !== curState.controls.currentThoughtLevel) {
+          try {
+            const res = await client.setConfigOption({
+              sessionId,
+              configId: 'thought_level',
+              value: targetThought,
+            });
+            if (isStale()) return;
+            this.store.updateConfigOptions(res.configOptions);
+          } catch (err) {
+            if (isStale()) return;
+            this.store.pushToast(
+              `Failed to carry over thought level "${targetThought}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              'warning',
+              { ttl: 3000 }
+            );
+          }
+        }
+      }
+    }
+
+    // 3. Mode
+    if (carryOver.modeId) {
+      curState = this.store.getState();
+      const targetModeId = carryOver.modeId;
+      if (
+        targetModeId !== curState.controls.currentModeId &&
+        curState.controls.availableModes.some(
+          m => m.value.toLowerCase() === targetModeId.toLowerCase()
+        )
+      ) {
+        const resolvedMode = resolveModeSelection(targetModeId, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (resolvedMode) {
+          try {
+            if (resolvedMode.strategy === 'config_option') {
+              const res = await client.setConfigOption({
+                sessionId,
+                configId: 'mode',
+                value: resolvedMode.modeId,
+              });
+              if (isStale()) return;
+              this.store.updateConfigOptions(res.configOptions);
+            } else {
+              await client.setMode({ sessionId, modeId: resolvedMode.modeId });
+              if (isStale()) return;
+              this.store.updateCurrentModeId(resolvedMode.modeId);
+            }
+          } catch (err) {
+            if (isStale()) return;
+            this.store.pushToast(
+              `Failed to carry over mode "${targetModeId}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              'warning',
+              { ttl: 3000 }
+            );
+          }
+        }
+      }
+    }
+  }
+
   async #startNewSession(): Promise<void> {
     const client = this.#acpClient;
     if (!client) return;
     const state = this.store.getState();
     const oldId = state.sessionId;
     const wasStreaming = state.isStreaming;
+    const carryOver: SessionControlCarryOver = this.#pendingCarryOverControls ?? {
+      modelId: state.controls.currentModelId,
+      thoughtLevel: state.controls.supportsThoughtLevel ? state.controls.currentThoughtLevel : null,
+      modeId: state.controls.currentModeId,
+    };
+    const hasCarryOver = Boolean(carryOver.modelId || carryOver.thoughtLevel || carryOver.modeId);
     const createEpoch = this.#beginSessionTransition('creating');
+    this.#pendingCarryOverControls = hasCarryOver ? carryOver : null;
 
     if (oldId) {
       if (wasStreaming) {
         await client.cancel(oldId).catch(() => {});
       }
       await client.closeSession(oldId).catch(() => {});
+      this.#todoServer?.clearSession(oldId);
     }
 
     if (
@@ -4564,11 +5185,17 @@ export class AppController {
         this.#creatingSessionEpoch = null;
         this.#pendingNewSessionUpdates = [];
       }
+      if (createEpoch === this.#sessionEpoch) {
+        this.#pendingCarryOverControls = null;
+      }
       return;
     }
 
     try {
-      const created = await client.newSession({ cwd: state.cwd, mcpServers: [] });
+      const created = await client.newSession({
+        cwd: state.cwd,
+        ...this.#buildSessionBootstrapOptions(),
+      });
       if (
         this.#shuttingDown ||
         !this.#isAcpClientLive(client) ||
@@ -4585,12 +5212,23 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#todoServer?.setActiveSessionId(created.sessionId);
       this.#lastCommittedSessionId = created.sessionId;
       this.#lastCommittedCwd = state.cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
       }
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
+      if (hasCarryOver) {
+        await this.#applyCarryOverControls(client, created.sessionId, carryOver, createEpoch);
+        if (
+          this.#shuttingDown ||
+          !this.#isAcpClientLive(client) ||
+          createEpoch !== this.#sessionEpoch
+        ) {
+          return;
+        }
+      }
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
@@ -4618,6 +5256,9 @@ export class AppController {
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
         this.#pendingNewSessionUpdates = [];
+      }
+      if (createEpoch === this.#sessionEpoch) {
+        this.#pendingCarryOverControls = null;
       }
     }
   }
@@ -4704,6 +5345,8 @@ export class AppController {
       );
       if (applied.configOptions) {
         this.store.updateConfigOptions(applied.configOptions);
+      } else {
+        this.store.updateCurrentModelId(applied.appliedModelId);
       }
 
       // Record & persist `recent_models` to `config.toml`
@@ -4844,6 +5487,7 @@ export class AppController {
               value: targetOrchId,
             });
             this.store.updateConfigOptions(res.configOptions);
+            await this.#persistSessionAnchorAndOsc();
           } catch {
             // Non-fatal: settings.json is already updated
           }
@@ -5076,6 +5720,7 @@ export class AppController {
         this.store.pushToast(`Mode: ${resolved.modeName ?? resolved.modeId}`, 'info', {
           ttl: 2000,
         });
+        await this.#persistSessionAnchorAndOsc();
       }
       this.scheduler.renderNow();
     } catch (err) {
@@ -5263,6 +5908,14 @@ export class AppController {
       };
       this.store.setAutoCollapseThought(next);
       omaUpdated = true;
+    } else if (rowId === 'ui.collapse_compacted') {
+      const next = Boolean(value);
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, collapse_compacted: next },
+      };
+      this.store.setCollapseCompacted(next);
+      omaUpdated = true;
     } else if (rowId === 'ui.tool_display') {
       const next: ToolDisplayMode = normalizeToolDisplayMode(value);
       this.#config = {
@@ -5438,6 +6091,7 @@ export class AppController {
         recent_models: [...this.#config.recent_models],
       });
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
+      this.store.setCollapseCompacted(this.#config.ui.collapse_compacted);
       this.store.setToolDisplayMode(this.#config.ui.tool_display);
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
@@ -5520,6 +6174,468 @@ export class AppController {
     }
     this.scheduler.renderNow();
     this.syncFocus();
+  }
+
+  #ensureTodoServer(): EmbeddedTodoMcpServer | null {
+    if (!this.#enableTodoMcp || this.#shuttingDown) {
+      return null;
+    }
+    if (this.#todoServer) {
+      return this.#todoServer;
+    }
+    try {
+      this.#todoServer = new EmbeddedTodoMcpServer({
+        version: OMA_VERSION,
+        onTodoChanged: event => {
+          this.#handleLiveTodoServerUpdate(event);
+        },
+      });
+      return this.#todoServer;
+    } catch {
+      return null;
+    }
+  }
+
+  #buildSessionBootstrapOptions(): {
+    mcpServers: McpServerConfig[];
+    _meta?: Record<string, unknown>;
+  } {
+    const server = this.#ensureTodoServer();
+    if (!server) {
+      return { mcpServers: [] };
+    }
+    return {
+      mcpServers: [server.getMcpServerConfig()],
+      _meta: {
+        antigravity: {
+          systemPrompt: {
+            append: OMA_TODO_SYSTEM_PROMPT_APPEND,
+          },
+        },
+      },
+    };
+  }
+
+  #clearTodoAutoClearTimer(): void {
+    if (this.#todoAutoClearTimer !== undefined) {
+      clearTimeout(this.#todoAutoClearTimer);
+      this.#todoAutoClearTimer = undefined;
+    }
+  }
+
+  #scheduleTodoAutoClearIfDone(): void {
+    this.#clearTodoAutoClearTimer();
+    const phases = this.store.transcript.todoPhases;
+    if (this.#todoHudDismissed || !areAllTodosFinished(phases)) {
+      return;
+    }
+    const delayMs = this.#todoAutoClearDelayMs;
+    if (!Number.isFinite(delayMs) || delayMs < 0) {
+      return;
+    }
+    const snapshotJson = JSON.stringify(phases);
+    const expectedEpoch = this.#sessionEpoch;
+    this.#todoAutoClearTimer = setTimeout(() => {
+      this.#todoAutoClearTimer = undefined;
+      if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
+      if (JSON.stringify(this.store.transcript.todoPhases) !== snapshotJson) return;
+      this.#todoHudDismissed = true;
+      this.scheduler.renderNow();
+    }, delayMs);
+    this.#todoAutoClearTimer.unref?.();
+  }
+
+  #handleLiveTodoServerUpdate(event: TodoServerUpdateEvent): void {
+    if (this.#shuttingDown) return;
+    const activeSessionId = this.store.getState().sessionId;
+    if (
+      activeSessionId &&
+      event.sessionId !== 'default' &&
+      event.sessionId !== activeSessionId
+    ) {
+      return;
+    }
+    this.store.transcript.applyLiveTodoToolResult(event);
+    if (!event.isError && event.op !== 'view') {
+      this.#pendingTodoSyncReminder = null;
+      this.#todoHudDismissed = false;
+      this.#scheduleTodoAutoClearIfDone();
+    }
+    this.scheduler.markDirty();
+  }
+
+  #commitUserTodoEdit(
+    nextPhases: readonly TodoPhase[],
+    reason: string,
+    options: { readonly removed?: boolean } = {}
+  ): void {
+    const cleaned = cloneTodoPhases(nextPhases).filter(phase => phase.tasks.length > 0);
+    this.store.transcript.setTodoPhases(cleaned, { source: 'user' });
+    const activeSessionId = this.store.getState().sessionId;
+    if (activeSessionId) {
+      this.#ensureTodoServer()?.seedSession(activeSessionId, cleaned);
+    }
+    this.#todoHudDismissed = false;
+    this.#scheduleTodoAutoClearIfDone();
+    this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
+      reason,
+      cleaned,
+      options.removed === true
+    );
+    this.scheduler.renderNow();
+    void this.#persistSessionAnchorAndOsc().catch(() => {});
+  }
+
+  async #editTodoInExternalEditor(editorCmd: string, initialMd: string): Promise<string | null> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oma-todo-'));
+    const filePath = path.join(dir, 'todos.todo.md');
+    await writeFile(filePath, initialMd, 'utf8');
+    const wasRaw = Boolean((process.stdin as { isRaw?: boolean }).isRaw);
+    this.osc.showCursor();
+    this.surface.suspend();
+    try {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(false);
+      }
+      const editorArgs = splitTodoShellArgs(editorCmd);
+      if (editorArgs.length === 0) return null;
+      const proc = Bun.spawn([...editorArgs, filePath], {
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+      });
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) return null;
+      const edited = await readFile(filePath, 'utf8');
+      return edited === initialMd ? null : edited;
+    } finally {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(wasRaw);
+      }
+      this.surface.resume();
+      this.osc.setTitleAndHideCursor('oma · Antigravity');
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  async #handleTodoCommand(argsText: string): Promise<void> {
+    const trimmed = argsText.trim();
+    const state = this.store.getState();
+    const current = cloneTodoPhases(this.store.transcript.todoPhases);
+
+    if (!trimmed) {
+      if (current.length === 0) {
+        this.store.pushToast('No todos. Use /todo append <task> to start one.', 'info');
+      } else {
+        this.store.transcript.addInfoNotice(formatTodoMarkdown(current).trimEnd(), 'info');
+      }
+      this.scheduler.renderNow();
+      return;
+    }
+
+    const sepIdx = trimmed.search(/\s/);
+    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
+    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+
+    switch (verb) {
+      case 'expand': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to expand.', 'info');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#todoExpanded = true;
+        this.#todoHudDismissed = false;
+        this.#clearTodoAutoClearTimer();
+        this.scheduler.renderNow();
+        this.store.pushToast('Expanded all todo phases in HUD', 'info', { ttl: 2000 });
+        return;
+      }
+      case 'collapse': {
+        this.#todoExpanded = false;
+        this.#scheduleTodoAutoClearIfDone();
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'help':
+      case '?': {
+        this.store.transcript.addInfoNotice(TODO_HELP_TEXT, 'info');
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'copy': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to copy.', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        await this.#copyTextWithToast(
+          formatTodoMarkdown(current),
+          'Copied todos as Markdown to clipboard'
+        );
+        return;
+      }
+      case 'export': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to export.', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
+        try {
+          await mkdir(path.dirname(targetFile), { recursive: true });
+          await writeFile(targetFile, formatTodoMarkdown(current), 'utf8');
+          this.store.pushToast(`Wrote todos to ${targetFile}`, 'success', { ttl: 3000 });
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to write todos: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+        }
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'import': {
+        const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
+        let raw = '';
+        try {
+          raw = await readFile(targetFile, 'utf8');
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to read todos: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+          this.scheduler.renderNow();
+          return;
+        }
+        const parsed = parseTodoMarkdown(raw);
+        if (parsed.errors.length > 0) {
+          this.store.pushToast(`Could not parse ${targetFile}: ${parsed.errors[0]}`, 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(parsed.phases, `/todo import ${targetFile}`, { removed: true });
+        const total = parsed.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+        this.store.pushToast(
+          `Imported ${parsed.phases.length} phase(s), ${total} task(s) from ${targetFile}.`,
+          'success'
+        );
+        return;
+      }
+      case 'edit': {
+        const initialMd =
+          current.length > 0
+            ? formatTodoMarkdown(current)
+            : '# Todos\n- [ ] (replace this with your tasks)\n';
+        let editedMd: string | null = null;
+        try {
+          if (this.#editTodoExternal) {
+            editedMd = await this.#editTodoExternal(initialMd);
+          } else {
+            const editorCmd = (process.env.VISUAL || process.env.EDITOR || '').trim();
+            if (!editorCmd) {
+              this.store.pushToast(
+                'No editor configured. Set $VISUAL or $EDITOR environment variable.',
+                'warning'
+              );
+              this.scheduler.renderNow();
+              return;
+            }
+            editedMd = await this.#editTodoInExternalEditor(editorCmd, initialMd);
+          }
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to open editor: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+          this.scheduler.renderNow();
+          return;
+        }
+        if (editedMd === null) {
+          this.store.pushToast('Editor exited without saving; todos unchanged.', 'info');
+          this.scheduler.renderNow();
+          return;
+        }
+        const parsed = parseTodoMarkdown(editedMd);
+        if (parsed.errors.length > 0) {
+          this.store.pushToast(`Could not parse Markdown: ${parsed.errors[0]}`, 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(parsed.phases, '/todo edit', { removed: true });
+        const total = parsed.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+        this.store.pushToast(`Updated todos (${total} task(s)).`, 'success');
+        return;
+      }
+      case 'append': {
+        const tokens = tokenizeTodoShellArgs(rest);
+        if (tokens.length === 0) {
+          this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        let targetPhase: TodoPhase | undefined;
+        let taskText = '';
+        if (tokens.length === 1) {
+          taskText = tokens[0]!.value.trim();
+          targetPhase = current[current.length - 1];
+        } else {
+          const first = tokens[0]!;
+          const matchedPhase = findTodoPhaseFuzzy(current, first.value);
+          if (matchedPhase) {
+            targetPhase = matchedPhase;
+            taskText = tokens
+              .slice(1)
+              .map(t => t.value)
+              .join(' ')
+              .trim();
+          } else if (first.quoted) {
+            targetPhase = { name: formatPhaseDisplayTitle(first.value), tasks: [] };
+            current.push(targetPhase);
+            taskText = tokens
+              .slice(1)
+              .map(t => t.value)
+              .join(' ')
+              .trim();
+          } else {
+            taskText = tokens.map(t => t.value).join(' ').trim();
+            targetPhase = current[current.length - 1];
+          }
+        }
+        if (!targetPhase) {
+          targetPhase = { name: 'Todos', tasks: [] };
+          current.push(targetPhase);
+        }
+        if (!taskText) {
+          this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        if (current.some(p => p.tasks.some(t => t.content === taskText))) {
+          this.store.pushToast(`Duplicate task "${taskText}".`, 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        targetPhase.tasks.push({ content: taskText, status: 'pending' });
+        normalizeSingleInProgress(current);
+        this.#commitUserTodoEdit(current, `/todo append -> ${targetPhase.name}`);
+        this.store.pushToast(`Appended to ${targetPhase.name}: ${taskText}`, 'success');
+        return;
+      }
+      case 'start': {
+        if (!rest) {
+          this.store.pushToast('Usage: /todo start <task>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const match = findTodoTaskFuzzy(current, rest);
+        if (!match) {
+          this.store.pushToast(`No task matched "${rest}".`, 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const outcome = applyTodoOperation(current, { op: 'start', task: match.task.content });
+        if (outcome.isError) {
+          this.store.pushToast(outcome.errors.join('; '), 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(outcome.phases, `/todo start ${match.task.content}`);
+        this.store.pushToast(`Started: ${match.task.content}`, 'success');
+        return;
+      }
+      case 'done':
+      case 'drop': {
+        const op = verb === 'done' ? 'done' : 'drop';
+        const label = verb === 'done' ? 'completed' : 'abandoned';
+        if (!rest) {
+          const allContents = current.flatMap(p => p.tasks.map(t => t.content));
+          const outcome =
+            allContents.length > 0
+              ? applyTodoOperation(current, { op, task: allContents })
+              : { phases: current, errors: [], isError: false };
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} (all)`);
+          this.store.pushToast(`Marked all tasks ${label}.`, 'success');
+          return;
+        }
+        const taskMatch = findTodoTaskFuzzy(current, rest);
+        if (taskMatch) {
+          const outcome = applyTodoOperation(current, { op, task: taskMatch.task.content });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} ${taskMatch.task.content}`);
+          this.store.pushToast(`Marked ${label}: ${taskMatch.task.content}`, 'success');
+          return;
+        }
+        const phaseMatch = findTodoPhaseFuzzy(current, rest);
+        if (phaseMatch) {
+          const outcome = applyTodoOperation(current, { op, phase: phaseMatch.name });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} ${phaseMatch.name}`);
+          this.store.pushToast(`Marked phase ${phaseMatch.name} ${label}.`, 'success');
+          return;
+        }
+        this.store.pushToast(`No task or phase matched "${rest}".`, 'warning');
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'clear':
+      case 'rm': {
+        if (verb === 'clear' || !rest) {
+          this.#commitUserTodoEdit([], '/todo rm (all)', { removed: true });
+          this.store.pushToast('Cleared all todos.', 'success');
+          return;
+        }
+        const taskMatch = findTodoTaskFuzzy(current, rest);
+        if (taskMatch) {
+          const outcome = applyTodoOperation(current, { op: 'rm', task: taskMatch.task.content });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo rm ${taskMatch.task.content}`, {
+            removed: true,
+          });
+          this.store.pushToast(`Removed: ${taskMatch.task.content}`, 'success');
+          return;
+        }
+        const phaseMatch = findTodoPhaseFuzzy(current, rest);
+        if (phaseMatch) {
+          const outcome = applyTodoOperation(current, { op: 'rm', phase: phaseMatch.name });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo rm ${phaseMatch.name}`, { removed: true });
+          this.store.pushToast(`Removed phase: ${phaseMatch.name}`, 'success');
+          return;
+        }
+        this.store.pushToast(`No task or phase matched "${rest}".`, 'warning');
+        this.scheduler.renderNow();
+        return;
+      }
+      default: {
+        this.store.pushToast(
+          `Unknown /todo verb "${verb}". Run /todo help for usage.`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+      }
+    }
   }
 
   async #exportTranscript(targetPath?: string): Promise<void> {
@@ -5666,6 +6782,14 @@ export class AppController {
         ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
         turnCount: this.store.transcript.turns.length,
         preview: this.store.transcript.getPreviewMessages(3, 400),
+        ...(this.store.transcript.hasPersistedTodoState
+          ? {
+              todoState: {
+                phases: cloneTodoPhases(this.store.transcript.todoPhases),
+                toolCallCount: this.store.transcript.todoToolCallCount,
+              },
+            }
+          : {}),
       });
       if (
         this.#shuttingDown ||
@@ -5725,45 +6849,84 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     if (this.#shuttingDown) return;
     const waitMs = delayMs ?? this.#backgroundDoneGraceMs;
+    const expectedEpoch = this.#sessionEpoch;
     this.#backgroundDoneTimer = setTimeout(() => {
       this.#backgroundDoneTimer = undefined;
-      if (this.#shuttingDown || !this.#pendingBackgroundDone) return;
-      const state = this.store.getState();
-      if (
-        state.isStreaming ||
-        state.hasActiveBackgroundTasks ||
-        state.isSwarmWorking ||
-        this.#isSwarmCoordinatorWorking() ||
-        this.#awaitingSwarmCoordinatorReply
-      ) {
-        return;
-      }
-      this.#pendingBackgroundDone = false;
-      this.#awaitingPostToolWakeup = false;
-      this.#awaitingSwarmCoordinatorReply = false;
-      this.#workingStartedAt = undefined;
-      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
-        autoCollapseThought: this.store.autoCollapseThought,
-        expandAllTools: state.expandAllTools,
-      });
-      if (this.#metricsTracker.isStreaming) {
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
-      }
-      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
-      this.#deferredSettleTurnIndex = null;
-      // Ensure any late chunks or tool updates are flushed to the screen before notifying done
-      this.scheduler.renderNow();
-      if (settleIdx !== null) {
-        this.scheduler.settleTurn(settleIdx);
-        this.osc.reassertCursorHidden();
-      }
-      if (!this.store.approvals.hasPending() && !state.activeQuestion) {
-        this.osc.setStatusDone();
-        this.#scheduleDoneToIdle();
-      }
-      void this.#syncSessionMetricsFromTranscript();
-      void this.#persistSessionAnchorAndOsc();
+      void (async () => {
+        if (
+          this.#shuttingDown ||
+          expectedEpoch !== this.#sessionEpoch ||
+          !this.#pendingBackgroundDone
+        ) {
+          return;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
+          if (
+            this.#shuttingDown ||
+            expectedEpoch !== this.#sessionEpoch ||
+            !this.#pendingBackgroundDone
+          ) {
+            return;
+          }
+        }
+        const state = this.store.getState();
+        if (
+          state.isStreaming ||
+          state.hasActiveBackgroundTasks ||
+          state.isSwarmWorking ||
+          this.#isSwarmCoordinatorWorking() ||
+          this.#awaitingSwarmCoordinatorReply
+        ) {
+          return;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          const activity = this.#metricsTracker.getLatestTurnActivity();
+          const transcriptAuthoritativelyFinal =
+            !activity ||
+            activity.resetAll === true ||
+            (activity.latestKind === 'planner_final' &&
+              activity.latestStepSeq > this.#backgroundResumeAnchorStepSeq);
+          const stalledTooLong =
+            this.#backgroundWaitLastProgressAt > 0 &&
+            this.#now() - this.#backgroundWaitLastProgressAt >=
+              DEFAULT_BACKGROUND_TRANSCRIPT_STALL_MS;
+          if (!transcriptAuthoritativelyFinal && !stalledTooLong) {
+            const recheckMs = Math.min(this.#backgroundDoneGraceMs, this.#toolWatchIntervalMs);
+            this.#scheduleBackgroundDone(recheckMs);
+            return;
+          }
+        }
+        this.#pendingBackgroundDone = false;
+        this.#awaitingPostToolWakeup = false;
+        this.#backgroundResumeAnchorStepSeq = 0;
+        this.#backgroundWaitLastProgressAt = 0;
+        this.#awaitingSwarmCoordinatorReply = false;
+        this.#workingStartedAt = undefined;
+        const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: state.expandAllTools,
+        });
+        if (this.#metricsTracker.isStreaming) {
+          const endedSnap = this.#metricsTracker.endStreamTurn();
+          this.#applySessionMetricsSnapshot(endedSnap);
+        }
+        const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+        this.#deferredSettleTurnIndex = null;
+        // Ensure any late chunks or tool updates are flushed to the screen before notifying done
+        this.scheduler.renderNow();
+        if (settleIdx !== null) {
+          this.scheduler.settleTurn(settleIdx);
+          this.osc.reassertCursorHidden();
+        }
+        if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+          this.osc.setStatusDone();
+          this.#scheduleDoneToIdle();
+        }
+        this.#syncToolWatchTimer();
+        void this.#syncSessionMetricsFromTranscript();
+        void this.#persistSessionAnchorAndOsc();
+      })();
     }, waitMs);
   }
 
@@ -5772,6 +6935,51 @@ export class AppController {
       clearTimeout(this.#backgroundDoneTimer);
       this.#backgroundDoneTimer = undefined;
     }
+  }
+
+  #syncToolWatchTimer(): void {
+    const shouldWatch =
+      !this.#shuttingDown &&
+      !this.store.getState().isReplaying &&
+      (this.store.transcript.hasInFlightToolCall() ||
+        this.store.hasActiveBackgroundTasks() ||
+        this.#pendingBackgroundDone);
+    if (!shouldWatch) {
+      this.#clearToolWatchTimer();
+      return;
+    }
+    if (this.#toolWatchTimer !== undefined) {
+      return;
+    }
+    this.#lastWatchedRunningJobs =
+      this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+    this.#toolWatchTimer = setInterval(() => {
+      if (
+        this.#shuttingDown ||
+        this.store.getState().isReplaying ||
+        (!this.store.transcript.hasInFlightToolCall() &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.#pendingBackgroundDone)
+      ) {
+        this.#clearToolWatchTimer();
+        return;
+      }
+      void this.#syncSessionMetricsFromTranscript();
+      const runningJobs =
+        this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+      if (runningJobs !== this.#lastWatchedRunningJobs) {
+        this.#lastWatchedRunningJobs = runningJobs;
+        this.scheduler.markDirty();
+      }
+    }, this.#toolWatchIntervalMs);
+  }
+
+  #clearToolWatchTimer(): void {
+    if (this.#toolWatchTimer !== undefined) {
+      clearInterval(this.#toolWatchTimer);
+      this.#toolWatchTimer = undefined;
+    }
+    this.#lastWatchedRunningJobs = -1;
   }
 
   #bindSessionMetrics(sessionId: string | null, autoSync = true): void {
@@ -5796,13 +7004,88 @@ export class AppController {
     return true;
   }
 
-  async #syncSessionMetricsFromTranscript(): Promise<void> {
+  async #syncSessionMetricsFromTranscript(
+    options: { readonly reconcileBackground?: boolean } = {}
+  ): Promise<void> {
     if (this.#shuttingDown) return;
     const expectedSessionId = this.#metricsTracker.sessionId;
     if (!expectedSessionId) return;
+    const prevActivitySeq = this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
     const snap = await this.#metricsTracker.syncFromTranscript();
     if (this.#shuttingDown || this.#metricsTracker.sessionId !== expectedSessionId) return;
-    if (this.#applySessionMetricsSnapshot(snap)) {
+    const nextActivity = this.#metricsTracker.getLatestTurnActivity();
+    if (nextActivity && nextActivity.latestStepSeq > prevActivitySeq) {
+      this.#backgroundWaitLastProgressAt = this.#now();
+    }
+    let dirty = this.#applySessionMetricsSnapshot(snap);
+    const checkpoint = this.#metricsTracker.getLatestCheckpoint();
+    if (checkpoint && this.store.transcript.applyTranscriptCompactionCheckpoint(checkpoint)) {
+      dirty = true;
+    }
+    if (!this.store.getState().isReplaying) {
+      const prevBusy = this.store.isBusy;
+      const bgRecords = this.#metricsTracker.getTranscriptBackgroundTasks();
+      const bgSynced =
+        bgRecords.length > 0 && this.store.transcript.syncTranscriptBackgroundTasks(bgRecords);
+      if (bgSynced) {
+        dirty = true;
+        this.#lastWatchedRunningJobs =
+          this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+      }
+      if (options.reconcileBackground !== false) {
+        const shouldWakeupAfterTranscriptTerminal =
+          bgSynced &&
+          prevBusy &&
+          !this.store.getState().isStreaming &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply;
+
+        if (shouldWakeupAfterTranscriptTerminal) {
+          if (nextActivity?.resetAll === true) {
+            this.#pendingBackgroundDone = false;
+            this.#awaitingPostToolWakeup = false;
+            this.#backgroundResumeAnchorStepSeq = 0;
+            this.#backgroundWaitLastProgressAt = 0;
+            this.#clearBackgroundDoneTimer();
+            if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+              this.osc.setStatusIdle();
+            }
+            this.#syncToolWatchTimer();
+          } else {
+            this.#awaitingPostToolWakeup = true;
+            this.#backgroundResumeAnchorStepSeq = Math.max(
+              this.#backgroundResumeAnchorStepSeq,
+              nextActivity?.latestKind === 'planner_final'
+                ? prevActivitySeq
+                : (nextActivity?.latestStepSeq ?? 0)
+            );
+            this.#backgroundWaitLastProgressAt = this.#now();
+            this.#reconcileBackgroundActivity(prevBusy);
+          }
+        } else if (bgSynced) {
+          this.#reconcileBackgroundActivity(prevBusy);
+        }
+
+        if (
+          this.#pendingBackgroundDone &&
+          !this.store.getState().isStreaming &&
+          nextActivity &&
+          nextActivity.latestStepSeq > prevActivitySeq &&
+          nextActivity.latestKind === 'planner_final' &&
+          nextActivity.latestStepSeq > this.#backgroundResumeAnchorStepSeq &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply
+        ) {
+          this.#awaitingPostToolWakeup = false;
+          this.#scheduleBackgroundDone(this.#backgroundDoneGraceMs);
+        }
+      }
+    }
+    if (dirty) {
       this.scheduler.markDirty();
     }
   }
@@ -6257,17 +7540,28 @@ export class AppController {
   #buildView() {
     const state = this.store.getState();
     const jobs = this.store.transcript.getBackgroundJobsSnapshot();
+    const allVisibleTurns = this.store.transcript.getVisibleTurns();
+    const transcriptSlice = this.store.transcript.getVisibleTranscriptSlice(
+      state.collapseCompacted
+    );
     return buildAppView({
       state,
       draft: this.store.draft.getState(),
-      turns: this.store.transcript.getVisibleTurns(),
+      turns: allVisibleTurns,
+      transcriptTurns: transcriptSlice.turns,
       plan: this.store.transcript.plan,
+      todoExpanded: this.#todoExpanded,
+      todoHudDismissed: this.#todoHudDismissed,
       jobs,
       version: OMA_VERSION,
       commands: this.store.commands.getAll(),
       trafficEntries: this.store.traffic.list(),
       toolPreviewLines: this.#config.ui.tool_preview_lines,
       evictedNodeIds: this.store.transcript.evictedTurnIds,
+      hiddenCompactedTurnCount: transcriptSlice.hiddenCompactedTurnCount,
+      totalCompactedTurnCount: transcriptSlice.totalCompactedTurnCount,
+      hasCompactedHistory: transcriptSlice.hasCompactedHistory,
+      compactedHistoryExpanded: transcriptSlice.compactedHistoryExpanded,
       config: this.#config,
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
@@ -6291,6 +7585,11 @@ export class AppController {
           onToggleNotice: (noticeId, collapsed) => {
             this.store.transcript.toggleNotice(noticeId, collapsed);
             this.scheduler.renderNow();
+          },
+          onToggleCompactedHistory: show => {
+            if (this.store.transcript.setShowCompactedHistory(show)) {
+              this.scheduler.renderNow();
+            }
           },
           onToggleAgent: (agentId, collapsed) => {
             this.store.transcript.toggleAgent(agentId, collapsed);

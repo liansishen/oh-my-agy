@@ -7,6 +7,7 @@ export type ToolDisplayMode = 'all' | 'compact' | 'hidden';
 
 export interface OmaUiConfig {
   readonly auto_collapse_thought: boolean;
+  readonly collapse_compacted: boolean;
   readonly tool_display: ToolDisplayMode;
   readonly tool_preview_lines: number;
   readonly osc_7501: boolean;
@@ -37,6 +38,7 @@ export const DEFAULT_CONFIG: OmaConfig = Object.freeze({
   recent_models: Object.freeze([]) as unknown as string[],
   ui: Object.freeze({
     auto_collapse_thought: true,
+    collapse_compacted: true,
     tool_display: 'all' as ToolDisplayMode,
     tool_preview_lines: 8,
     osc_7501: true,
@@ -82,6 +84,7 @@ const KNOWN_TOP_KEYS = new Set([
 
 const KNOWN_UI_KEYS = new Set([
   'auto_collapse_thought',
+  'collapse_compacted',
   'tool_display',
   'tool_preview_lines',
   'osc_7501',
@@ -391,6 +394,13 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
         warnings,
         'ui.',
       ),
+      collapse_compacted: readBooleanField(
+        uiTable,
+        'collapse_compacted',
+        DEFAULT_CONFIG.ui.collapse_compacted,
+        warnings,
+        'ui.',
+      ),
       tool_display,
       tool_preview_lines: readPreviewLinesField(
         uiTable,
@@ -535,6 +545,10 @@ function normalizeConfigForSave(config: OmaConfig): OmaConfig {
     recent_models: normalizeRecentModels(config.recent_models, MAX_RECENT_MODELS),
     ui: {
       auto_collapse_thought: Boolean(config.ui.auto_collapse_thought),
+      collapse_compacted:
+        typeof config.ui?.collapse_compacted === 'boolean'
+          ? config.ui.collapse_compacted
+          : DEFAULT_CONFIG.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: clampedLines,
       osc_7501: Boolean(config.ui.osc_7501),
@@ -563,6 +577,7 @@ export function formatConfigToml(config: OmaConfig): string {
     '',
     '[ui]',
     `auto_collapse_thought = ${String(norm.ui.auto_collapse_thought)}`,
+    `collapse_compacted = ${String(norm.ui.collapse_compacted)}`,
     `tool_display = ${formatTomlString(norm.ui.tool_display)}`,
     `tool_preview_lines = ${norm.ui.tool_preview_lines}`,
     `osc_7501 = ${String(norm.ui.osc_7501)}`,

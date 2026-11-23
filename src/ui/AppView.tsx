@@ -29,13 +29,20 @@ export interface AppViewProps {
   readonly state: AppState;
   readonly draft: DraftState;
   readonly turns: readonly TranscriptTurn[];
+  readonly transcriptTurns?: readonly TranscriptTurn[];
   readonly plan: PlanState | null;
+  readonly todoExpanded?: boolean;
+  readonly todoHudDismissed?: boolean;
   readonly jobs?: BackgroundJobsSnapshot;
   readonly version: string;
   readonly commands: readonly SlashCommandDef[];
   readonly trafficEntries: readonly TrafficEntry[];
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
+  readonly hiddenCompactedTurnCount?: number;
+  readonly totalCompactedTurnCount?: number;
+  readonly hasCompactedHistory?: boolean;
+  readonly compactedHistoryExpanded?: boolean;
   readonly config?: OmaConfig;
   readonly configPath?: string;
   readonly agySettingsPath?: string;
@@ -111,13 +118,20 @@ export function buildAppView(props: AppViewProps): ViewInput {
     state,
     draft,
     turns,
+    transcriptTurns,
     plan,
+    todoExpanded,
+    todoHudDismissed,
     jobs,
     version,
     commands,
     trafficEntries,
     toolPreviewLines,
     evictedNodeIds,
+    hiddenCompactedTurnCount,
+    totalCompactedTurnCount,
+    hasCompactedHistory,
+    compactedHistoryExpanded,
     config,
     configPath,
     agySettingsPath,
@@ -130,11 +144,15 @@ export function buildAppView(props: AppViewProps): ViewInput {
   const main: JSX.Element = (
     <TranscriptView
       state={state}
-      turns={turns}
+      turns={transcriptTurns ?? turns}
       plan={plan}
       version={version}
       toolPreviewLines={toolPreviewLines}
       evictedNodeIds={evictedNodeIds}
+      hiddenCompactedTurnCount={hiddenCompactedTurnCount}
+      totalCompactedTurnCount={totalCompactedTurnCount}
+      hasCompactedHistory={hasCompactedHistory}
+      compactedHistoryExpanded={compactedHistoryExpanded}
       now={now}
       callbacks={callbacks.transcript}
     />
@@ -145,6 +163,8 @@ export function buildAppView(props: AppViewProps): ViewInput {
       state={state}
       draft={draft}
       plan={plan}
+      todoExpanded={todoExpanded}
+      todoHudDismissed={todoHudDismissed}
       jobs={jobs}
       hasTurns={turns.length > 0}
       commands={commands}

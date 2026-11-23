@@ -17,9 +17,11 @@ import {
   formatTokenMetricsText,
   formatTpsText,
   getTranscriptPath,
+  readTranscriptModelCandidates,
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
 } from '../src/state/session_metrics';
+import { TranscriptStore } from '../src/state/transcript';
 import { AppStore } from '../src/state/store';
 
 // ---------------------------------------------------------------------------
@@ -758,5 +760,644 @@ describe('AppStore sessionMetrics & gitStatus state management', () => {
     store.resetSessionState();
     expect(store.getState().sessionMetrics).toBeNull();
     expect(store.getState().gitStatus).toEqual(git);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. readTranscriptModelCandidates: Tail model extraction from transcript.jsonl
+// ---------------------------------------------------------------------------
+
+describe('readTranscriptModelCandidates', () => {
+  test('reads newest-to-oldest deduplicated model IDs, handles missing files, and scans only the tail on large transcripts', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-model-scan-'));
+    try {
+      expect(await readTranscriptModelCandidates('missing-sess', { baseBrainDir: tmpDir })).toEqual([]);
+      expect(await readTranscriptModelCandidates('   ', { baseBrainDir: tmpDir })).toEqual([]);
+
+      const sessA = 'sess-models-a';
+      const pathA = getTranscriptPath(sessA, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(pathA), { recursive: true });
+      await writeFile(
+        pathA,
+        [
+          JSON.stringify({ type: 'USER_INPUT', content: 'hi' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+          '{broken json',
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      expect(await readTranscriptModelCandidates(sessA, { baseBrainDir: tmpDir })).toEqual([
+        'gemini-flash-worker-agy',
+        'gemini-pro-orchestrator-neon',
+        'gemini-4-carbon-low',
+      ]);
+
+      // Large transcript (> 512 KiB): only tail window is scanned and partial leading line is dropped
+      const sessLarge = 'sess-models-large';
+      const pathLarge = getTranscriptPath(sessLarge, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(pathLarge), { recursive: true });
+      const oldLine = `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        model: 'old-early-model',
+        content: 'x'.repeat(2048),
+      })}\n`;
+      const fillerLine = `${JSON.stringify({
+        type: 'GENERIC',
+        content: 'y'.repeat(16_384),
+      })}\n`;
+      const tailLine1 = `${JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh' })}\n`;
+      const tailLine2 = `${JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high' })}\n`;
+      await writeFile(
+        pathLarge,
+        oldLine + fillerLine.repeat(36) + tailLine1 + tailLine2,
+        'utf8',
+      );
+      expect(await readTranscriptModelCandidates(sessLarge, { baseBrainDir: tmpDir })).toEqual([
+        'gemini-4-hydrogen-high',
+        'gemini-4-neon-xhigh',
+      ]);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore alignment', () => {
+  test('extracts CHECKPOINT <summary>, counts USER_INPUT turns, handles incremental/truncation/reset, and aligns with TranscriptStore', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-checkpoint-test-'));
+    try {
+      const sessionId = 'sess-checkpoint-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const userLine = (step: number, text: string, source = 'USER_EXPLICIT') =>
+        JSON.stringify({
+          type: 'USER_INPUT',
+          source,
+          step_index: step,
+          content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>`,
+        });
+      const checkpointLine = (
+        step: number,
+        opts: { status?: string; content: string; inTok?: number; cacheTok?: number; outTok?: number },
+      ) =>
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: opts.status ?? 'DONE',
+          step_index: step,
+          created_at: `2026-11-23T10:00:0${step}Z`,
+          input_tokens: opts.inTok ?? 500,
+          cache_read_tokens: opts.cacheTok ?? 12000,
+          output_tokens: opts.outTok ?? 350,
+          content: opts.content,
+        });
+
+      // Turn 0, Turn 1, then IN_PROGRESS checkpoint (ignored), then internal subagent input (ignored), then Turn 2 (/compact) + DONE checkpoint
+      await writeFile(
+        transcriptFile,
+        [
+          userLine(0, 'Hello project'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20 }),
+          userLine(2, 'Inspect codebase'),
+          JSON.stringify({ type: 'USER_INPUT', source: 'SYSTEM_SUBAGENT', step_index: 3, content: 'internal helper' }),
+          checkpointLine(4, { status: 'IN_PROGRESS', content: '<summary>\npartial\n</summary>' }),
+          userLine(5, '/compact'),
+          checkpointLine(6, {
+            content:
+              '# Resuming from a compaction\n\n<summary>\n## Summary\nKept key architecture decisions.\n</summary>\n\n# Conversation Logs',
+            inTok: 400,
+            cacheTok: 15000,
+            outTok: 280,
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const firstCp = tracker.getLatestCheckpoint();
+      expect(firstCp).toEqual({
+        stepIndex: 6,
+        userInputsBefore: 3,
+        precededByCompactCommand: true,
+        toolCallsBeforeInTurn: 0,
+        assistantResponsesBeforeInTurn: 0,
+        summaryText: '## Summary\nKept key architecture decisions.',
+        createdAt: '2026-11-23T10:00:06Z',
+        tokensBefore: 15400,
+        summaryTokens: 280,
+      });
+
+      // Incrementally append Turn 3 (auto-compaction without /compact command, no <summary> tags -> trimmed raw fallback)
+      await appendFile(
+        transcriptFile,
+        [
+          userLine(7, 'Continue implementing tests'),
+          checkpointLine(9, {
+            content: '  Plain fallback compaction summary  ',
+            inTok: 200,
+            cacheTok: 8000,
+            outTok: 190,
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      await tracker.syncFromTranscript();
+      const secondCp = tracker.getLatestCheckpoint();
+      expect(secondCp).toEqual({
+        stepIndex: 9,
+        userInputsBefore: 4,
+        precededByCompactCommand: false,
+        toolCallsBeforeInTurn: 0,
+        assistantResponsesBeforeInTurn: 0,
+        summaryText: 'Plain fallback compaction summary',
+        createdAt: '2026-11-23T10:00:09Z',
+        tokensBefore: 8200,
+        summaryTokens: 190,
+      });
+
+      // Apply onto TranscriptStore: 4 turns, boundary advances to Turn 3, idempotent on re-apply
+      const store = new TranscriptStore({ now: () => 1_700_000_000_000 });
+      store.beginUserTurn('Hello project');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('Inspect codebase');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('/compact');
+      store.finishActiveTurn('end_turn');
+      store.beginUserTurn('Continue implementing tests');
+      store.finishActiveTurn('end_turn');
+
+      expect(store.applyTranscriptCompactionCheckpoint(firstCp!)).toBe(true);
+      expect(store.compactedBeforeTurnIndex).toBe(2);
+      expect(store.getVisibleTranscriptSlice(true).hiddenCompactedTurnCount).toBe(2);
+      expect(store.getVisibleTranscriptSlice(true).turns.map(t => t.index)).toEqual([2, 3]);
+      // Idempotent on same checkpoint
+      expect(store.applyTranscriptCompactionCheckpoint(firstCp!)).toBe(false);
+
+      // Advancing to second checkpoint hides Turns 0..2
+      expect(store.applyTranscriptCompactionCheckpoint(secondCp!)).toBe(true);
+      expect(store.compactedBeforeTurnIndex).toBe(3);
+      expect(store.getVisibleTranscriptSlice(true).hiddenCompactedTurnCount).toBe(3);
+      expect(store.getVisibleTranscriptSlice(true).turns.map(t => t.index)).toEqual([3]);
+
+      // Disabling collapseCompacted reveals all 4 turns without mutating underlying turns
+      expect(store.getVisibleTranscriptSlice(false).turns.map(t => t.index)).toEqual([0, 1, 2, 3]);
+      expect(store.getVisibleTranscriptSlice(false).hasCompactedHistory).toBe(false);
+
+      // Mid-turn auto-compaction places notice strictly after pre-checkpoint tool #2 and before post-checkpoint tools/reply
+      await writeFile(
+        transcriptFile,
+        [
+          userLine(0, 'Old turn'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, content: 'Old reply', input_tokens: 100, output_tokens: 10 }),
+          userLine(2, 'Long investigative turn'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, content: 'Initial plan', input_tokens: 120, output_tokens: 15 }),
+          JSON.stringify({ type: 'GENERIC', step_index: 4, status: 'DONE', content: 'Tool 1 out' }),
+          JSON.stringify({ type: 'GENERIC', step_index: 5, status: 'DONE', content: 'Tool 2 out' }),
+          checkpointLine(6, { content: '<summary>Mid-turn compacted</summary>', inTok: 500, cacheTok: 1000, outTok: 90 }),
+          JSON.stringify({ type: 'GENERIC', step_index: 7, status: 'DONE', content: 'Tool 3 out' }),
+          JSON.stringify({ type: 'GENERIC', step_index: 8, status: 'DONE', content: 'Tool 4 out' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 9, content: 'Final answer after compaction', input_tokens: 300, output_tokens: 40 }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      const midCp = tracker.getLatestCheckpoint();
+      expect(midCp).toBeDefined();
+      expect(midCp?.toolCallsBeforeInTurn).toBe(2);
+      expect(midCp?.assistantResponsesBeforeInTurn).toBe(1);
+
+      const midStore = new TranscriptStore({ now: () => 1_700_000_100_000 });
+      midStore.beginUserTurn('Old turn', [], { isReplaying: true });
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Old reply' } }, { isReplaying: true });
+      midStore.beginUserTurn('Long investigative turn', [], { isReplaying: true });
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Initial plan' } }, { isReplaying: true });
+      for (let i = 1; i <= 4; i++) {
+        midStore.applySessionUpdate(
+          { sessionUpdate: 'tool_call', toolCallId: `mid-tc-${i}`, name: 'run_command', kind: 'execute', status: 'completed', title: `cmd ${i}` },
+          { isReplaying: true },
+        );
+      }
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Final answer after compaction' } }, { isReplaying: true });
+      midStore.finalizeReplayedTurns();
+
+      expect(midStore.applyTranscriptCompactionCheckpoint(midCp!)).toBe(true);
+      const targetMidTurn = midStore.turns[1]!;
+      expect(targetMidTurn.timeline.map(r => `${r.kind}:${r.id}`)).toEqual([
+        `assistant:${targetMidTurn.assistantSegments[0]!.id}`,
+        'tool:mid-tc-1',
+        'tool:mid-tc-2',
+        `notice:${targetMidTurn.notices[0]!.id}`,
+        'tool:mid-tc-3',
+        'tool:mid-tc-4',
+        `assistant:${targetMidTurn.assistantSegments[1]!.id}`,
+      ]);
+
+      // File truncation resets checkpoint state cleanly
+      await writeFile(
+        transcriptFile,
+        userLine(0, 'Fresh after truncate') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestCheckpoint()).toBeNull();
+
+      // Re-add checkpoint, then verify reset() and setSession() clear it
+      await appendFile(
+        transcriptFile,
+        checkpointLine(1, { content: '<summary>Reloaded</summary>' }) + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestCheckpoint()?.summaryText).toBe('Reloaded');
+      tracker.reset();
+      expect(tracker.getLatestCheckpoint()).toBeNull();
+      tracker.setSession(null);
+      expect(tracker.getLatestCheckpoint()).toBeNull();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('SessionMetricsTracker background task tracking & resume baseline', () => {
+  test('parses RUNNING background tasks & SYSTEM_MESSAGE completions, honors resume baseline, and resets on truncation', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-bg-metrics-'));
+    try {
+      const sessionId = 'sess-bg-metrics-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const runningLine = (step: number, taskId: string, desc: string, logTail = 'step completed\r\n') =>
+        JSON.stringify({
+          step_index: step,
+          source: 'MODEL',
+          type: 'GENERIC',
+          status: 'RUNNING',
+          created_at: `2026-11-23T11:35:0${Math.min(9, step)}Z`,
+          content: [
+            `Created At: 2026-11-23T11:35:0${Math.min(9, step)}+08:00`,
+            `Tool is running as a background task with task id: ${taskId}`,
+            `Task Description: ${desc}`,
+            `Task logs are available at: file:///tmp/${taskId.replace('/', '_')}.log`,
+            'Log output:',
+            logTail,
+          ].join('\n'),
+        });
+
+      const sysDoneLine = (step: number, taskId: string, verb = 'finished', extra = '') =>
+        JSON.stringify({
+          step_index: step,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: `2026-11-23T11:36:0${Math.min(9, step)}Z`,
+          content: `<SYSTEM_MESSAGE>\nTask id "${taskId}" ${verb}${extra}\n</SYSTEM_MESSAGE>`,
+        });
+
+      await writeFile(
+        transcriptFile,
+        [
+          runningLine(1, `${sessionId}/task-1`, 'historical orphaned server'),
+          runningLine(2, `${sessionId}/task-2`, 'historical finished build'),
+          sysDoneLine(3, `${sessionId}/task-2`, 'finished', ' with result:\nCommand exited with code 0.'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const beforeBaseline = tracker.getTranscriptBackgroundTasks();
+      expect(beforeBaseline.find(t => t.taskId === `${sessionId}/task-1`)?.status).toBe('running');
+      expect(beforeBaseline.find(t => t.taskId === `${sessionId}/task-2`)?.status).toBe('completed');
+
+      // Pin baseline on /resume so historical orphaned RUNNING tasks do not light up the live HUD
+      tracker.markTranscriptBackgroundBaseline();
+      const afterBaseline = tracker.getTranscriptBackgroundTasks();
+      expect(afterBaseline.some(t => t.taskId === `${sessionId}/task-1`)).toBe(false);
+      expect(afterBaseline.find(t => t.taskId === `${sessionId}/task-2`)?.status).toBe('completed');
+
+      // New RUNNING tasks with terminal words inside CommandLine / Log output must still parse cleanly
+      await appendFile(
+        transcriptFile,
+        [
+          runningLine(5, `${sessionId}/task-5`, 'echo step completed && sleep 13', 'build finished step 1\ncancelled warning ignored'),
+          runningLine(6, `${sessionId}/task-6`, 'sleep 20 && echo fail-test'),
+          runningLine(7, `${sessionId}/task-7`, 'sleep 30'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const live = tracker.getTranscriptBackgroundTasks();
+      const t5 = live.find(t => t.taskId === `${sessionId}/task-5`);
+      expect(t5?.status).toBe('running');
+      expect(t5?.description).toBe('echo step completed && sleep 13');
+      expect(t5?.logPath).toBe(`file:///tmp/${sessionId}_task-5.log`);
+      expect(t5?.startedAt).toBe(Date.parse('2026-11-23T11:35:05Z'));
+
+      // Terminal transitions: finished -> completed, failed -> failed, killed -> cancelled; duplicate RUNNING never resurrects
+      await appendFile(
+        transcriptFile,
+        [
+          sysDoneLine(8, `${sessionId}/task-5`, 'finished', ' with result: ok'),
+          sysDoneLine(8, `${sessionId}/task-6`, 'failed', ' with error'),
+          sysDoneLine(8, `${sessionId}/task-7`, 'killed'),
+          runningLine(9, `${sessionId}/task-5`, 'duplicate stale line'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const settled = tracker.getTranscriptBackgroundTasks();
+      expect(settled.find(t => t.taskId === `${sessionId}/task-5`)?.status).toBe('completed');
+      expect(settled.find(t => t.taskId === `${sessionId}/task-6`)?.status).toBe('failed');
+      expect(settled.find(t => t.taskId === `${sessionId}/task-7`)?.status).toBe('cancelled');
+
+      // Real agy `was canceled with result:`, `timed out`, and server-restart bulk stop notices
+      await appendFile(
+        transcriptFile,
+        [
+          runningLine(10, `${sessionId}/task-10`, 'sleep 100 && echo canceled'),
+          runningLine(11, `${sessionId}/task-11`, 'sleep 200 && echo timeout'),
+          runningLine(12, `${sessionId}/task-12`, 'sleep 300 && echo restart'),
+          sysDoneLine(13, `${sessionId}/task-10`, 'was canceled', ' with result:\nTool execution was canceled'),
+          sysDoneLine(14, `${sessionId}/task-11`, 'timed out', ' after 120s'),
+          JSON.stringify({
+            step_index: 15,
+            source: 'SYSTEM',
+            type: 'SYSTEM_MESSAGE',
+            status: 'DONE',
+            created_at: '2026-11-23T11:37:00Z',
+            content: '<SYSTEM_MESSAGE>\n[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>',
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const realVariants = tracker.getTranscriptBackgroundTasks();
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-10`)?.status).toBe('cancelled');
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-11`)?.status).toBe('failed');
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-12`)?.status).toBe('cancelled');
+
+      // Truncation clears background task tracker and baseline cleanly
+      await writeFile(transcriptFile, JSON.stringify({ type: 'USER_INPUT', step_index: 0, content: 'hi' }) + '\n', 'utf8');
+      await tracker.syncFromTranscript();
+      expect(tracker.getTranscriptBackgroundTasks()).toEqual([]);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('parses one-shot Timer, recurring Cron, manage_task kill/status/list outputs, and ignores run_command false matches', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-bg-sched-'));
+    try {
+      const sessionId = '6af6570b-c084-4eb5-8f9f-fedaeb495f58';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const runningStep = (step: number, taskId: string, desc: string, ts: string) =>
+        JSON.stringify({
+          step_index: step,
+          source: 'MODEL',
+          type: 'GENERIC',
+          status: 'RUNNING',
+          created_at: ts,
+          content: [
+            `Created At: ${ts}`,
+            `Tool is running as a background task with task id: ${taskId}`,
+            `Task Description: ${desc}`,
+            `Task logs are available at: file:///tmp/task-${step}.log`,
+          ].join('\n'),
+        });
+
+      const sysMsgStep = (step: number, sender: string, body: string, ts: string) =>
+        JSON.stringify({
+          step_index: step,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: ts,
+          content: [
+            '<SYSTEM_MESSAGE>',
+            `[Message] timestamp=${ts} sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=${body}`,
+            '</SYSTEM_MESSAGE>',
+          ].join('\n'),
+        });
+
+      await writeFile(
+        transcriptFile,
+        [
+          runningStep(80, `${sessionId}/task-80`, 'Timer: 20s, Prompt: Check server d73d9d79 status and logs', '2026-11-23T05:59:37Z'),
+          runningStep(146, `${sessionId}/task-146`, 'Cron: */2 * * * *, Prompt: Check if panel returns 200. When ready, cancel this schedule task via manage_task.', '2026-11-23T06:11:17Z'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const started = tracker.getTranscriptBackgroundTasks();
+      const timer80 = started.find((t) => t.taskId === `${sessionId}/task-80`);
+      const cron146 = started.find((t) => t.taskId === `${sessionId}/task-146`);
+      expect(timer80?.status).toBe('running');
+      expect(timer80?.scheduleKind).toBe('timer');
+      expect(cron146?.status).toBe('running');
+      expect(cron146?.scheduleKind).toBe('cron');
+
+      // Cron tick stays running; one-shot timer fire settles to completed
+      await appendFile(
+        transcriptFile,
+        [
+          sysMsgStep(82, `${sessionId}/task-80`, 'Check server d73d9d79 status and logs', '2026-11-23T05:59:57Z'),
+          sysMsgStep(149, `${sessionId}/task-146`, 'Check if panel returns 200. When ready, cancel this schedule task via manage_task.', '2026-11-23T06:12:35Z'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const afterTick = tracker.getTranscriptBackgroundTasks();
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-80`)?.status).toBe('completed');
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-80`)?.endedAt).toBe(Date.parse('2026-11-23T05:59:57Z'));
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-146`)?.status).toBe('running');
+
+      // Cron terminal completion settles cron job to completed
+      await appendFile(
+        transcriptFile,
+        `${sysMsgStep(189, `${sessionId}/task-146`, 'Cron schedule completed after reaching its maximum of 10 iterations.', '2026-11-23T06:30:35Z')}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getTranscriptBackgroundTasks().find((t) => t.taskId === `${sessionId}/task-146`)?.status).toBe('completed');
+
+      // Concurrent timers + manage_task kill + manage_task status + run_command non-match + manage_task list sweep
+      await appendFile(
+        transcriptFile,
+        [
+          runningStep(256, `${sessionId}/task-256`, 'Timer: 45s, Prompt: Check running state', '2026-11-23T06:41:09Z'),
+          runningStep(259, `${sessionId}/task-259`, 'Timer: 45s, Prompt: dummy', '2026-11-23T06:41:18Z'),
+          runningStep(260, `${sessionId}/task-260`, 'sleep 60', '2026-11-23T06:41:19Z'),
+          JSON.stringify({
+            step_index: 261,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:21Z',
+            content: [
+              'Created At: 2026-11-23T14:41:21+08:00',
+              'Completed At: 2026-11-23T14:41:22+08:00',
+              'Created At: 2026-11-23T14:41:21+08:00',
+              'Completed At: 2026-11-23T14:41:22+08:00',
+              `Task "${sessionId}/task-259" cancelled.`,
+            ].join('\n'),
+          }),
+          JSON.stringify({
+            step_index: 262,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:23Z',
+            content: `Created At: 2026-11-23T14:41:23+08:00\nCompleted At: 2026-11-23T14:41:23+08:00\nTask: ${sessionId}/task-260 | Status: RUNNING | Log: file:///tmp/t260.log`,
+          }),
+          JSON.stringify({
+            step_index: 263,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:24Z',
+            content: 'Created At: 2026-11-23T14:41:24+08:00\nCompleted At: 2026-11-23T14:41:24+08:00\nCommand exited with code 0.\n\nCommand output:\nNo background tasks are currently running.',
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const mid = tracker.getTranscriptBackgroundTasks();
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-259`)?.status).toBe('cancelled');
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-256`)?.status).toBe('running');
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-260`)?.status).toBe('running');
+
+      // Status FAILED settles task-260, and manage_task(list) empty output settles remaining running tasks without resetAll
+      await appendFile(
+        transcriptFile,
+        [
+          JSON.stringify({
+            step_index: 264,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:30Z',
+            content: `Created At: 2026-11-23T14:41:30+08:00\nCompleted At: 2026-11-23T14:41:30+08:00\nTask: ${sessionId}/task-260 | Status: FAILED | Log: file:///tmp/t260.log`,
+          }),
+          JSON.stringify({
+            step_index: 292,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:44:54Z',
+            content: [
+              'Created At: 2026-11-23T14:44:54+08:00',
+              'Completed At: 2026-11-23T14:44:55+08:00',
+              'Created At: 2026-11-23T14:44:54+08:00',
+              'Completed At: 2026-11-23T14:44:55+08:00',
+              'No background tasks are currently running.',
+            ].join('\n'),
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const finalTasks = tracker.getTranscriptBackgroundTasks();
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-259`)?.status).toBe('cancelled');
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-260`)?.status).toBe('failed');
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-256`)?.status).toBe('completed');
+      expect(tracker.getLatestTurnActivity()?.resetAll).toBeUndefined();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('tracks hasTranscriptData and latest turn step activity across planner tool calls, empty/error thoughts, final replies, and truncation/reset', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-turn-act-'));
+    try {
+      const sessionId = 'sess-turn-act-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      expect(tracker.hasTranscriptData).toBe(false);
+      expect(tracker.getLatestTurnActivity()).toBeNull();
+
+      await writeFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'USER_INPUT', step_index: 1, content: '<USER_REQUEST>Fix</USER_REQUEST>' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.hasTranscriptData).toBe(true);
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 1, latestKind: 'user_input' });
+
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'GENERIC', status: 'RUNNING', step_index: 2, content: 'Tool is running as a background task with task id: s/t-1' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 2, latestKind: 'tool_running' });
+
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 3, content: '<SYSTEM_MESSAGE>Task id "s/t-1" finished</SYSTEM_MESSAGE>' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 3, latestKind: 'system_message' });
+
+      // Planner progress update WITH pending tool_calls must NOT classify as planner_final
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 4, status: 'DONE', content: 'Checking...', tool_calls: [{ name: 'read_file' }] })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 4, latestKind: 'planner_tool_call' });
+
+      // Empty thinking / empty output before retry error must NOT classify as planner_final
+      await appendFile(
+        transcriptFile,
+        [
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 5, status: 'DONE', thinking: 'hmm' }),
+          JSON.stringify({ type: 'ERROR_MESSAGE', step_index: 6, content: 'empty output' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 6, latestKind: 'system_message' });
+
+      // Final assistant response with non-empty content and no tool_calls -> planner_final
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 7, status: 'DONE', content: 'All done.' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 7, latestKind: 'planner_final' });
+
+      tracker.reset();
+      expect(tracker.hasTranscriptData).toBe(false);
+      expect(tracker.getLatestTurnActivity()).toBeNull();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

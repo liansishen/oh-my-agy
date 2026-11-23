@@ -4,6 +4,7 @@ import type { ToolDisplayMode } from '../config/config';
 import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
+import { isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
 import {
   estimateTokensFromText,
   formatFullLocalTime,
@@ -23,6 +24,7 @@ export interface TranscriptCallbacks {
   readonly onToggleTool: (toolCallId: string, collapsed: boolean) => void;
   readonly onToggleToolGroup?: (groupId: string, expanded: boolean) => void;
   readonly onToggleNotice: (noticeId: string, collapsed: boolean) => void;
+  readonly onToggleCompactedHistory?: (show: boolean) => void;
   readonly onToggleAgent: (agentId: string, collapsed: boolean) => void;
   readonly onApproveTool: (toolCallId: string, action: ApprovalAction) => void;
   readonly onCopyMessage: (text: string) => void;
@@ -56,6 +58,10 @@ export interface TranscriptViewProps {
   readonly version: string;
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
+  readonly hiddenCompactedTurnCount?: number;
+  readonly totalCompactedTurnCount?: number;
+  readonly hasCompactedHistory?: boolean;
+  readonly compactedHistoryExpanded?: boolean;
   readonly now?: number;
   readonly callbacks: TranscriptCallbacks;
 }
@@ -166,11 +172,11 @@ function computeCompletedTurnMemoKey(
       diffSig += `,${d.path}:${hashTextFingerprint(d.patchText ?? '')}:${hashTextFingerprint(d.oldText ?? '')}:${hashTextFingerprint(d.newText ?? '')}`;
     }
     parts.push(
-      `tc:${tc.toolCallId}:${tc.displayName}:${tc.kind ?? ''}:${tc.targetKind}:${tc.status}:${tc.collapsed ? 1 : 0}:${tc.cancelled ? 1 : 0}:${tc.exitCode ?? ''}:${tc.tookMs ?? ''}:${tc.endedAt ?? ''}:${tc.locations.length}:${hashTextFingerprint(tc.outputText)}:${diffSig}:${tc.awaitingPermission ? 1 : 0}:${tc.approved ?? ''}:${hashTextFingerprint(tc.title)}:${hashTextFingerprint(tc.target ?? '')}:${hashTextFingerprint(tc.intent ?? '')}`,
+      `tc:${tc.toolCallId}:${tc.displayName}:${tc.kind ?? ''}:${tc.targetKind}:${tc.status}:${tc.collapsed ? 1 : 0}:${tc.cancelled ? 1 : 0}:${tc.exitCode ?? ''}:${tc.tookMs ?? ''}:${tc.endedAt ?? ''}:${tc.backgroundRunning ? 1 : 0}:${tc.backgroundTaskId ?? ''}:${tc.locations.length}:${hashTextFingerprint(tc.outputText)}:${diffSig}:${tc.awaitingPermission ? 1 : 0}:${tc.approved ?? ''}:${hashTextFingerprint(tc.title)}:${hashTextFingerprint(tc.target ?? '')}:${hashTextFingerprint(tc.intent ?? '')}`,
     );
   }
   for (const n of turn.notices) {
-    parts.push(`no:${n.id}:${n.collapsed ? 1 : 0}:${hashTextFingerprint(n.text)}:${hashTextFingerprint(n.summaryText)}`);
+    parts.push(`no:${n.id}:${n.status ?? ''}:${n.collapsed ? 1 : 0}:${hashTextFingerprint(n.text)}:${hashTextFingerprint(n.summaryText)}`);
   }
   for (const a of turn.agents) {
     parts.push(
@@ -359,6 +365,15 @@ function computeToolMeta(tool: ToolCallItem): readonly (readonly SpanData[])[] |
     const lineCount = tool.outputText.split(/\r?\n/).length;
     meta.push([{ t: `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`, s: 'muted mono' }]);
   }
+  if (tool.backgroundRunning) {
+    const shortTaskId = tool.backgroundTaskId?.split('/').pop();
+    meta.push([
+      {
+        t: shortTaskId ? `background · ${shortTaskId}` : 'background',
+        s: 'warning mono',
+      },
+    ]);
+  }
   return meta.length > 0 ? meta : undefined;
 }
 
@@ -398,8 +413,10 @@ function renderBashRunBody(
   turnStatus: TranscriptTurn['status'],
   now: number
 ): JSX.Element {
-  const runTone =
-    tool.status === 'error'
+  const isBgRunning = Boolean(tool.backgroundRunning);
+  const runTone = isBgRunning
+    ? 'warning'
+    : tool.status === 'error'
       ? 'error'
       : tool.status === 'cancelled'
         ? 'warning'
@@ -408,7 +425,8 @@ function renderBashRunBody(
           : undefined;
   const cmdText = tool.target || tool.title;
   const isRunning =
-    tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming';
+    isBgRunning ||
+    (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming');
   const liveAgeMs = Math.max(0, now - tool.startedAt);
   const stoppedMs =
     tool.tookMs !== undefined
@@ -416,8 +434,9 @@ function renderBashRunBody(
       : !tool.replayed && tool.endedAt !== undefined
         ? Math.max(0, tool.endedAt - tool.startedAt)
         : undefined;
-  const stateLabel =
-    isRunning
+  const stateLabel = isBgRunning
+    ? 'background'
+    : isRunning
       ? 'running'
       : tool.status === 'ask'
         ? 'awaiting approval'
@@ -426,8 +445,9 @@ function renderBashRunBody(
           : tool.exitCode !== undefined
             ? `exit ${tool.exitCode}`
             : tool.status;
-  const stateStyle =
-    tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
+  const stateStyle = isBgRunning
+    ? 'warning mono'
+    : tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
       ? 'error mono'
       : tool.status === 'done'
         ? 'success mono'
@@ -602,12 +622,16 @@ function renderToolItem(
   nodeKey: string = tool.toolCallId
 ): JSX.Element {
   const isAsk = tool.status === 'ask';
+  const isBgRunning = Boolean(tool.backgroundRunning);
+  const effectiveStatus = isBgRunning ? 'running' : tool.status;
   const isToolRunning =
-    tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming';
+    isBgRunning ||
+    (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming');
   const isPendingOrRunning =
-    (tool.status === 'pending' || tool.status === 'running') &&
-    tool.endedAt === undefined &&
-    turnStatus === 'streaming';
+    isBgRunning ||
+    ((tool.status === 'pending' || tool.status === 'running') &&
+      tool.endedAt === undefined &&
+      turnStatus === 'streaming');
   const toolAge = isToolRunning ? Math.max(0, now - tool.startedAt) : undefined;
   const toolTook = isToolRunning
     ? undefined
@@ -645,6 +669,98 @@ function renderToolItem(
       >
         {relatedAgents.map(ag => renderAgentRow(ag, turnStatus, now, callbacks.onToggleAgent))}
       </tool>
+    );
+  }
+
+  if (tool.isOmaTodo) {
+    const snap = tool.todoSnapshot;
+    const status = snap?.isError ? 'error' : isToolRunning ? 'running' : effectiveStatus;
+
+    if (snap?.isError) {
+      return (
+        <tool
+          key={nodeKey}
+          role="omp.tool.todo"
+          name="todo"
+          title="Todo"
+          status={status}
+          age={toolAge}
+          took={toolTook}
+          frame="card"
+          preview="none"
+          collapsed={false}
+        >
+          <text
+            key="err"
+            spans={[{ t: snap.text || 'Todo operation failed', s: 'error' }]}
+            wrap="word"
+          />
+        </tool>
+      );
+    }
+
+    if (snap) {
+      const nonEmptyPhases = snap.phases.filter(p => p.tasks.length > 0);
+      const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
+      const done = nonEmptyPhases.reduce(
+        (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+        0
+      );
+      return (
+        <tool
+          key={nodeKey}
+          role="omp.tool.todo"
+          name="todo"
+          title="Todo"
+          target={total > 0 ? `${done}/${total}` : undefined}
+          targetKind={total > 0 ? 'text' : undefined}
+          status={status}
+          age={toolAge}
+          took={toolTook}
+          frame="card"
+          preview="none"
+          collapsed={false}
+        >
+          {total === 0 ? (
+            <text
+              key="empty"
+              spans={[{ t: snap.text || 'No todos', s: 'muted' }]}
+              wrap="word"
+            />
+          ) : (
+            <checklist
+              key="checklist"
+              mode="full"
+              phases={mapTodoPhasesToChecklist(nonEmptyPhases)}
+            />
+          )}
+        </tool>
+      );
+    }
+
+    const rawRec =
+      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
+        ? (tool.rawInput as Record<string, unknown>)
+        : tool.args;
+    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
+    return (
+      <tool
+        key={nodeKey}
+        role="omp.tool.todo"
+        name="todo"
+        title="Todo"
+        target={inFlightOp}
+        targetKind={inFlightOp ? 'text' : undefined}
+        status={status}
+        age={toolAge}
+        took={toolTook}
+        frame="card"
+        preview="none"
+        confirm={isAsk ? 'card' : undefined}
+        ask={isAsk ? tool.ask : undefined}
+        approved={tool.approved}
+        onAction={approvalHandlers}
+      />
     );
   }
 
@@ -689,7 +805,7 @@ function renderToolItem(
       href={href}
       meta={meta}
       exit={tool.exitCode}
-      status={tool.status}
+      status={effectiveStatus}
       age={toolAge}
       took={toolTook}
       frame={frame}
@@ -894,6 +1010,7 @@ function isRoutineCollapsibleTool(
 ): boolean {
   if (relatedAgents.length > 0) return false;
   if (tool.status === 'ask') return false;
+  if (tool.backgroundRunning) return false;
   if (
     (tool.status === 'pending' || tool.status === 'running') &&
     tool.endedAt === undefined &&
@@ -1170,6 +1287,10 @@ function renderTurnFooterNodes(
  */
 export function TranscriptView(props: TranscriptViewProps): JSX.Element {
   const { state, turns, plan, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
+  const hasCompactedHistory = Boolean(props.hasCompactedHistory);
+  const compactedHistoryExpanded = Boolean(props.compactedHistoryExpanded);
+  const hiddenCompactedTurnCount = props.hiddenCompactedTurnCount ?? 0;
+  const totalCompactedTurnCount = props.totalCompactedTurnCount ?? hiddenCompactedTurnCount;
   const now = props.now ?? Date.now();
   const lastTurn = turns[turns.length - 1];
   const isEvicted = (key: string): boolean => Boolean(evictedNodeIds?.has(`main.${key}`));
@@ -1188,7 +1309,7 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
 
   return (
     <col role="omp.transcript">
-      {turns.length === 0 ? (
+      {turns.length === 0 && !hasCompactedHistory ? (
         <card key="welcome" role="omp.welcome">
           <row key="lockup" align="center" gap="md" role="omp.welcome.lockup">
             {state.welcomeLogoBlobId ? (
@@ -1234,6 +1355,39 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
             />
           </row>
         </card>
+      ) : null}
+
+      {hasCompactedHistory ? (
+        <row
+          key="compacted-history"
+          role="omp.compaction.hidden"
+          align="center"
+          gap="sm"
+        >
+          <icon key="icon" name="info" role="omp.compaction.hidden-icon" />
+          <text
+            key="label"
+            grow={1}
+            shrink={1}
+            wrap="word"
+            spans={[
+              {
+                t: compactedHistoryExpanded
+                  ? `Showing ${totalCompactedTurnCount} earlier compacted ${totalCompactedTurnCount === 1 ? 'turn' : 'turns'}`
+                  : `${hiddenCompactedTurnCount} earlier ${hiddenCompactedTurnCount === 1 ? 'turn' : 'turns'} hidden after compaction`,
+                s: 'muted',
+              },
+            ]}
+          />
+          <button
+            key="toggle"
+            role="omp.compaction.toggle"
+            text={compactedHistoryExpanded ? 'Hide earlier' : 'Show earlier'}
+            size="sm"
+            variant="quiet"
+            onClick={() => callbacks.onToggleCompactedHistory?.(!compactedHistoryExpanded)}
+          />
+        </row>
       ) : null}
 
       {turns.flatMap(turn => {
@@ -1589,7 +1743,7 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
         return turnNodes;
       })}
 
-      {plan && plan.entries.length > 0 ? (
+      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool' ? (
         <tool
           key="plan"
           role="omp.tool.todo"

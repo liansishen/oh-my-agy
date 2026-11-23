@@ -100,6 +100,8 @@ export interface ComposerViewProps {
   readonly state: AppState;
   readonly draft: DraftState;
   readonly plan: PlanState | null;
+  readonly todoExpanded?: boolean;
+  readonly todoHudDismissed?: boolean;
   readonly jobs?: BackgroundJobsSnapshot;
   readonly hasTurns: boolean;
   readonly commands?: readonly SlashCommandDef[];
@@ -271,6 +273,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     state,
     draft,
     plan,
+    todoExpanded,
+    todoHudDismissed,
     jobs,
     commands,
     workingStartedAt,
@@ -330,7 +334,11 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
           ? `Swarm running (${swarmWorkingCount} active)…`
           : 'Swarm running…'
         : 'Background task running…';
-  const hasPlan = Boolean(plan && plan.entries.length > 0);
+  const hasPlan = Boolean(
+    !todoHudDismissed &&
+      plan &&
+      ((plan.phases && plan.phases.some(p => p.items.length > 0)) || plan.entries.length > 0)
+  );
 
   // Aggregate `agents` (or swarm bee) and `jobs` segments for `omp.hud`
   const swarmActiveCount = state.activeSwarmCount ?? 0;
@@ -345,10 +353,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     swarmActiveCount,
     jobs?.inspectableAgentCount ?? 0
   );
-  const runningJobs = Math.max(
-    jobs?.runningJobCount ?? 0,
-    jobs?.detachedTaskCount ?? 0
-  );
+  const runningJobs = jobs?.runningJobCount ?? 0;
 
   const showSwarmBeeSeg = hasSwarm;
   const showGenericAgentsSeg = !hasSwarm && (runningAgents > 0 || inspectableAgents > 0);
@@ -386,6 +391,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const modeLabel = controls.currentModeName || modeId;
   const showModeChip = modeId !== 'default';
   const isOrchestratorActive = isOrchestratorModelId(controls.currentModelId);
+  const isOrchestratorWorking = isOrchestratorActive && (state.isStreaming || isBackgroundBusy);
+  const orchestratorMark = isOrchestratorWorking ? 'working' : undefined;
   const effortLevel = normalizeEffortLevel(controls.currentThoughtLevel);
   const effortDisplay =
     controls.currentThoughtLevelName || controls.currentThoughtLevel || effortLevel;
@@ -548,18 +555,32 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
               key="todo"
               mode="hud"
               role="omp.hud.todo"
-              phases={[
-                {
-                  id: 'plan',
-                  title: 'Plan',
-                  items: plan.entries.map(e => ({
-                    id: e.id,
-                    text: e.text,
-                    status: e.status,
-                    note: e.priority ? `[${e.priority}]` : undefined,
-                  })),
-                },
-              ]}
+              phases={
+                plan.phases && plan.phases.length > 0
+                  ? plan.phases.map(phase => ({
+                      id: phase.id,
+                      title: phase.title,
+                      ...(!todoExpanded && phase.collapsed ? { collapsed: true } : {}),
+                      items: phase.items.map(e => ({
+                        id: e.id,
+                        text: e.text,
+                        status: e.status,
+                        ...(e.note ? { note: e.note } : {}),
+                      })),
+                    }))
+                  : [
+                      {
+                        id: 'plan',
+                        title: 'Plan',
+                        items: plan.entries.map(e => ({
+                          id: e.id,
+                          text: e.text,
+                          status: e.status,
+                          note: e.priority ? `[${e.priority}]` : undefined,
+                        })),
+                      },
+                    ]
+              }
             />
           ) : null}
         </row>
@@ -647,6 +668,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
           <row
             key="model"
             role={isOrchestratorActive ? 'oma.composer.model.orchestrator' : 'omp.composer.model'}
+            mark={orchestratorMark}
             gap="xs"
             align="center"
             title="Switch model  ⌥P"
@@ -687,6 +709,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             <row
               key="planner"
               role="oma.composer.planner"
+              mark={orchestratorMark}
               gap="xs"
               align="center"
               tone="info"
@@ -726,6 +749,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             <row
               key="executor"
               role="oma.composer.executor"
+              mark={orchestratorMark}
               gap="xs"
               align="center"
               tone="success"

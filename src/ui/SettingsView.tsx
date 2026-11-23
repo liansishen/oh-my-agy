@@ -277,6 +277,17 @@ function buildPageSections(
         },
       },
       {
+        id: 'ui.collapse_compacted',
+        label: 'Hide Compacted History',
+        hint: 'Hide earlier turns before the latest compaction boundary to keep long sessions fast',
+        changed: config.ui.collapse_compacted !== DEFAULT_CONFIG.ui.collapse_compacted,
+        defaultLabel: 'On',
+        control: {
+          k: 'switch',
+          on: config.ui.collapse_compacted,
+        },
+      },
+      {
         id: 'ui.tool_display',
         label: 'Tool Call Display',
         hint: 'Show full previews (All), single-line inline rows (Compact), or hide completed runs (Alt+O / Ctrl+Shift+O)',
