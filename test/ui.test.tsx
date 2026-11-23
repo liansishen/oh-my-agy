@@ -10678,4 +10678,504 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await controller.shutdown({ cleanExit: true });
     await runPromise;
   });
+
+  test('embedded HTTP MCP todo tool, live HUD checklist, 60s auto-clear & /todo expand, silent auto-allow, /todo slash suite + <system-reminder>, and /resume replay', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let capturedNewSessionParams: Record<string, unknown> | undefined;
+    let capturedLoadSessionParams: Record<string, unknown> | undefined;
+    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
+    const sentPermissions: unknown[] = [];
+
+    const replaySessionId = 'sess-todo-replay';
+    const liveSessionId = 'sess-todo-live';
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/new') {
+        capturedNewSessionParams = msg.params;
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: liveSessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/list') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              {
+                sessionId: replaySessionId,
+                cwd: tmp,
+                title: 'Resumed Todo Session',
+                updatedAt: '2026-11-23T14:00:00.000Z',
+              },
+            ],
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/load') {
+        capturedLoadSessionParams = msg.params;
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: 'Plan migration' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'replay-todo-1',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'in_progress',
+              rawInput: {
+                op: 'init',
+                list: [
+                  { phase: 'Prep', items: ['Audit API', 'Check schema'] },
+                  { phase: 'Ship', items: ['Deploy build'] },
+                ],
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'replay-todo-1',
+              status: 'completed',
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'replay-todo-2',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'completed',
+              rawInput: {
+                op: 'done',
+                task: ['Audit API', 'Check schema'],
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: replaySessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Prep finished.' },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: replaySessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/prompt') {
+        const blocks = ((msg.params?.prompt as Array<{ type?: string; text?: string }>) ?? []).map(
+          b => ({ type: b.type, text: b.text }),
+        );
+        sentPrompts.push(blocks);
+        const promptText = blocks.map(b => b.text ?? '').join('\n');
+        const mcpServers = (capturedNewSessionParams?.mcpServers as Array<{ name?: string; url?: string }>) ?? [];
+        const todoUrl = mcpServers.find(s => s.name === 'oma_todo')?.url;
+
+        if (promptText.includes('Start multi-phase work')) {
+          void (async () => {
+            // Simulate permission prompt for todo -> must be auto-allowed silently
+            h.send({
+              jsonrpc: '2.0',
+              id: 701,
+              method: 'session/request_permission',
+              params: {
+                sessionId: liveSessionId,
+                toolCall: {
+                  toolCallId: 'todo-live-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                },
+                options: [{ optionId: 'allow-once-id', name: 'Allow once', kind: 'allow_once' }],
+              },
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'in_progress',
+                  rawInput: {
+                    op: 'init',
+                    list: [
+                      { phase: 'Phase 1', items: ['Step A'] },
+                      { phase: 'Phase 2', items: ['Step B'] },
+                    ],
+                  },
+                },
+              },
+            });
+
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 11,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: {
+                    op: 'init',
+                    list: [
+                      { phase: 'Phase 1', items: ['Step A'] },
+                      { phase: 'Phase 2', items: ['Step B'] },
+                    ],
+                  },
+                },
+              }),
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'todo-live-1',
+                  status: 'completed',
+                },
+              },
+            });
+
+            // Complete Step A so Phase 1 is collapsed in HUD and Step B becomes active
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 12,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: { op: 'done', task: 'Step A' },
+                },
+              }),
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-2',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'done', task: 'Step A' },
+                },
+              },
+            });
+
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Phase 1 complete.' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
+        }
+
+        if (promptText.includes('Finish remaining work')) {
+          void (async () => {
+            await fetch(todoUrl!, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 13,
+                method: 'tools/call',
+                params: {
+                  _meta: {
+                    'antigravity.google/root_conversation_id': liveSessionId,
+                  },
+                  name: 'todo',
+                  arguments: { op: 'done', task: 'Step B' },
+                },
+              }),
+            });
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: liveSessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'todo-live-3',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'done', task: 'Step B' },
+                },
+              },
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
+        }
+
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+
+      if (msg.id === 701) {
+        sentPermissions.push(msg.result);
+        return;
+      }
+
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    type ReplayedWireNode = { id: string; k: string; p: Record<string, unknown> };
+    const replayNodes = () => {
+      const nodes = new Map<string, ReplayedWireNode>();
+      const addSubtree = (n: WireNode) => {
+        nodes.set(n.id, { id: n.id, k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const child of n.c) addSubtree(child);
+      };
+      const delSubtree = (prefix: string) => {
+        for (const k of [...nodes.keys()]) {
+          if (k === prefix || k.startsWith(`${prefix}.`)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const clipboardWritten: string[] = [];
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      clipboard: {
+        isRemoteSshWithoutDisplay: () => false,
+        readImage: async () => null,
+        readText: async () => '',
+        writeText: async text => {
+          clipboardWritten.push(text);
+          return true;
+        },
+      },
+      editTodoExternal: async () => '# Edited Phase\n- [x] Task X\n- [ ] Task Y\n',
+      todoAutoClearDelayMs: 50,
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Verify session/new injected oma_todo HTTP MCP + _meta.antigravity.systemPrompt.append
+    const newMcp = capturedNewSessionParams?.mcpServers as Array<{ type?: string; name?: string; url?: string }>;
+    expect(newMcp).toHaveLength(1);
+    expect(newMcp[0]?.type).toBe('http');
+    expect(newMcp[0]?.name).toBe('oma_todo');
+    expect(newMcp[0]?.url).toContain('http://127.0.0.1:');
+    const newMeta = capturedNewSessionParams?._meta as { antigravity?: { systemPrompt?: { append?: string } } };
+    expect(newMeta?.antigravity?.systemPrompt?.append).toContain('mcp_oma_todo_todo');
+
+    // 2. Run multi-phase live MCP tool calls -> in-place omp.tool.todo + live HUD + silent auto-allow
+    await controller.submitInput('Start multi-phase work');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => {
+      const m = replayNodes();
+      return m.has('dock.activity.todo') && m.has('main.t0-todo-live-2');
+    });
+
+    // Silent auto-allow responded without creating approval card
+    expect(sentPermissions).toEqual([{ outcome: { outcome: 'selected', optionId: 'allow-once-id' } }]);
+
+    const liveNodes = replayNodes();
+    const card2 = liveNodes.get('main.t0-todo-live-2');
+    expect(card2?.p['role']).toBe('omp.tool.todo');
+    expect(card2?.p['title']).toBe('Todo');
+    expect(card2?.p['target']).toBe('1/2');
+    expect(card2?.p['preview']).toBe('none');
+    expect(liveNodes.has('main.plan')).toBe(false);
+    expect(liveNodes.has('dock.hud.running.jobs')).toBe(false);
+
+    const hudTodo = liveNodes.get('dock.activity.todo');
+    expect(hudTodo?.p['role']).toBe('omp.hud.todo');
+    expect(hudTodo?.p['mode']).toBe('hud');
+    const hudPhases = hudTodo?.p['phases'] as Array<{ title: string; collapsed?: boolean; items: Array<{ status: string }> }>;
+    expect(hudPhases).toHaveLength(2);
+    expect(hudPhases[0]?.collapsed).toBe(true);
+    expect(hudPhases[0]?.items[0]?.status).toBe('done');
+    expect(hudPhases[1]?.collapsed).toBeUndefined();
+    expect(hudPhases[1]?.items[0]?.status).toBe('active');
+
+    // 3. Complete remaining work -> 50ms auto-dismiss hides HUD, `/todo expand` reveals uncollapsed
+    await controller.submitInput('Finish remaining work');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.activity.todo'));
+
+    await controller.submitInput('/todo expand');
+    await waitFor(() => replayNodes().has('dock.activity.todo'));
+    const revealedPhases = replayNodes().get('dock.activity.todo')?.p['phases'] as Array<{ collapsed?: boolean }>;
+    expect(revealedPhases.every(p => p.collapsed === undefined)).toBe(true);
+
+    // 4. Full `/todo` slash commands + next-turn <system-reminder> injection
+    await controller.submitInput('/todo copy');
+    expect(clipboardWritten[0]).toContain('# Phase 1');
+
+    const exportPath = join(tmp, 'custom-todo.md');
+    await controller.submitInput(`/todo export ${exportPath}`);
+    expect(existsSync(exportPath)).toBe(true);
+
+    await controller.submitInput('/todo edit');
+    await waitFor(() => {
+      const p = replayNodes().get('dock.activity.todo')?.p['phases'] as Array<{ title: string }> | undefined;
+      return Boolean(p && p[0]?.title === 'Edited Phase');
+    });
+
+    await controller.submitInput('/todo append "Verify" Run final smoke check');
+    await controller.submitInput('/todo start smoke');
+    await controller.submitInput('/todo drop smoke');
+    await controller.submitInput('/todo rm smoke');
+    expect(controller.store.transcript.todoPhases.some(p => p.name === 'Verify')).toBe(false);
+
+    await controller.submitInput('Continue after manual todo edit');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    const lastOutbound = sentPrompts[sentPrompts.length - 1] ?? [];
+    expect(lastOutbound.some(b => (b.text ?? '').includes('<system-reminder>'))).toBe(true);
+    expect(lastOutbound.some(b => b.text === 'Continue after manual todo edit')).toBe(true);
+
+    await controller.submitInput('/todo import custom-todo.md');
+    expect(controller.store.transcript.todoPhases[0]?.name).toBe('Phase 1');
+
+    await controller.submitInput('/todo rm');
+    await waitFor(() => !replayNodes().has('dock.activity.todo'));
+
+    // 5. Switch session -> `session/load` receives mcpServers & deterministically reconstructs todo HUD/cards
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        !controller.store.getState().picker?.loading
+    );
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().sessionId === replaySessionId);
+    await waitFor(() => replayNodes().has('dock.activity.todo'));
+
+    const loadMcp = capturedLoadSessionParams?.mcpServers as Array<{ name?: string; url?: string }>;
+    expect(loadMcp?.[0]?.name).toBe('oma_todo');
+    const replayedNodes = replayNodes();
+    expect(replayedNodes.get('main.t0-replay-todo-2')?.p['target']).toBe('2/3');
+    expect(replayedNodes.has('main.plan')).toBe(false);
+    const replayedHudPhases = replayedNodes.get('dock.activity.todo')?.p['phases'] as Array<{ title: string; collapsed?: boolean }>;
+    expect(replayedHudPhases.map(p => p.title)).toEqual(['1. Prep', '2. Ship']);
+    expect(replayedHudPhases[0]?.collapsed).toBe(true);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
 });

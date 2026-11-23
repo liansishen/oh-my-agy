@@ -647,7 +647,7 @@ export interface ToolCallDeltaUpdate extends ToolCallFields {
 
 export type PlanEntryPriority = "high" | "medium" | "low";
 export type PlanEntryStatus = "pending" | "in_progress" | "completed";
-export type TspChecklistStatus = "pending" | "active" | "done";
+export type TspChecklistStatus = "pending" | "active" | "done" | "dropped";
 
 export interface PlanEntry {
   content: string;

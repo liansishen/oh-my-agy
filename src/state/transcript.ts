@@ -40,10 +40,20 @@ import {
   type UnknownSessionUpdate,
 } from '../acp/protocol';
 import type { ApprovalDecision, MappedPermissionOptions } from './approval';
+import type { TodoServerUpdateEvent } from '../mcp/todo_server';
 import type {
   TranscriptBackgroundTaskRecord,
   TranscriptCompactionCheckpoint,
 } from './session_metrics';
+import {
+  applyTodoOperation,
+  cloneTodoPhases,
+  isOmaTodoToolName,
+  isTodoTaskFinished,
+  mapTodoPhasesToChecklist,
+  type TodoOp,
+  type TodoPhase,
+} from './todo';
 
 export const LONG_RUNNING_TOOL_THRESHOLD_MS = 10_000;
 
@@ -138,6 +148,13 @@ export interface ToolCallItem {
   backgroundTaskId?: string;
   /** True while actively tracked as a running background task. */
   backgroundRunning?: boolean;
+  /** Authoritative structured snapshot captured from oma's embedded `todo` MCP tool. */
+  todoSnapshot?: {
+    readonly phases: readonly TodoPhase[];
+    readonly op: TodoOp;
+    readonly isError: boolean;
+    readonly text: string;
+  };
 }
 
 export type SubagentTspStatus =
@@ -194,11 +211,21 @@ export interface PlanItemState {
   readonly id: string;
   readonly text: string;
   readonly priority?: PlanEntryPriority;
+  readonly note?: string;
   readonly status: TspChecklistStatus;
+}
+
+export interface PlanPhaseState {
+  readonly id: string;
+  readonly title: string;
+  readonly items: readonly PlanItemState[];
+  readonly collapsed?: boolean;
 }
 
 export interface PlanState {
   readonly entries: readonly PlanItemState[];
+  readonly phases?: readonly PlanPhaseState[];
+  readonly source?: 'acp' | 'todo_tool';
   readonly updatedAt: number;
 }
 
@@ -456,6 +483,10 @@ export function mapToolDisplayMeta(
   kind?: string,
   rawName?: string,
 ): { displayName: string; targetKind: TspToolTargetKind } {
+  if (isOmaTodoToolName(rawName)) {
+    return { displayName: 'todo', targetKind: 'text' };
+  }
+
   const k = kind?.toLowerCase();
   const n = rawName?.toLowerCase();
 
@@ -792,6 +823,8 @@ const SYNC_ONLY_TOOL_NAMES = new Set([
   'define_subagent',
   'manage_subagents',
   'send_message',
+  'todo',
+  'mcp_oma_todo_todo',
 ]);
 
 function isSynchronousMcpCommandTool(tool: ToolCallItem): boolean {
@@ -1554,6 +1587,15 @@ export class TranscriptStore {
   private readonly _now: () => number;
   private _turns: TranscriptTurn[] = [];
   private _plan: PlanState | null = null;
+  private _todoPhases: TodoPhase[] = [];
+  private _replayedTodoPhases: TodoPhase[] = [];
+  private readonly _pendingTodoSnapshots: Array<{
+    readonly phases: TodoPhase[];
+    readonly op: TodoOp;
+    readonly isError: boolean;
+    readonly text: string;
+    readonly rawOp?: string;
+  }> = [];
   private _activeTurnIndex: number | null = null;
 
   private readonly _toolIndex = new Map<string, { turnIndex: number; tool: ToolCallItem }>();
@@ -1576,6 +1618,91 @@ export class TranscriptStore {
 
   get plan(): PlanState | null {
     return this._plan;
+  }
+
+  get todoPhases(): readonly TodoPhase[] {
+    return this._todoPhases;
+  }
+
+  setTodoPhases(
+    phases: readonly TodoPhase[],
+    _options: { readonly source?: 'todo_tool' | 'user' } = {},
+  ): void {
+    const cloned = cloneTodoPhases(phases).filter((phase) => phase.tasks.length > 0);
+    this._todoPhases = cloned;
+    if (cloned.length === 0) {
+      if (this._plan?.source === 'todo_tool') {
+        this._plan = null;
+      }
+      return;
+    }
+
+    const checklistPhases = mapTodoPhasesToChecklist(cloned);
+    const entries: PlanItemState[] = checklistPhases.flatMap((phase) =>
+      phase.items.map((item) => ({
+        id: item.id,
+        text: item.text,
+        ...(item.note !== undefined ? { note: item.note } : {}),
+        status: item.status,
+      })),
+    );
+    this._plan = {
+      entries,
+      phases: checklistPhases,
+      source: 'todo_tool',
+      updatedAt: this._now(),
+    };
+  }
+
+  applyLiveTodoToolResult(event: TodoServerUpdateEvent): void {
+    const snapshot = {
+      phases: cloneTodoPhases(event.phases),
+      op: event.op,
+      isError: event.isError,
+      text: event.text,
+    };
+    if (!event.isError && event.op !== 'view') {
+      this.setTodoPhases(snapshot.phases, { source: 'todo_tool' });
+    }
+
+    let matchedTool: { turn: TranscriptTurn; tool: ToolCallItem } | undefined;
+    for (let i = this._turns.length - 1; i >= 0 && !matchedTool; i--) {
+      const turn = this._turns[i]!;
+      for (let j = turn.toolCalls.length - 1; j >= 0; j--) {
+        const tool = turn.toolCalls[j]!;
+        if (isOmaTodoToolName(tool.rawName, tool.title) && !tool.todoSnapshot) {
+          matchedTool = { turn, tool };
+          break;
+        }
+      }
+    }
+
+    if (matchedTool) {
+      this.assignTodoSnapshotToTool(matchedTool.turn, matchedTool.tool, snapshot);
+      return;
+    }
+
+    const argRec = asRecord(event.rawArgs);
+    const rawOp = typeof argRec?.op === 'string' ? argRec.op.trim().toLowerCase() : undefined;
+    this._pendingTodoSnapshots.push({ ...snapshot, rawOp });
+  }
+
+  addInfoNotice(text: string, level: NoticeItem['level'] = 'info'): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const turn = this.ensureActiveTurn(false);
+    const notice: NoticeItem = {
+      id: `notice-${this._idSeq++}`,
+      kind: 'notice',
+      level,
+      text: trimmed,
+      summaryText: '',
+      collapsed: false,
+      timestamp: this._now(),
+    };
+    turn.notices.push(notice);
+    turn.timeline.push({ kind: 'notice', id: notice.id });
+    this.bumpTurn(turn);
   }
 
   get activeTurn(): TranscriptTurn | undefined {
@@ -2093,6 +2220,15 @@ export class TranscriptStore {
           }
           this.syncSubagentsForTool(turn, tool);
         }
+        if (isOmaTodoToolName(tool.rawName, tool.title)) {
+          tool.displayName = 'todo';
+          tool.targetKind = 'text';
+          tool.title = 'Todo';
+          tool.intent = undefined;
+          if (!tool.todoSnapshot && (tool.rawInput !== undefined || tool.args !== undefined)) {
+            this.applyReplayedTodoTool(turn, tool);
+          }
+        }
       }
       this.bumpTurn(turn);
     }
@@ -2273,6 +2409,7 @@ export class TranscriptStore {
             ...(e.priority !== undefined ? { priority: e.priority } : {}),
             status: mapPlanStatusToChecklist(e.status),
           })),
+          source: 'acp',
           updatedAt: now,
         };
         return { handled: true };
@@ -3259,6 +3396,9 @@ export class TranscriptStore {
   clear(): void {
     this._turns = [];
     this._plan = null;
+    this._todoPhases = [];
+    this._replayedTodoPhases = [];
+    this._pendingTodoSnapshots.length = 0;
     this._activeTurnIndex = null;
     this._toolIndex.clear();
     this._detachedBgTasks.clear();
@@ -3477,6 +3617,7 @@ export class TranscriptStore {
         if (!isReplaying) {
           this.syncBackgroundTaskForTool(existingTurn.index, tool);
         }
+        this.syncTodoToolState(existingTurn, tool, isReplaying);
       }
       return tool;
     }
@@ -3560,8 +3701,101 @@ export class TranscriptStore {
     if (!isReplaying) {
       this.syncBackgroundTaskForTool(turn.index, tool);
     }
+    this.syncTodoToolState(turn, tool, isReplaying);
 
     return tool;
+  }
+
+  private assignTodoSnapshotToTool(
+    turn: TranscriptTurn,
+    tool: ToolCallItem,
+    snapshot: {
+      readonly phases: readonly TodoPhase[];
+      readonly op: TodoOp;
+      readonly isError: boolean;
+      readonly text: string;
+    },
+  ): void {
+    tool.displayName = 'todo';
+    tool.targetKind = 'text';
+    tool.title = 'Todo';
+    tool.intent = undefined;
+    tool.todoSnapshot = {
+      phases: cloneTodoPhases(snapshot.phases),
+      op: snapshot.op,
+      isError: snapshot.isError,
+      text: snapshot.text,
+    };
+    const total = snapshot.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+    const done = snapshot.phases.reduce(
+      (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+      0,
+    );
+    tool.target = !snapshot.isError && total > 0 ? `${done}/${total}` : undefined;
+    this.bumpTurn(turn);
+  }
+
+  private applyReplayedTodoTool(turn: TranscriptTurn, tool: ToolCallItem): void {
+    const rawArgs = tool.rawInput ?? tool.args;
+    if (rawArgs === undefined) return;
+    const outcome = applyTodoOperation(this._replayedTodoPhases, rawArgs);
+    if (!outcome.isError && outcome.op !== 'view' && tool.acpStatus !== 'failed') {
+      this._replayedTodoPhases = cloneTodoPhases(outcome.phases);
+      this.setTodoPhases(outcome.phases, { source: 'todo_tool' });
+    }
+    this.assignTodoSnapshotToTool(turn, tool, {
+      phases: outcome.phases,
+      op: outcome.op,
+      isError: outcome.isError,
+      text: outcome.text,
+    });
+  }
+
+  private syncTodoToolState(
+    turn: TranscriptTurn,
+    tool: ToolCallItem,
+    isReplaying: boolean,
+  ): void {
+    if (!isOmaTodoToolName(tool.rawName, tool.title)) return;
+    tool.displayName = 'todo';
+    tool.targetKind = 'text';
+    tool.title = 'Todo';
+    tool.intent = undefined;
+    if (!tool.userToggled) {
+      tool.collapsed = false;
+    }
+    if (tool.todoSnapshot) {
+      const total = tool.todoSnapshot.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+      const done = tool.todoSnapshot.phases.reduce(
+        (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+        0,
+      );
+      tool.target = !tool.todoSnapshot.isError && total > 0 ? `${done}/${total}` : undefined;
+      return;
+    }
+
+    if (isReplaying) {
+      if (tool.acpStatus === 'completed' || tool.acpStatus === 'failed') {
+        this.applyReplayedTodoTool(turn, tool);
+      }
+      return;
+    }
+
+    if (this._pendingTodoSnapshots.length > 0) {
+      const argRec = asRecord(tool.rawInput) ?? asRecord(tool.args);
+      const opVal = typeof argRec?.op === 'string' ? argRec.op.trim().toLowerCase() : undefined;
+      const matchIdx = opVal
+        ? this._pendingTodoSnapshots.findIndex((s) => s.rawOp === opVal)
+        : tool.acpStatus === 'completed' || tool.acpStatus === 'failed'
+          ? 0
+          : -1;
+      if (matchIdx >= 0) {
+        const pending = this._pendingTodoSnapshots.splice(matchIdx, 1)[0];
+        if (pending) {
+          this.assignTodoSnapshotToTool(turn, tool, pending);
+        }
+      }
+    }
   }
 
   private syncBackgroundTaskForTool(turnIndex: number, tool: ToolCallItem): void {

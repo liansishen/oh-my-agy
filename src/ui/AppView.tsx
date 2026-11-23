@@ -31,6 +31,8 @@ export interface AppViewProps {
   readonly turns: readonly TranscriptTurn[];
   readonly transcriptTurns?: readonly TranscriptTurn[];
   readonly plan: PlanState | null;
+  readonly todoExpanded?: boolean;
+  readonly todoHudDismissed?: boolean;
   readonly jobs?: BackgroundJobsSnapshot;
   readonly version: string;
   readonly commands: readonly SlashCommandDef[];
@@ -118,6 +120,8 @@ export function buildAppView(props: AppViewProps): ViewInput {
     turns,
     transcriptTurns,
     plan,
+    todoExpanded,
+    todoHudDismissed,
     jobs,
     version,
     commands,
@@ -159,6 +163,8 @@ export function buildAppView(props: AppViewProps): ViewInput {
       state={state}
       draft={draft}
       plan={plan}
+      todoExpanded={todoExpanded}
+      todoHudDismissed={todoHudDismissed}
       jobs={jobs}
       hasTurns={turns.length > 0}
       commands={commands}

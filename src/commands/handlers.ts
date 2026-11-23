@@ -51,6 +51,7 @@ export type CommandAction =
   | { readonly type: 'set_thought'; readonly level: string }
   | { readonly type: 'set_thinking_display'; readonly mode: 'on' | 'off' | 'toggle' }
   | { readonly type: 'set_mode'; readonly mode: string }
+  | { readonly type: 'todo'; readonly argsText: string }
   | { readonly type: 'open_help' }
   | { readonly type: 'quit' }
   | {
@@ -99,6 +100,7 @@ export interface CommandActionExecutor {
   setThought(level: string): void | Promise<void>;
   setThinkingDisplay?(mode: 'on' | 'off' | 'toggle'): void | Promise<void>;
   setMode(mode: string): void | Promise<void>;
+  handleTodo?(argsText: string): void | Promise<void>;
   openHelp(): void | Promise<void>;
   quit(): void | Promise<void>;
   passthroughPrompt(text: string, commandName: string, source: 'oma' | 'agy'): void | Promise<void>;
@@ -410,6 +412,8 @@ function buildBuiltinAction(
       return { type: 'open_jobs' };
     case 'git':
       return { type: 'open_git' };
+    case 'todo':
+      return { type: 'todo', argsText: parsed.argsText };
   }
 }
 
@@ -487,6 +491,9 @@ export async function executeCommandAction(
       return;
     case 'set_mode':
       await executor.setMode(action.mode);
+      return;
+    case 'todo':
+      await executor.handleTodo?.(action.argsText);
       return;
     case 'open_help':
       await executor.openHelp();

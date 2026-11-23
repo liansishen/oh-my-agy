@@ -4,6 +4,7 @@ import type { ToolDisplayMode } from '../config/config';
 import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
+import { isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
 import {
   estimateTokensFromText,
   formatFullLocalTime,
@@ -668,6 +669,98 @@ function renderToolItem(
       >
         {relatedAgents.map(ag => renderAgentRow(ag, turnStatus, now, callbacks.onToggleAgent))}
       </tool>
+    );
+  }
+
+  if (tool.displayName === 'todo') {
+    const snap = tool.todoSnapshot;
+    const status = snap?.isError ? 'error' : isToolRunning ? 'running' : effectiveStatus;
+
+    if (snap?.isError) {
+      return (
+        <tool
+          key={nodeKey}
+          role="omp.tool.todo"
+          name="todo"
+          title="Todo"
+          status={status}
+          age={toolAge}
+          took={toolTook}
+          frame="card"
+          preview="none"
+          collapsed={false}
+        >
+          <text
+            key="err"
+            spans={[{ t: snap.text || 'Todo operation failed', s: 'error' }]}
+            wrap="word"
+          />
+        </tool>
+      );
+    }
+
+    if (snap) {
+      const nonEmptyPhases = snap.phases.filter(p => p.tasks.length > 0);
+      const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
+      const done = nonEmptyPhases.reduce(
+        (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+        0
+      );
+      return (
+        <tool
+          key={nodeKey}
+          role="omp.tool.todo"
+          name="todo"
+          title="Todo"
+          target={total > 0 ? `${done}/${total}` : undefined}
+          targetKind={total > 0 ? 'text' : undefined}
+          status={status}
+          age={toolAge}
+          took={toolTook}
+          frame="card"
+          preview="none"
+          collapsed={false}
+        >
+          {total === 0 ? (
+            <text
+              key="empty"
+              spans={[{ t: snap.text || 'No todos', s: 'muted' }]}
+              wrap="word"
+            />
+          ) : (
+            <checklist
+              key="checklist"
+              mode="full"
+              phases={mapTodoPhasesToChecklist(nonEmptyPhases)}
+            />
+          )}
+        </tool>
+      );
+    }
+
+    const rawRec =
+      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
+        ? (tool.rawInput as Record<string, unknown>)
+        : tool.args;
+    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
+    return (
+      <tool
+        key={nodeKey}
+        role="omp.tool.todo"
+        name="todo"
+        title="Todo"
+        target={inFlightOp}
+        targetKind={inFlightOp ? 'text' : undefined}
+        status={status}
+        age={toolAge}
+        took={toolTook}
+        frame="card"
+        preview="none"
+        confirm={isAsk ? 'card' : undefined}
+        ask={isAsk ? tool.ask : undefined}
+        approved={tool.approved}
+        onAction={approvalHandlers}
+      />
     );
   }
 
@@ -1650,7 +1743,7 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
         return turnNodes;
       })}
 
-      {plan && plan.entries.length > 0 ? (
+      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool' ? (
         <tool
           key="plan"
           role="omp.tool.todo"

@@ -100,6 +100,8 @@ export interface ComposerViewProps {
   readonly state: AppState;
   readonly draft: DraftState;
   readonly plan: PlanState | null;
+  readonly todoExpanded?: boolean;
+  readonly todoHudDismissed?: boolean;
   readonly jobs?: BackgroundJobsSnapshot;
   readonly hasTurns: boolean;
   readonly commands?: readonly SlashCommandDef[];
@@ -271,6 +273,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     state,
     draft,
     plan,
+    todoExpanded,
+    todoHudDismissed,
     jobs,
     commands,
     workingStartedAt,
@@ -330,7 +334,11 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
           ? `Swarm running (${swarmWorkingCount} active)…`
           : 'Swarm running…'
         : 'Background task running…';
-  const hasPlan = Boolean(plan && plan.entries.length > 0);
+  const hasPlan = Boolean(
+    !todoHudDismissed &&
+      plan &&
+      ((plan.phases && plan.phases.some(p => p.items.length > 0)) || plan.entries.length > 0)
+  );
 
   // Aggregate `agents` (or swarm bee) and `jobs` segments for `omp.hud`
   const swarmActiveCount = state.activeSwarmCount ?? 0;
@@ -545,18 +553,32 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
               key="todo"
               mode="hud"
               role="omp.hud.todo"
-              phases={[
-                {
-                  id: 'plan',
-                  title: 'Plan',
-                  items: plan.entries.map(e => ({
-                    id: e.id,
-                    text: e.text,
-                    status: e.status,
-                    note: e.priority ? `[${e.priority}]` : undefined,
-                  })),
-                },
-              ]}
+              phases={
+                plan.phases && plan.phases.length > 0
+                  ? plan.phases.map(phase => ({
+                      id: phase.id,
+                      title: phase.title,
+                      ...(!todoExpanded && phase.collapsed ? { collapsed: true } : {}),
+                      items: phase.items.map(e => ({
+                        id: e.id,
+                        text: e.text,
+                        status: e.status,
+                        ...(e.note ? { note: e.note } : {}),
+                      })),
+                    }))
+                  : [
+                      {
+                        id: 'plan',
+                        title: 'Plan',
+                        items: plan.entries.map(e => ({
+                          id: e.id,
+                          text: e.text,
+                          status: e.status,
+                          note: e.priority ? `[${e.priority}]` : undefined,
+                        })),
+                      },
+                    ]
+              }
             />
           ) : null}
         </row>

@@ -1,4 +1,5 @@
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   connect,
@@ -44,6 +45,7 @@ import {
   type AcpIncomingRequest,
   type AuthMethod,
   type ContentBlock,
+  type McpServerConfig,
   type SessionUpdateParams,
 } from '../acp/protocol';
 import {
@@ -84,6 +86,7 @@ import {
 import { nextCodePointOffset, prevCodePointOffset } from '../editor/draft';
 import { extractFileMentions } from '../editor/trigger';
 import { WorkspaceFileIndexer } from '../filesearch/indexer';
+import { EmbeddedTodoMcpServer, type TodoServerUpdateEvent } from '../mcp/todo_server';
 import {
   getDataDir,
   PreviewStore,
@@ -124,6 +127,23 @@ import {
   type ResumeSessionEntry,
   type SkillItem,
 } from '../state/store';
+import {
+  applyTodoOperation,
+  areAllTodosFinished,
+  cloneTodoPhases,
+  findTodoPhaseFuzzy,
+  findTodoTaskFuzzy,
+  formatPhaseDisplayTitle,
+  formatTodoMarkdown,
+  formatUserTodoSyncReminder,
+  isOmaTodoToolName,
+  normalizeSingleInProgress,
+  OMA_TODO_SYSTEM_PROMPT_APPEND,
+  parseTodoMarkdown,
+  TODO_AUTO_CLEAR_DELAY_MS,
+  TODO_HELP_TEXT,
+  type TodoPhase,
+} from '../state/todo';
 import {
   buildElicitationContent,
   type AttachmentItem,
@@ -259,6 +279,12 @@ export interface AppControllerOptions {
   readonly replayDrainQuietMs?: number;
   /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
   readonly terminalRows?: number;
+  /** Optional delay override (ms) before auto-hiding completed HUD todos (< 0 disables auto-hide). Default: 60000. */
+  readonly todoAutoClearDelayMs?: number;
+  /** Enable embedded HTTP MCP `todo` tool server injection (default: true). */
+  readonly enableTodoMcp?: boolean;
+  /** Optional external editor hook override for `/todo edit` in offline tests. */
+  readonly editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
 }
 
 function cloneConfig(config: OmaConfig): OmaConfig {
@@ -337,6 +363,35 @@ function guessMimeType(filePath: string): string {
   }
 }
 
+function splitTodoShellArgs(raw: string): string[] {
+  const tokens: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (ch === '\\' && i + 1 < raw.length) {
+      cur += raw[++i]!;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (!inQuotes && /\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur);
+        cur = '';
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.length > 0) {
+    tokens.push(cur);
+  }
+  return tokens;
+}
+
 function looksBinary(bytes: Uint8Array): boolean {
   const checkLen = Math.min(bytes.byteLength, 8192);
   for (let i = 0; i < checkLen; i++) {
@@ -408,9 +463,17 @@ export class AppController {
   readonly #backgroundWakeupGraceMs: number;
   readonly #replayDrainInitialQuietMs: number;
   readonly #replayDrainActiveQuietMs: number;
+  readonly #todoAutoClearDelayMs: number;
+  readonly #enableTodoMcp: boolean;
+  readonly #editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
   readonly #metricsTracker: SessionMetricsTracker;
 
   #acpClient: AcpClient | null = null;
+  #todoServer: EmbeddedTodoMcpServer | null = null;
+  #todoExpanded = false;
+  #todoHudDismissed = false;
+  #todoAutoClearTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #pendingTodoSyncReminder: string | null = null;
   #swarmWatcher: SwarmBoardWatcher | null = null;
   #swarmWatcherSessionId: string | null = null;
   #lastTpsStoreFlushAt = 0;
@@ -507,6 +570,12 @@ export class AppController {
       options.replayDrainQuietMs !== undefined
         ? Math.max(0, options.replayDrainQuietMs)
         : DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS;
+    this.#todoAutoClearDelayMs =
+      options.todoAutoClearDelayMs !== undefined
+        ? options.todoAutoClearDelayMs
+        : TODO_AUTO_CLEAR_DELAY_MS;
+    this.#enableTodoMcp = options.enableTodoMcp ?? true;
+    this.#editTodoExternal = options.editTodoExternal;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
       now: this.#now,
@@ -786,6 +855,9 @@ export class AppController {
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
     this.#clearToolWatchTimer();
+    this.#clearTodoAutoClearTimer();
+    this.#todoServer?.dispose();
+    this.#todoServer = null;
     this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
@@ -937,6 +1009,11 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     this.#clearToolWatchTimer();
     this.#clearDoneIdleTimer();
+    this.#clearTodoAutoClearTimer();
+    this.#todoExpanded = false;
+    this.#todoHudDismissed = false;
+    this.#pendingTodoSyncReminder = null;
+    this.#todoServer?.setActiveSessionId(null);
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
@@ -1166,7 +1243,10 @@ export class AppController {
 
     const createEpoch = this.#beginSessionTransition('creating');
     try {
-      const created = await client.newSession({ cwd, mcpServers: [] });
+      const created = await client.newSession({
+        cwd,
+        ...this.#buildSessionBootstrapOptions(),
+      });
       if (this.#shuttingDown || !this.#isAcpClientLive(client) || createEpoch !== this.#sessionEpoch) {
         throw new Error('ACP connection closed while creating session');
       }
@@ -1179,6 +1259,7 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#todoServer?.setActiveSessionId(created.sessionId);
       this.#lastCommittedSessionId = created.sessionId;
       this.#lastCommittedCwd = cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
@@ -1275,7 +1356,7 @@ export class AppController {
       const loaded = await client.loadSession({
         sessionId,
         cwd,
-        mcpServers: [],
+        ...this.#buildSessionBootstrapOptions(),
       });
 
       if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
@@ -1294,6 +1375,9 @@ export class AppController {
       }
 
       this.store.transcript.finalizeReplayedTurns();
+      this.#todoServer?.setActiveSessionId(loaded.sessionId);
+      this.#todoServer?.seedSession(loaded.sessionId, this.store.transcript.todoPhases);
+      this.#scheduleTodoAutoClearIfDone();
       const loadedTier = client.currentTier ?? extractSessionTier(loaded._meta);
       this.store.applySessionSnapshot({
         sessionId: loaded.sessionId,
@@ -1752,6 +1836,21 @@ export class AppController {
           .respondToServerRequest(req.id, { outcome: { outcome: 'cancelled' } })
           .catch(() => {});
         return;
+      }
+      if (isOmaTodoToolName(req.params.toolCall.name, req.params.toolCall.title)) {
+        const options = req.params.options ?? [];
+        const allowOpt =
+          options.find(o => o.kind === 'allow_once') ??
+          options.find(o => o.kind === 'allow_always') ??
+          options[0];
+        if (allowOpt) {
+          void client
+            .respondToServerRequest(req.id, {
+              outcome: { outcome: 'selected', optionId: allowOpt.optionId },
+            })
+            .catch(() => {});
+          return;
+        }
       }
       const thoughtOpts = {
         autoCollapseThought: this.store.autoCollapseThought,
@@ -3350,6 +3449,9 @@ export class AppController {
       setMode: async (mode: string) => {
         await this.#applyMode(mode, false);
       },
+      handleTodo: async (argsText: string) => {
+        await this.#handleTodoCommand(argsText);
+      },
       openHelp: () => {
         this.#pickerLoadToken += 1;
         this.store.openHelp();
@@ -3470,9 +3572,17 @@ export class AppController {
             return;
           }
 
+          const reminderToSend = !isCompactPrompt ? this.#pendingTodoSyncReminder : null;
+          const outboundPrompt = reminderToSend
+            ? [{ type: 'text' as const, text: reminderToSend }, ...promptBlocks]
+            : promptBlocks;
+          if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
+            this.#pendingTodoSyncReminder = null;
+          }
+
           const result = await client.prompt({
             sessionId,
-            prompt: promptBlocks,
+            prompt: outboundPrompt,
           });
 
         if (
@@ -4669,6 +4779,7 @@ export class AppController {
           await client.cancel(oldSessionId).catch(() => {});
         }
         await client.closeSession(oldSessionId).catch(() => {});
+        this.#todoServer?.clearSession(oldSessionId);
       }
 
       if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) {
@@ -4952,6 +5063,7 @@ export class AppController {
         await client.cancel(oldId).catch(() => {});
       }
       await client.closeSession(oldId).catch(() => {});
+      this.#todoServer?.clearSession(oldId);
     }
 
     if (
@@ -4970,7 +5082,10 @@ export class AppController {
     }
 
     try {
-      const created = await client.newSession({ cwd: state.cwd, mcpServers: [] });
+      const created = await client.newSession({
+        cwd: state.cwd,
+        ...this.#buildSessionBootstrapOptions(),
+      });
       if (
         this.#shuttingDown ||
         !this.#isAcpClientLive(client) ||
@@ -4987,6 +5102,7 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
+      this.#todoServer?.setActiveSessionId(created.sessionId);
       this.#lastCommittedSessionId = created.sessionId;
       this.#lastCommittedCwd = state.cwd;
       if (this.#creatingSessionEpoch === createEpoch) {
@@ -5950,6 +6066,432 @@ export class AppController {
     this.syncFocus();
   }
 
+  #ensureTodoServer(): EmbeddedTodoMcpServer | null {
+    if (!this.#enableTodoMcp || this.#shuttingDown) {
+      return null;
+    }
+    if (this.#todoServer) {
+      return this.#todoServer;
+    }
+    try {
+      this.#todoServer = new EmbeddedTodoMcpServer({
+        version: OMA_VERSION,
+        onTodoChanged: event => {
+          this.#handleLiveTodoServerUpdate(event);
+        },
+      });
+      return this.#todoServer;
+    } catch {
+      return null;
+    }
+  }
+
+  #buildSessionBootstrapOptions(): {
+    mcpServers: McpServerConfig[];
+    _meta: Record<string, unknown>;
+  } {
+    const server = this.#ensureTodoServer();
+    return {
+      mcpServers: server ? [server.getMcpServerConfig()] : [],
+      _meta: {
+        antigravity: {
+          systemPrompt: {
+            append: OMA_TODO_SYSTEM_PROMPT_APPEND,
+          },
+        },
+      },
+    };
+  }
+
+  #clearTodoAutoClearTimer(): void {
+    if (this.#todoAutoClearTimer !== undefined) {
+      clearTimeout(this.#todoAutoClearTimer);
+      this.#todoAutoClearTimer = undefined;
+    }
+  }
+
+  #scheduleTodoAutoClearIfDone(): void {
+    this.#clearTodoAutoClearTimer();
+    const phases = this.store.transcript.todoPhases;
+    if (this.#todoHudDismissed || !areAllTodosFinished(phases)) {
+      return;
+    }
+    const delayMs = this.#todoAutoClearDelayMs;
+    if (!Number.isFinite(delayMs) || delayMs < 0) {
+      return;
+    }
+    const snapshotJson = JSON.stringify(phases);
+    const expectedEpoch = this.#sessionEpoch;
+    this.#todoAutoClearTimer = setTimeout(() => {
+      this.#todoAutoClearTimer = undefined;
+      if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
+      if (JSON.stringify(this.store.transcript.todoPhases) !== snapshotJson) return;
+      this.#todoHudDismissed = true;
+      this.scheduler.renderNow();
+    }, delayMs);
+    this.#todoAutoClearTimer.unref?.();
+  }
+
+  #handleLiveTodoServerUpdate(event: TodoServerUpdateEvent): void {
+    if (this.#shuttingDown) return;
+    const activeSessionId = this.store.getState().sessionId;
+    if (
+      activeSessionId &&
+      event.sessionId !== 'default' &&
+      event.sessionId !== activeSessionId
+    ) {
+      return;
+    }
+    this.store.transcript.applyLiveTodoToolResult(event);
+    if (!event.isError && event.op !== 'view') {
+      this.#pendingTodoSyncReminder = null;
+      this.#todoHudDismissed = false;
+      this.#scheduleTodoAutoClearIfDone();
+    }
+    this.scheduler.markDirty();
+  }
+
+  #commitUserTodoEdit(
+    nextPhases: readonly TodoPhase[],
+    reason: string,
+    options: { readonly removed?: boolean } = {}
+  ): void {
+    const cleaned = cloneTodoPhases(nextPhases).filter(phase => phase.tasks.length > 0);
+    this.store.transcript.setTodoPhases(cleaned, { source: 'user' });
+    const activeSessionId = this.store.getState().sessionId;
+    if (activeSessionId) {
+      this.#ensureTodoServer()?.seedSession(activeSessionId, cleaned);
+    }
+    this.#todoHudDismissed = false;
+    this.#scheduleTodoAutoClearIfDone();
+    this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
+      reason,
+      cleaned,
+      options.removed === true
+    );
+    this.scheduler.renderNow();
+  }
+
+  async #editTodoInExternalEditor(editorCmd: string, initialMd: string): Promise<string | null> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oma-todo-'));
+    const filePath = path.join(dir, 'todos.todo.md');
+    await writeFile(filePath, initialMd, 'utf8');
+    const wasRaw = Boolean((process.stdin as { isRaw?: boolean }).isRaw);
+    this.osc.showCursor();
+    this.surface.suspend();
+    try {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(false);
+      }
+      const editorArgs = splitTodoShellArgs(editorCmd);
+      if (editorArgs.length === 0) return null;
+      const proc = Bun.spawn([...editorArgs, filePath], {
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+      });
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) return null;
+      const edited = await readFile(filePath, 'utf8');
+      return edited === initialMd ? null : edited;
+    } finally {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(wasRaw || true);
+      }
+      this.surface.resume();
+      this.osc.setTitleAndHideCursor('oma · Antigravity');
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  async #handleTodoCommand(argsText: string): Promise<void> {
+    const trimmed = argsText.trim();
+    const state = this.store.getState();
+    const current = cloneTodoPhases(this.store.transcript.todoPhases);
+
+    if (!trimmed) {
+      if (current.length === 0) {
+        this.store.pushToast('No todos. Use /todo append <task> to start one.', 'info');
+      } else {
+        this.store.transcript.addInfoNotice(formatTodoMarkdown(current).trimEnd(), 'info');
+      }
+      this.scheduler.renderNow();
+      return;
+    }
+
+    const sepIdx = trimmed.search(/\s/);
+    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
+    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+
+    switch (verb) {
+      case 'expand': {
+        this.#todoExpanded = true;
+        this.#todoHudDismissed = false;
+        this.#clearTodoAutoClearTimer();
+        this.scheduler.renderNow();
+        this.store.pushToast('Expanded all todo phases in HUD', 'info', { ttl: 2000 });
+        return;
+      }
+      case 'collapse': {
+        this.#todoExpanded = false;
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'help':
+      case '?': {
+        this.store.transcript.addInfoNotice(TODO_HELP_TEXT, 'info');
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'copy': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to copy.', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        await this.#copyTextWithToast(
+          formatTodoMarkdown(current),
+          'Copied todos as Markdown to clipboard'
+        );
+        return;
+      }
+      case 'export': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to export.', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
+        try {
+          await mkdir(path.dirname(targetFile), { recursive: true });
+          await writeFile(targetFile, formatTodoMarkdown(current), 'utf8');
+          this.store.pushToast(`Wrote todos to ${targetFile}`, 'success', { ttl: 3000 });
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to write todos: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+        }
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'import': {
+        const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
+        let raw = '';
+        try {
+          raw = await readFile(targetFile, 'utf8');
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to read todos: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+          this.scheduler.renderNow();
+          return;
+        }
+        const parsed = parseTodoMarkdown(raw);
+        if (parsed.errors.length > 0) {
+          this.store.pushToast(`Could not parse ${targetFile}: ${parsed.errors[0]}`, 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(parsed.phases, `/todo import ${targetFile}`, { removed: true });
+        const total = parsed.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+        this.store.pushToast(
+          `Imported ${parsed.phases.length} phase(s), ${total} task(s) from ${targetFile}.`,
+          'success'
+        );
+        return;
+      }
+      case 'edit': {
+        const initialMd =
+          current.length > 0
+            ? formatTodoMarkdown(current)
+            : '# Todos\n- [ ] (replace this with your tasks)\n';
+        let editedMd: string | null = null;
+        if (this.#editTodoExternal) {
+          editedMd = await this.#editTodoExternal(initialMd);
+        } else {
+          const editorCmd = (process.env.VISUAL || process.env.EDITOR || '').trim();
+          if (!editorCmd) {
+            this.store.pushToast(
+              'No editor configured. Set $VISUAL or $EDITOR environment variable.',
+              'warning'
+            );
+            this.scheduler.renderNow();
+            return;
+          }
+          editedMd = await this.#editTodoInExternalEditor(editorCmd, initialMd);
+        }
+        if (editedMd === null) {
+          this.store.pushToast('Editor exited without saving; todos unchanged.', 'info');
+          this.scheduler.renderNow();
+          return;
+        }
+        const parsed = parseTodoMarkdown(editedMd);
+        if (parsed.errors.length > 0) {
+          this.store.pushToast(`Could not parse Markdown: ${parsed.errors[0]}`, 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(parsed.phases, '/todo edit', { removed: true });
+        const total = parsed.phases.reduce((sum, p) => sum + p.tasks.length, 0);
+        this.store.pushToast(`Updated todos (${total} task(s)).`, 'success');
+        return;
+      }
+      case 'append': {
+        const tokens = splitTodoShellArgs(rest);
+        if (tokens.length === 0) {
+          this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const phaseQuery = tokens.length === 1 ? undefined : tokens[0]!;
+        const taskText = (tokens.length === 1 ? tokens[0]! : tokens.slice(1).join(' ')).trim();
+        let targetPhase: TodoPhase | undefined;
+        if (phaseQuery) {
+          targetPhase = findTodoPhaseFuzzy(current, phaseQuery);
+          if (!targetPhase) {
+            targetPhase = { name: formatPhaseDisplayTitle(phaseQuery), tasks: [] };
+            current.push(targetPhase);
+          }
+        } else if (current.length > 0) {
+          targetPhase = current[current.length - 1];
+        } else {
+          targetPhase = { name: 'Todos', tasks: [] };
+          current.push(targetPhase);
+        }
+        if (!targetPhase || !taskText) {
+          this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        if (current.some(p => p.tasks.some(t => t.content === taskText))) {
+          this.store.pushToast(`Duplicate task "${taskText}".`, 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        targetPhase.tasks.push({ content: taskText, status: 'pending' });
+        normalizeSingleInProgress(current);
+        this.#commitUserTodoEdit(current, `/todo append -> ${targetPhase.name}`);
+        this.store.pushToast(`Appended to ${targetPhase.name}: ${taskText}`, 'success');
+        return;
+      }
+      case 'start': {
+        if (!rest) {
+          this.store.pushToast('Usage: /todo start <task>', 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const match = findTodoTaskFuzzy(current, rest);
+        if (!match) {
+          this.store.pushToast(`No task matched "${rest}".`, 'warning');
+          this.scheduler.renderNow();
+          return;
+        }
+        const outcome = applyTodoOperation(current, { op: 'start', task: match.task.content });
+        if (outcome.isError) {
+          this.store.pushToast(outcome.errors.join('; '), 'error');
+          this.scheduler.renderNow();
+          return;
+        }
+        this.#commitUserTodoEdit(outcome.phases, `/todo start ${match.task.content}`);
+        this.store.pushToast(`Started: ${match.task.content}`, 'success');
+        return;
+      }
+      case 'done':
+      case 'drop': {
+        const op = verb === 'done' ? 'done' : 'drop';
+        const label = verb === 'done' ? 'completed' : 'abandoned';
+        if (!rest) {
+          const allContents = current.flatMap(p => p.tasks.map(t => t.content));
+          const outcome =
+            allContents.length > 0
+              ? applyTodoOperation(current, { op, task: allContents })
+              : { phases: current, errors: [], isError: false };
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} (all)`);
+          this.store.pushToast(`Marked all tasks ${label}.`, 'success');
+          return;
+        }
+        const taskMatch = findTodoTaskFuzzy(current, rest);
+        if (taskMatch) {
+          const outcome = applyTodoOperation(current, { op, task: taskMatch.task.content });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} ${taskMatch.task.content}`);
+          this.store.pushToast(`Marked ${label}: ${taskMatch.task.content}`, 'success');
+          return;
+        }
+        const phaseMatch = findTodoPhaseFuzzy(current, rest);
+        if (phaseMatch) {
+          const outcome = applyTodoOperation(current, { op, phase: phaseMatch.name });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo ${op} ${phaseMatch.name}`);
+          this.store.pushToast(`Marked phase ${phaseMatch.name} ${label}.`, 'success');
+          return;
+        }
+        this.store.pushToast(`No task or phase matched "${rest}".`, 'warning');
+        this.scheduler.renderNow();
+        return;
+      }
+      case 'clear':
+      case 'rm': {
+        if (verb === 'clear' || !rest) {
+          this.#commitUserTodoEdit([], '/todo rm (all)', { removed: true });
+          this.store.pushToast('Cleared all todos.', 'success');
+          return;
+        }
+        const taskMatch = findTodoTaskFuzzy(current, rest);
+        if (taskMatch) {
+          const outcome = applyTodoOperation(current, { op: 'rm', task: taskMatch.task.content });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo rm ${taskMatch.task.content}`, {
+            removed: true,
+          });
+          this.store.pushToast(`Removed: ${taskMatch.task.content}`, 'success');
+          return;
+        }
+        const phaseMatch = findTodoPhaseFuzzy(current, rest);
+        if (phaseMatch) {
+          const outcome = applyTodoOperation(current, { op: 'rm', phase: phaseMatch.name });
+          if (outcome.isError) {
+            this.store.pushToast(outcome.errors.join('; '), 'error');
+            this.scheduler.renderNow();
+            return;
+          }
+          this.#commitUserTodoEdit(outcome.phases, `/todo rm ${phaseMatch.name}`, { removed: true });
+          this.store.pushToast(`Removed phase: ${phaseMatch.name}`, 'success');
+          return;
+        }
+        this.store.pushToast(`No task or phase matched "${rest}".`, 'warning');
+        this.scheduler.renderNow();
+        return;
+      }
+      default: {
+        this.store.pushToast(
+          `Unknown /todo verb "${verb}". Run /todo help for usage.`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+      }
+    }
+  }
+
   async #exportTranscript(targetPath?: string): Promise<void> {
     const state = this.store.getState();
     try {
@@ -6751,6 +7293,8 @@ export class AppController {
       turns: allVisibleTurns,
       transcriptTurns: transcriptSlice.turns,
       plan: this.store.transcript.plan,
+      todoExpanded: this.#todoExpanded,
+      todoHudDismissed: this.#todoHudDismissed,
       jobs,
       version: OMA_VERSION,
       commands: this.store.commands.getAll(),
