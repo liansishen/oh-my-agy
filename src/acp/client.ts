@@ -559,8 +559,9 @@ export class AcpClient {
   async listAllSessions(options?: {
     cwd?: string;
     maxPages?: number;
+    onPage?: (accumulated: SessionSummary[]) => void;
   }): Promise<SessionSummary[]> {
-    const maxPages = options?.maxPages ?? 50;
+    const maxPages = options?.maxPages ?? 200;
     const all: SessionSummary[] = [];
     const seenIds = new Set<string>();
     let cursor: string | undefined;
@@ -573,6 +574,12 @@ export class AcpClient {
           seenIds.add(item.sessionId);
           all.push(item);
         }
+      }
+      if (batch.length > 0 && options?.onPage) {
+        const snapshot = options.cwd
+          ? all.filter((s) => sameDir(s.cwd, options.cwd!))
+          : [...all];
+        options.onPage(snapshot);
       }
       if (!res?.nextCursor || res.nextCursor === cursor) {
         break;

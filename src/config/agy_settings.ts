@@ -501,3 +501,157 @@ export async function updateAgySetting<K extends AgySafeSettingKey>(
 ): Promise<SaveAgySettingsResult> {
   return saveAgySettings({ [key]: value } as AgySafeSettingsPatch, options);
 }
+
+export interface AutoCompactOverrideInfo {
+  readonly raw: string;
+  readonly kind: 'tokens' | 'percent';
+  readonly requestedTokens?: number;
+  readonly requestedPercent?: number;
+  readonly effectiveTokens?: number;
+  readonly effectivePercent?: number;
+  readonly clamped: boolean;
+}
+
+export interface AutoCompactDisplaySummary {
+  readonly label: string;
+  readonly compactLabel: string;
+  readonly isOverride: boolean;
+  readonly info: AutoCompactOverrideInfo | null;
+}
+
+function formatCompactCountForAutoCompact(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '0';
+  if (n >= 1_000_000) {
+    const val = n / 1_000_000;
+    return Number.isInteger(val) ? `${val}M` : `${val.toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (n >= 1_000) {
+    const val = n / 1_000;
+    return val >= 100 ? `${Math.round(val)}k` : `${val.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  return String(Math.round(n));
+}
+
+function formatCompactPercentForAutoCompact(pct: number): string {
+  if (!Number.isFinite(pct)) return '0%';
+  return pct < 10 ? `${pct.toFixed(1).replace(/\.0$/, '')}%` : `${Math.round(pct)}%`;
+}
+
+/**
+ * Parse `AGY_CLI_AUTO_COMPACT_OVERRIDE` values matching `agy 1.5.15`:
+ * integer token counts (`700000`), `K`/`M` shorthand (`800K`, `0.5M`), or percentages (`80%`).
+ */
+export function parseAutoCompactOverride(
+  raw: string | undefined,
+  contextWindowSize?: number,
+): AutoCompactOverrideInfo | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+
+  const windowSize =
+    typeof contextWindowSize === 'number' && Number.isFinite(contextWindowSize) && contextWindowSize > 0
+      ? Math.round(contextWindowSize)
+      : undefined;
+
+  const pctMatch = /^(\d+(?:\.\d+)?)\s*%$/.exec(trimmed);
+  if (pctMatch?.[1]) {
+    const pct = Number(pctMatch[1]);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return null;
+    if (windowSize !== undefined) {
+      const effectiveTokens = Math.max(1, Math.min(windowSize, Math.round((windowSize * pct) / 100)));
+      const effectivePercent = (effectiveTokens / windowSize) * 100;
+      return {
+        raw: trimmed,
+        kind: 'percent',
+        requestedPercent: pct,
+        effectiveTokens,
+        effectivePercent,
+        clamped: false,
+      };
+    }
+    return {
+      raw: trimmed,
+      kind: 'percent',
+      requestedPercent: pct,
+      effectivePercent: pct,
+      clamped: false,
+    };
+  }
+
+  let requestedTokens: number | undefined;
+  const unitMatch = /^(\d+(?:\.\d+)?)\s*([km])$/i.exec(trimmed);
+  if (unitMatch?.[1] && unitMatch[2]) {
+    const num = Number(unitMatch[1]);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    const mult = unitMatch[2].toLowerCase() === 'm' ? 1_000_000 : 1_000;
+    requestedTokens = Math.round(num * mult);
+  } else if (/^\d+$/.test(trimmed)) {
+    requestedTokens = Number.parseInt(trimmed, 10);
+  } else {
+    return null;
+  }
+
+  if (!Number.isFinite(requestedTokens) || requestedTokens <= 0) {
+    return null;
+  }
+
+  if (windowSize !== undefined) {
+    const clamped = requestedTokens > windowSize;
+    const effectiveTokens = Math.min(requestedTokens, windowSize);
+    const effectivePercent = (effectiveTokens / windowSize) * 100;
+    return {
+      raw: trimmed,
+      kind: 'tokens',
+      requestedTokens,
+      effectiveTokens,
+      effectivePercent,
+      clamped,
+    };
+  }
+
+  return {
+    raw: trimmed,
+    kind: 'tokens',
+    requestedTokens,
+    effectiveTokens: requestedTokens,
+    clamped: false,
+  };
+}
+
+/**
+ * Format `AGY_CLI_AUTO_COMPACT_OVERRIDE` into human-readable summary strings
+ * for `/context` and `/model` UI surfaces.
+ */
+export function formatAutoCompactSummary(
+  raw: string | undefined,
+  contextWindowSize?: number,
+): AutoCompactDisplaySummary {
+  const info = parseAutoCompactOverride(raw, contextWindowSize);
+  if (!info) {
+    return {
+      label: 'Default (managed by agy)',
+      compactLabel: 'Default',
+      isOverride: false,
+      info: null,
+    };
+  }
+
+  let compactLabel: string;
+  if (info.effectiveTokens !== undefined && info.effectivePercent !== undefined) {
+    compactLabel = `${formatCompactCountForAutoCompact(info.effectiveTokens)} (${formatCompactPercentForAutoCompact(info.effectivePercent)})`;
+  } else if (info.effectiveTokens !== undefined) {
+    compactLabel = formatCompactCountForAutoCompact(info.effectiveTokens);
+  } else if (info.effectivePercent !== undefined) {
+    compactLabel = formatCompactPercentForAutoCompact(info.effectivePercent);
+  } else {
+    compactLabel = info.raw;
+  }
+
+  const clampedNote = info.clamped ? ', clamped' : '';
+  return {
+    label: `${compactLabel} · override (AGY_CLI_AUTO_COMPACT_OVERRIDE=${info.raw}${clampedNote})`,
+    compactLabel,
+    isOverride: true,
+    info,
+  };
+}

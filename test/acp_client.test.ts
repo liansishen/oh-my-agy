@@ -722,7 +722,23 @@ describe("src/acp/protocol.ts tool_call 状态、exit_code 与辅助函数", () 
     expect(extractToolOutputText({ stdout: "out", stderr: "err" })).toBe(
       "out\nerr",
     );
+    expect(extractToolOutputText({ error: "Permission denied" })).toBe(
+      "Permission denied",
+    );
+    expect(
+      extractToolOutputText({
+        output: "",
+        error: { message: "Blocked by sandbox" },
+      }),
+    ).toBe("Blocked by sandbox");
+    expect(extractToolOutputText({ message: "Not found" })).toBe("Not found");
+    expect(extractToolOutputText({ output: "" })).toBe("");
     expect(extractToolOutputText("raw text")).toBe("raw text");
+
+    expect(JSON_RPC_ERROR.RESOURCE_NOT_FOUND).toBe(-32002);
+    expect(new AcpRpcError(-32002, "Session not found").isSessionNotFound()).toBe(true);
+    expect(new AcpRpcError(-32603, "Conversation not found").isSessionNotFound()).toBe(true);
+    expect(new AcpRpcError(-32603, "Internal error").isSessionNotFound()).toBe(false);
   });
 
   test("plan 状态映射、分组 configOptions 展平、内容文本提取与认证错误判断", () => {
@@ -1295,8 +1311,15 @@ describe("src/acp/client.ts Mock ACP 端到端协议测试", () => {
     const client = new AcpClient({ spawn: harness.spawn });
     client.start();
 
-    const all = await client.listAllSessions();
+    const pageSnapshots: string[][] = [];
+    const all = await client.listAllSessions({
+      onPage: (acc) => pageSnapshots.push(acc.map((s) => s.sessionId)),
+    });
     expect(all.map((s) => s.sessionId)).toEqual(["s1", "s2", "s3"]);
+    expect(pageSnapshots).toEqual([
+      ["s1", "s2"],
+      ["s1", "s2", "s3"],
+    ]);
 
     // 在 Windows 环境测试 sameDir 过滤（或全平台直接验证本地过滤行为）
     if (process.platform === "win32") {

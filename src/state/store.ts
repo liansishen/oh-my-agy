@@ -493,6 +493,8 @@ export interface AppState {
   readonly orchestratorSettings: AgyOrchestratorSettings;
   /** Current terminal viewport height in rows (used e.g. for Swarm Overview >= 28-row threshold). */
   readonly terminalRows: number;
+  /** Raw `AGY_CLI_AUTO_COMPACT_OVERRIDE` value inherited from environment if configured. */
+  readonly autoCompactOverrideRaw?: string;
   readonly usage: ContextUsageState | null;
   readonly sessionMetrics: SessionMetricsSnapshot | null;
   readonly gitStatus: GitStatusSnapshot | null;
@@ -527,6 +529,7 @@ export interface AppStoreOptions {
   readonly toolDisplayMode?: ToolDisplayMode;
   readonly orchestratorSettings?: AgyOrchestratorSettings;
   readonly terminalRows?: number;
+  readonly autoCompactOverrideRaw?: string;
   readonly draft?: DraftEngineOptions;
   readonly history?: InputHistoryOptions;
   readonly traffic?: TrafficBufferOptions;
@@ -648,6 +651,7 @@ export class AppStore {
   private _modelThoughtLevels: Record<string, readonly ConfigOptionChoice[]> = {};
   private _orchestratorSettings: AgyOrchestratorSettings;
   private _terminalRows: number;
+  private readonly _autoCompactOverrideRaw: string | undefined;
   private _usage: ContextUsageState | null = null;
   private _sessionMetrics: SessionMetricsSnapshot | null = null;
   private _gitStatus: GitStatusSnapshot | null = null;
@@ -693,6 +697,7 @@ export class AppStore {
         : typeof process.stdout?.rows === 'number' && process.stdout.rows > 0
           ? process.stdout.rows
           : 40;
+    this._autoCompactOverrideRaw = options.autoCompactOverrideRaw?.trim() || undefined;
 
     this.draft = new DraftEngine({
       now: this._now,
@@ -1139,6 +1144,9 @@ export class AppStore {
       modelThoughtLevels: this._modelThoughtLevels,
       orchestratorSettings: this._orchestratorSettings,
       terminalRows: this._terminalRows,
+      ...(this._autoCompactOverrideRaw
+        ? { autoCompactOverrideRaw: this._autoCompactOverrideRaw }
+        : {}),
       usage: this._usage,
       sessionMetrics: this._sessionMetrics,
       gitStatus: this._gitStatus,
@@ -1596,7 +1604,9 @@ export class AppStore {
     const currentEffectiveThought =
       kind === 'model' && !isOrchestratorModelId(targetModelId)
         ? this._controls.currentThoughtLevel
-        : undefined;
+        : kind === 'planner' || kind === 'executor'
+          ? 'high'
+          : undefined;
     const defaultModelThinking = isModelLikePicker
       ? clampThoughtLevelForChoices(
           options.modelPickerThinking ?? currentEffectiveThought,
@@ -1719,7 +1729,9 @@ export class AppStore {
     const defaultActive =
       this._picker.kind === 'model' && !isOrchestratorModelId(targetModelId)
         ? this._controls.currentThoughtLevel
-        : undefined;
+        : this._picker.kind === 'planner' || this._picker.kind === 'executor'
+          ? 'high'
+          : undefined;
     const rawCurrent =
       this._picker.modelPickerThinking ?? defaultActive ?? choices[0]!.value;
     const current = clampThoughtLevelForChoices(rawCurrent, choices) ?? choices[0]!.value;
@@ -2112,7 +2124,9 @@ export class AppStore {
           !isOrchestratorModelId(selectedId) &&
           selectedId === this._controls.currentModelId
             ? this._controls.currentThoughtLevel
-            : undefined;
+            : this._picker.kind === 'planner' || this._picker.kind === 'executor'
+              ? 'high'
+              : undefined;
         const preferred =
           !this._picker.modelPickerThinkingDirty && currentThoughtForSelected !== undefined
             ? currentThoughtForSelected

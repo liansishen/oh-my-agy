@@ -25,9 +25,11 @@ import {
 import {
   AGY_SAFE_SETTING_KEYS,
   DEFAULT_AGY_SAFE_SETTINGS,
+  formatAutoCompactSummary,
   formatOrchestratorModelSpec,
   getAgySettingsPath,
   loadAgySettings,
+  parseAutoCompactOverride,
   parseOrchestratorModelSpec,
   saveAgySettings,
   updateAgySetting,
@@ -639,6 +641,66 @@ describe('src/config/agy_settings.ts strict safe allowlist persistence', () => {
     expect('showThinking' in rawAfterReset).toBe(false);
     expect('orchestrator' in rawAfterReset).toBe(false);
     expect(rawAfterReset['theme']).toBe('dark');
+  });
+
+  test('parseAutoCompactOverride & formatAutoCompactSummary handle tokens, K/M shorthand, percentages, clamping & invalid inputs', () => {
+    expect(parseAutoCompactOverride('700000')).toEqual({
+      raw: '700000',
+      kind: 'tokens',
+      requestedTokens: 700_000,
+      effectiveTokens: 700_000,
+      clamped: false,
+    });
+    expect(parseAutoCompactOverride('800K', 1_000_000)).toEqual({
+      raw: '800K',
+      kind: 'tokens',
+      requestedTokens: 800_000,
+      effectiveTokens: 800_000,
+      effectivePercent: 80,
+      clamped: false,
+    });
+    expect(parseAutoCompactOverride('0.5M', 1_000_000)).toEqual({
+      raw: '0.5M',
+      kind: 'tokens',
+      requestedTokens: 500_000,
+      effectiveTokens: 500_000,
+      effectivePercent: 50,
+      clamped: false,
+    });
+    expect(parseAutoCompactOverride('80%', 1_000_000)).toEqual({
+      raw: '80%',
+      kind: 'percent',
+      requestedPercent: 80,
+      effectiveTokens: 800_000,
+      effectivePercent: 80,
+      clamped: false,
+    });
+    expect(parseAutoCompactOverride('2M', 1_000_000)).toEqual({
+      raw: '2M',
+      kind: 'tokens',
+      requestedTokens: 2_000_000,
+      effectiveTokens: 1_000_000,
+      effectivePercent: 100,
+      clamped: true,
+    });
+
+    for (const invalid of [undefined, '', '0', '-10%', 'abc', '120%']) {
+      expect(parseAutoCompactOverride(invalid, 1_000_000)).toBeNull();
+    }
+
+    const summary800k = formatAutoCompactSummary('800K', 1_000_000);
+    expect(summary800k.isOverride).toBe(true);
+    expect(summary800k.compactLabel).toBe('800k (80%)');
+    expect(summary800k.label).toBe('800k (80%) · override (AGY_CLI_AUTO_COMPACT_OVERRIDE=800K)');
+
+    const summaryClamped = formatAutoCompactSummary('2M', 1_000_000);
+    expect(summaryClamped.label).toContain('1M (100%)');
+    expect(summaryClamped.label).toContain(', clamped');
+
+    const summaryDefault = formatAutoCompactSummary('abc', 1_000_000);
+    expect(summaryDefault.isOverride).toBe(false);
+    expect(summaryDefault.compactLabel).toBe('Default');
+    expect(summaryDefault.label).toBe('Default (managed by agy)');
   });
 });
 

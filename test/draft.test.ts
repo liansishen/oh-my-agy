@@ -2667,4 +2667,78 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
     expect(store.getToolById('tc-speculative')?.backgroundRunning).toBe(false);
   });
+
+  test('AppStore defaults Orchestrator planner/executor picker thinking to high (clamped when unavailable)', () => {
+    const app = new AppStore({ cwd: '/workspace/demo' });
+    app.applySessionSnapshot({
+      sessionId: 's-orch-default',
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          type: 'select',
+          currentValue: 'gemini-pro-orchestrator-neon',
+          options: [
+            { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+            { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+            { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+          ],
+        },
+        {
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: 'low',
+          options: [
+            { value: 'low', name: 'Low' },
+            { value: 'medium', name: 'Medium' },
+            { value: 'high', name: 'High' },
+          ],
+        },
+      ],
+    });
+
+    app.openPicker('planner', { selectedId: 'gemini-4-neon' });
+    expect(app.getState().picker?.modelPickerThinking).toBe('high');
+
+    // Switching to another model before user dirties the slider stays at high (clamped to 3 levels)
+    app.setPickerSelected('gemini-4-carbon');
+    expect(app.getState().picker?.modelPickerThinking).toBe('high');
+
+    // Stepping from unset default starts at high -> medium
+    app.openPicker('executor', { selectedId: 'gemini-4-hydrogen' });
+    expect(app.getState().picker?.modelPickerThinking).toBe('high');
+    expect(app.stepModelPickerThinking(-1)).toBe('medium');
+
+    // If a model only supports low/medium, high clamps to medium
+    app.applySessionSnapshot({
+      sessionId: 's-orch-clamp',
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          type: 'select',
+          currentValue: 'custom-two-level',
+          options: [{ value: 'custom-two-level', name: 'Custom Two Level' }],
+        },
+        {
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: 'low',
+          options: [
+            { value: 'low', name: 'Low' },
+            { value: 'medium', name: 'Medium' },
+          ],
+        },
+      ],
+    });
+    app.openPicker('planner', { selectedId: 'custom-two-level' });
+    expect(app.getState().picker?.modelPickerThinking).toBe('medium');
+  });
 });

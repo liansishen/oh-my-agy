@@ -47,6 +47,7 @@ import {
   type AuthMethod,
   type ContentBlock,
   type McpServerConfig,
+  type SessionSummary,
   type SessionUpdateParams,
 } from '../acp/protocol';
 import {
@@ -189,10 +190,28 @@ const DEFAULT_BACKGROUND_DONE_GRACE_MS = 2000;
 const DEFAULT_BACKGROUND_WAKEUP_GRACE_MS = 10_000;
 const DEFAULT_BACKGROUND_TRANSCRIPT_STALL_MS = 180_000;
 const DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS = 120;
+const AGY_1_5_15_REPLAY_DRAIN_INITIAL_QUIET_MS = 20;
 const DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS = 250;
 const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
 const GIT_PROBE_MIN_INTERVAL_MS = 1500;
 const TPS_FLUSH_MIN_INTERVAL_MS = 120;
+
+export function isSemverAtLeast(
+  rawVersion: string | undefined,
+  major: number,
+  minor: number,
+  patch: number,
+): boolean {
+  if (!rawVersion) return false;
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/i.exec(rawVersion.trim());
+  if (!m) return false;
+  const curMajor = Number.parseInt(m[1]!, 10);
+  const curMinor = Number.parseInt(m[2]!, 10);
+  const curPatch = Number.parseInt(m[3]!, 10);
+  if (curMajor !== major) return curMajor > major;
+  if (curMinor !== minor) return curMinor > minor;
+  return curPatch >= patch;
+}
 
 export interface ClipboardService {
   readImage(): Promise<ClipboardImage | null>;
@@ -240,6 +259,7 @@ export interface AppControllerOptions {
   readonly cli: CliOptions;
   readonly config: OmaConfig;
   readonly cwd?: string;
+  readonly env?: Readonly<Record<string, string | undefined>>;
   readonly session: Session;
   readonly output: SafeTermOutput;
   readonly acpSpawn?: AcpSpawnFn;
@@ -481,6 +501,7 @@ export class AppController {
 
   readonly #cli: CliOptions;
   #config: OmaConfig;
+  readonly #env?: Readonly<Record<string, string | undefined>>;
   readonly #output: SafeTermOutput;
   readonly #acpSpawn?: AcpSpawnFn;
   readonly #previewStore: PreviewStore;
@@ -505,6 +526,7 @@ export class AppController {
   readonly #backgroundWakeupGraceMs: number;
   readonly #replayDrainInitialQuietMs: number;
   readonly #replayDrainActiveQuietMs: number;
+  readonly #hasExplicitReplayDrainQuietMs: boolean;
   readonly #todoAutoClearDelayMs: number;
   readonly #enableTodoMcp: boolean;
   readonly #editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
@@ -543,6 +565,11 @@ export class AppController {
   #lastCommittedCwd: string | null = null;
   #replayingSessionId: string | null = null;
   #replayingSessionEpoch: number | null = null;
+  #pendingReplayedServerRequests: Array<{
+    readonly epoch: number;
+    readonly sessionId: string;
+    readonly req: AcpIncomingRequest;
+  }> = [];
   #creatingSessionEpoch: number | null = null;
   #pendingNewSessionUpdates: SessionUpdateParams[] = [];
   #pendingCarryOverControls: SessionControlCarryOver | null = null;
@@ -578,6 +605,7 @@ export class AppController {
   constructor(options: AppControllerOptions) {
     this.#cli = options.cli;
     this.#config = cloneConfig(options.config);
+    this.#env = options.env;
     this.#output = options.output;
     this.#acpSpawn = options.acpSpawn;
     this.#previewStore = options.previewStore ?? new PreviewStore();
@@ -614,6 +642,7 @@ export class AppController {
       options.replayDrainQuietMs !== undefined
         ? Math.max(0, options.replayDrainQuietMs)
         : DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS;
+    this.#hasExplicitReplayDrainQuietMs = options.replayDrainQuietMs !== undefined;
     this.#todoAutoClearDelayMs =
       options.todoAutoClearDelayMs !== undefined
         ? options.todoAutoClearDelayMs
@@ -640,6 +669,10 @@ export class AppController {
       this.session.caps.features
     );
 
+    const envSource = options.env ?? process.env;
+    const autoCompactOverrideRaw =
+      envSource['AGY_CLI_AUTO_COMPACT_OVERRIDE']?.trim() || undefined;
+
     this.store = new AppStore({
       cwd: initialCwd,
       autoAllowTools: this.#config.approval.auto_allow_tools,
@@ -653,6 +686,7 @@ export class AppController {
         this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
       ...(options.terminalRows !== undefined ? { terminalRows: options.terminalRows } : {}),
+      ...(autoCompactOverrideRaw ? { autoCompactOverrideRaw } : {}),
       now: this.#now,
     });
     if (initialBeeBlobs) {
@@ -903,6 +937,7 @@ export class AppController {
     this.#todoServer?.dispose();
     this.#todoServer = null;
     this.#cancelReplayDrain();
+    this.#cancelPendingReplayedServerRequests();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
     this.#metricsTracker.setSession(null);
@@ -978,6 +1013,7 @@ export class AppController {
       agyBin: this.#resolveAgyBin(),
       extraArgs,
       cwd: this.store.getState().cwd,
+      ...(this.#env ? { env: this.#env } : {}),
       spawn: this.#acpSpawn,
       closeTimeoutMs: 500,
       onUpdate: params => this.#handleAcpUpdate(params),
@@ -1049,6 +1085,7 @@ export class AppController {
   ): number {
     const epoch = ++this.#sessionEpoch;
     this.#cancelReplayDrain(new Error('Superseded by session switch'));
+    this.#cancelPendingReplayedServerRequests();
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#clearToolWatchTimer();
@@ -1157,7 +1194,7 @@ export class AppController {
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
       this.store.setConnectionStatus('ready');
-      this.osc.setStatusIdle();
+      this.#restoreOscAfterBlock();
       this.osc.setWorkingDirectory(this.store.getState().cwd);
       await this.#persistSessionAnchorAndOsc();
 
@@ -1212,6 +1249,9 @@ export class AppController {
         }
       } catch (err) {
         if (!this.#isAcpClientLive(client)) throw err;
+        if (err instanceof AcpRpcError && err.isSessionNotFound()) {
+          void this.#previewStore.delete(retrySessionId).catch(() => {});
+        }
         // Fallback to new session if previous session cannot be reloaded
       }
     }
@@ -1251,8 +1291,14 @@ export class AppController {
           if (err instanceof AcpRpcError && err.isAuthRequired()) {
             throw err;
           }
+          const isNotFound = err instanceof AcpRpcError && err.isSessionNotFound();
+          if (isNotFound) {
+            void this.#previewStore.delete(target.sessionId).catch(() => {});
+          }
           this.store.pushToast(
-            `Failed to load session ${target.sessionId}; starting a new session.`,
+            isNotFound
+              ? `Session ${target.sessionId} not found (may have been deleted); starting a new session.`
+              : `Failed to load session ${target.sessionId}; starting a new session.`,
             'warning'
           );
         }
@@ -1365,7 +1411,16 @@ export class AppController {
    * prematurely fusing trailing history into a live streaming turn.
    */
   async #waitForReplayDrain(): Promise<void> {
-    if (this.#shuttingDown || this.#replayDrainInitialQuietMs <= 0) {
+    if (this.#shuttingDown) {
+      return;
+    }
+    const backendVersion =
+      this.store.getState().agentVersion ?? this.store.getState().agentInfo?.version;
+    const initialQuietMs =
+      !this.#hasExplicitReplayDrainQuietMs && isSemverAtLeast(backendVersion, 1, 5, 15)
+        ? Math.min(this.#replayDrainInitialQuietMs, AGY_1_5_15_REPLAY_DRAIN_INITIAL_QUIET_MS)
+        : this.#replayDrainInitialQuietMs;
+    if (initialQuietMs <= 0) {
       return;
     }
     this.#cancelReplayDrain();
@@ -1375,7 +1430,7 @@ export class AppController {
       this.#replayDrainReject = reject;
       this.#replayDrainTimer = setTimeout(() => {
         this.#cancelReplayDrain();
-      }, this.#replayDrainInitialQuietMs);
+      }, initialQuietMs);
       this.#replayDrainMaxTimer = setTimeout(() => {
         this.#cancelReplayDrain();
       }, DEFAULT_REPLAY_DRAIN_MAX_MS);
@@ -1506,6 +1561,11 @@ export class AppController {
       if (settledAny) {
         this.osc.reassertCursorHidden();
       }
+      if (this.#replayingSessionEpoch === loadEpoch) {
+        this.#replayingSessionId = null;
+        this.#replayingSessionEpoch = null;
+      }
+      this.#drainPendingReplayedServerRequests(loaded.sessionId, loadEpoch);
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
       return true;
     } catch (err) {
@@ -1514,6 +1574,7 @@ export class AppController {
         return false;
       }
       this.#cancelReplayDrain();
+      this.#cancelPendingReplayedServerRequests();
       this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(false);
       throw err;
@@ -1770,10 +1831,13 @@ export class AppController {
           void this.#syncSessionMetricsFromTranscript();
           void this.#refreshGitStatus();
         }
-        if (this.store.hasActiveBackgroundTasks()) {
+        if (
+          this.store.hasActiveBackgroundTasks() ||
+          this.store.isSwarmWorking ||
+          this.#isSwarmCoordinatorWorking() ||
+          toolFinishedInThisUpdate
+        ) {
           this.#metricsTracker.pauseForTools();
-        } else {
-          this.#metricsTracker.resumeAfterTools();
         }
         this.#syncToolWatchTimer();
       } else if (update.sessionUpdate === 'notice') {
@@ -1903,6 +1967,53 @@ export class AppController {
     this.scheduler.markDirty();
   }
 
+  #cancelPendingReplayedServerRequests(): void {
+    const queued = this.#pendingReplayedServerRequests;
+    this.#pendingReplayedServerRequests = [];
+    if (queued.length === 0) return;
+    const client = this.#acpClient;
+    if (!client?.isRunning) return;
+    for (const item of queued) {
+      if (isRequestPermissionRequest(item.req)) {
+        void client
+          .respondToServerRequest(item.req.id, { outcome: { outcome: 'cancelled' } })
+          .catch(() => {});
+      } else if (isElicitationCreateRequest(item.req)) {
+        void client
+          .respondToServerRequest(item.req.id, { action: 'cancel' })
+          .catch(() => {});
+      }
+    }
+  }
+
+  #drainPendingReplayedServerRequests(sessionId: string, epoch: number): void {
+    const queued = this.#pendingReplayedServerRequests;
+    this.#pendingReplayedServerRequests = [];
+    if (queued.length === 0) return;
+    const client = this.#acpClient;
+    for (const item of queued) {
+      const canMount =
+        !this.#shuttingDown &&
+        item.epoch === epoch &&
+        epoch === this.#sessionEpoch &&
+        item.sessionId === sessionId &&
+        this.store.getState().sessionId === sessionId;
+      if (canMount) {
+        this.#handleAcpServerRequest(item.req);
+      } else if (client?.isRunning) {
+        if (isRequestPermissionRequest(item.req)) {
+          void client
+            .respondToServerRequest(item.req.id, { outcome: { outcome: 'cancelled' } })
+            .catch(() => {});
+        } else if (isElicitationCreateRequest(item.req)) {
+          void client
+            .respondToServerRequest(item.req.id, { action: 'cancel' })
+            .catch(() => {});
+        }
+      }
+    }
+  }
+
   #handleAcpServerRequest(req: AcpIncomingRequest): void {
     const client = this.#acpClient;
     if (!client) return;
@@ -1911,6 +2022,28 @@ export class AppController {
       req.params && typeof (req.params as { sessionId?: unknown }).sessionId === 'string'
         ? ((req.params as { sessionId: string }).sessionId.trim() || undefined)
         : undefined;
+    const isReplayingTargetSession = Boolean(
+      reqSessionId &&
+        this.#replayingSessionId !== null &&
+        reqSessionId === this.#replayingSessionId &&
+        this.#replayingSessionEpoch === this.#sessionEpoch
+    );
+    if (
+      isReplayingTargetSession &&
+      (isRequestPermissionRequest(req) || isElicitationCreateRequest(req))
+    ) {
+      this.#pendingReplayedServerRequests.push({
+        epoch: this.#sessionEpoch,
+        sessionId: reqSessionId!,
+        req,
+      });
+      this.store.traffic.recordSystem(
+        `buffered ${req.method} during session/load replay for ${reqSessionId}`,
+        req.params
+      );
+      return;
+    }
+
     const activeSessionId = this.store.getState().sessionId;
     const isStaleRequestSession = Boolean(
       reqSessionId &&
@@ -2023,6 +2156,7 @@ export class AppController {
       `agy acp exited unexpectedly${info.code !== null ? ` (exit code ${info.code})` : ''}.`;
 
     this.#cancelReplayDrain(new Error(crashMessage));
+    this.#cancelPendingReplayedServerRequests();
     this.#replayingSessionId = null;
     this.#replayingSessionEpoch = null;
     this.#creatingSessionEpoch = null;
@@ -3435,28 +3569,42 @@ export class AppController {
     this.store.clearCtrlCArm();
     this.store.dismissCompletion();
 
-    // Check slash commands when no image attachments are attached
-    if (pendingAttachments.length === 0) {
-      const dispatched = dispatchSlashCommand(text, this.store.commands);
-      if (dispatched.isCommand) {
-        if (!isolated) {
-          this.store.draft.reset();
+    // Check slash commands; passthrough commands retain pending attachments (agy >= 1.5.15)
+    const dispatched = dispatchSlashCommand(text, this.store.commands);
+    if (
+      dispatched.isCommand &&
+      (pendingAttachments.length === 0 || dispatched.action.type === 'passthrough_prompt')
+    ) {
+      if (!isolated) {
+        this.store.draft.reset();
+        if (dispatched.action.type === 'passthrough_prompt' && pendingAttachments.length > 0) {
+          this.store.clearAttachments();
+          this.#suppressedMentionPaths.clear();
         }
-        void this.store.history.push(text, this.store.getState().cwd);
-        this.scheduler.renderNow();
-        await executeCommandAction(
-          dispatched.action,
-          this.#commandExecutor({ preserveDraft: isolated })
-        );
-        return;
       }
+      void this.store.history.push(text, this.store.getState().cwd);
+      this.scheduler.renderNow();
+      await executeCommandAction(
+        dispatched.action,
+        this.#commandExecutor({
+          preserveDraft: isolated,
+          attachments: pendingAttachments,
+        })
+      );
+      return;
     }
 
     await this.#sendPromptToAcp(text, pendingAttachments, { preserveDraft: isolated });
   }
 
-  #commandExecutor(options: { readonly preserveDraft?: boolean } = {}): CommandActionExecutor {
+  #commandExecutor(
+    options: {
+      readonly preserveDraft?: boolean;
+      readonly attachments?: readonly AttachmentItem[];
+    } = {},
+  ): CommandActionExecutor {
     const preserveDraft = options.preserveDraft === true;
+    const passthroughAttachments = options.attachments ?? [];
     const copyByIndex = async (index?: number) => {
       const idx = index && index >= 1 ? index : 1;
       const md = this.store.transcript.getAssistantMarkdownByReverseIndex(idx);
@@ -3563,7 +3711,7 @@ export class AppController {
           this.#syncSwarmFxStylesheet();
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
-        await this.#sendPromptToAcp(text, [], { preserveDraft });
+        await this.#sendPromptToAcp(text, passthroughAttachments, { preserveDraft });
       },
       unknownCommand: (commandName, _rawText, suggestions) => {
         const hint =
@@ -3601,6 +3749,7 @@ export class AppController {
     const sessionId = state.sessionId;
     const promptEpoch = this.#sessionEpoch;
     const isCompactPrompt = /^\/compact(?:\s|$)/i.test(text.trim());
+    const isLeadingSlashPrompt = /^\/[^\s]+/.test(text.trim());
     const suppressedMentions = preserveDraft
       ? new Set<string>()
       : new Set(this.#suppressedMentionPaths);
@@ -3670,7 +3819,9 @@ export class AppController {
 
           const reminderToSend = !isCompactPrompt ? this.#pendingTodoSyncReminder : null;
           const outboundPrompt = reminderToSend
-            ? [{ type: 'text' as const, text: `${reminderToSend}\n\n` }, ...promptBlocks]
+            ? isLeadingSlashPrompt
+              ? [...promptBlocks, { type: 'text' as const, text: `\n\n${reminderToSend}` }]
+              : [{ type: 'text' as const, text: `${reminderToSend}\n\n` }, ...promptBlocks]
             : promptBlocks;
 
           const result = await client.prompt({
@@ -3689,6 +3840,16 @@ export class AppController {
         ) {
           return;
         }
+        if (result.stopReason === 'end_turn') {
+          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
+          if (
+            this.#shuttingDown ||
+            promptEpoch !== this.#sessionEpoch ||
+            this.store.getState().sessionId !== sessionId
+          ) {
+            return;
+          }
+        }
         const finishedTurn = this.store.transcript.finishActiveTurn(
           result.stopReason,
           undefined,
@@ -3699,21 +3860,15 @@ export class AppController {
             preserveInFlightBackgroundTools: true,
           }
         );
-        this.store.setStreaming(false);
-
-        if (result.stopReason === 'end_turn') {
-          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
-          if (
-            this.#shuttingDown ||
-            promptEpoch !== this.#sessionEpoch ||
-            this.store.getState().sessionId !== sessionId
-          ) {
-            return;
-          }
-          if (isCompactPrompt && finishedTurn && !finishedTurn.notices.some(n => n.kind === 'compaction')) {
-            this.store.transcript.markCompactionCompleted(finishedTurn.index);
-          }
+        if (
+          result.stopReason === 'end_turn' &&
+          isCompactPrompt &&
+          finishedTurn &&
+          !finishedTurn.notices.some(n => n.kind === 'compaction')
+        ) {
+          this.store.transcript.markCompactionCompleted(finishedTurn.index);
         }
+        this.store.setStreaming(false);
 
         const hasBgTools = this.store.hasActiveBackgroundTasks();
         const swarmActive = this.store.isSwarmWorking;
@@ -4426,15 +4581,58 @@ export class AppController {
     }
 
     try {
+      const mergeWithPreviews = (
+        remote: readonly SessionSummary[],
+        previewMap: ReadonlyMap<string, SessionAnchorRecord>,
+      ): ResumeSessionEntry[] =>
+        remote.map(s => {
+          const cached: SessionAnchorRecord | undefined = previewMap.get(s.sessionId);
+          const rawCwd = s.cwd || cached?.cwd || '';
+          return {
+            sessionId: s.sessionId,
+            cwd: rawCwd,
+            displayCwd: normalizeDisplayPath(rawCwd),
+            title: (s.title ?? '').trim() || cached?.title || '',
+            updatedAt: s.updatedAt || cached?.updatedAt || '',
+            ...(cached?.model ? { model: cached.model } : {}),
+            ...(cached?.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+            ...(cached?.mode ? { mode: cached.mode } : {}),
+            ...(cached?.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
+            ...(cached?.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
+          };
+        });
+
+      let previewMapReady: Map<string, SessionAnchorRecord> | null = null;
+
       // Immediately capture rejection on the concurrent remote list request so a fast failure
       // while local previews are still reading — or after the picker closes — never produces
       // an `unhandledRejection`.
-      const remoteResultPromise = client.listAllSessions().then(
-        sessions => ({ ok: true as const, sessions }),
-        error => ({ ok: false as const, error })
-      );
+      const remoteResultPromise = client
+        .listAllSessions({
+          onPage: partialRemote => {
+            if (isStale() || !previewMapReady) return;
+            const partialMerged = mergeWithPreviews(partialRemote, previewMapReady);
+            this.store.setResumeSessions(partialMerged, { loading: true });
+            const partialState = this.store.getState();
+            if (partialState.picker) {
+              const computed = computePickerData(
+                partialState,
+                partialState.picker,
+                this.store.traffic.list(),
+                this.#now()
+              );
+              this.store.setPickerSelected(computed.selectedId ?? null);
+            }
+            this.scheduler.markDirty();
+          },
+        })
+        .then(
+          sessions => ({ ok: true as const, sessions }),
+          error => ({ ok: false as const, error })
+        );
       const previewMap = await this.#previewStore.loadMap();
       if (isStale()) return;
+      previewMapReady = previewMap;
 
       // Render locally cached sessions immediately as progressive first paint while ACP pages load
       if (previewMap.size > 0) {
@@ -4474,23 +4672,7 @@ export class AppController {
         throw remoteResult.error;
       }
       const remoteSessions = remoteResult.sessions;
-
-      const merged: ResumeSessionEntry[] = remoteSessions.map(s => {
-        const cached: SessionAnchorRecord | undefined = previewMap.get(s.sessionId);
-        const rawCwd = s.cwd || cached?.cwd || '';
-        return {
-          sessionId: s.sessionId,
-          cwd: rawCwd,
-          displayCwd: normalizeDisplayPath(rawCwd),
-          title: (s.title ?? '').trim() || cached?.title || '',
-          updatedAt: s.updatedAt || cached?.updatedAt || '',
-          ...(cached?.model ? { model: cached.model } : {}),
-          ...(cached?.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
-          ...(cached?.mode ? { mode: cached.mode } : {}),
-          ...(cached?.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
-          ...(cached?.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
-        };
-      });
+      const merged = mergeWithPreviews(remoteSessions, previewMap);
 
       this.store.setResumeSessions(merged);
       const state = this.store.getState();
@@ -4925,7 +5107,7 @@ export class AppController {
       ) {
         return;
       }
-      this.osc.setStatusIdle();
+      this.#restoreOscAfterBlock();
       this.osc.setWorkingDirectory(this.store.getState().cwd);
       await this.#persistSessionAnchorAndOsc();
       if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) return;
@@ -4952,8 +5134,14 @@ export class AppController {
         this.scheduler.renderNow(true);
         return;
       }
+      const isNotFound = err instanceof AcpRpcError && err.isSessionNotFound();
+      if (isNotFound) {
+        void this.#previewStore.delete(sessionId).catch(() => {});
+      }
       this.store.pushToast(
-        `Failed to load session: ${err instanceof Error ? err.message : String(err)}`,
+        isNotFound
+          ? `Session ${meta?.title || sessionId.slice(0, 8)} not found (may have been deleted).`
+          : `Failed to load session: ${err instanceof Error ? err.message : String(err)}`,
         'error'
       );
       this.scheduler.renderNow();
