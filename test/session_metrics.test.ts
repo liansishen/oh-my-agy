@@ -17,6 +17,7 @@ import {
   formatTokenMetricsText,
   formatTpsText,
   getTranscriptPath,
+  readTranscriptModelCandidates,
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
 } from '../src/state/session_metrics';
@@ -758,5 +759,68 @@ describe('AppStore sessionMetrics & gitStatus state management', () => {
     store.resetSessionState();
     expect(store.getState().sessionMetrics).toBeNull();
     expect(store.getState().gitStatus).toEqual(git);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. readTranscriptModelCandidates: Tail model extraction from transcript.jsonl
+// ---------------------------------------------------------------------------
+
+describe('readTranscriptModelCandidates', () => {
+  test('reads newest-to-oldest deduplicated model IDs, handles missing files, and scans only the tail on large transcripts', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-model-scan-'));
+    try {
+      expect(await readTranscriptModelCandidates('missing-sess', { baseBrainDir: tmpDir })).toEqual([]);
+      expect(await readTranscriptModelCandidates('   ', { baseBrainDir: tmpDir })).toEqual([]);
+
+      const sessA = 'sess-models-a';
+      const pathA = getTranscriptPath(sessA, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(pathA), { recursive: true });
+      await writeFile(
+        pathA,
+        [
+          JSON.stringify({ type: 'USER_INPUT', content: 'hi' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+          '{broken json',
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      expect(await readTranscriptModelCandidates(sessA, { baseBrainDir: tmpDir })).toEqual([
+        'gemini-flash-worker-agy',
+        'gemini-pro-orchestrator-neon',
+        'gemini-4-carbon-low',
+      ]);
+
+      // Large transcript (> 512 KiB): only tail window is scanned and partial leading line is dropped
+      const sessLarge = 'sess-models-large';
+      const pathLarge = getTranscriptPath(sessLarge, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(pathLarge), { recursive: true });
+      const oldLine = `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        model: 'old-early-model',
+        content: 'x'.repeat(2048),
+      })}\n`;
+      const fillerLine = `${JSON.stringify({
+        type: 'GENERIC',
+        content: 'y'.repeat(16_384),
+      })}\n`;
+      const tailLine1 = `${JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh' })}\n`;
+      const tailLine2 = `${JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high' })}\n`;
+      await writeFile(
+        pathLarge,
+        oldLine + fillerLine.repeat(36) + tailLine1 + tailLine2,
+        'utf8',
+      );
+      expect(await readTranscriptModelCandidates(sessLarge, { baseBrainDir: tmpDir })).toEqual([
+        'gemini-4-hydrogen-high',
+        'gemini-4-neon-xhigh',
+      ]);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

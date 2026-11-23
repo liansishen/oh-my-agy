@@ -8838,4 +8838,697 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await controller.shutdown({ cleanExit: true });
     await runPromise;
   });
+
+  test('/new and /clear carry over model, thought_level, Orchestrator variant, and mode (including diff skipping, rapid double /new, error fallback, and legacy track)', async () => {
+    // -----------------------------------------------------------------------
+    // Part A: configOptions track (full carry-over, diff skip, Orchestrator,
+    //         rapid double /new race, and graceful degradation on failure)
+    // -----------------------------------------------------------------------
+    const tmpA = makeTempDir();
+    const agySettingsPath = join(tmpA, 'agy-settings.json');
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify({
+        orchestrator: {
+          planner: 'Gemini 4 Neon (Extra)',
+          executor: 'Claude Sonnet 5.5 (High)',
+        },
+      }),
+      'utf8',
+    );
+    const hostA = new FakeTernHost();
+    const sessionA = await createConnectedSession(hostA);
+    const acpA = new MockAcpHarness();
+
+    let sessionSeq = 0;
+    const sessionState = new Map<string, { model: string; thought: string; mode: string }>();
+    const setConfigCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    let holdNextModelSet: PromiseWithResolvers<void> | null = null;
+    let failNextModelSet = false;
+
+    const buildConfigOptionsFor = (sid: string) => {
+      const cur = sessionState.get(sid) ?? {
+        model: 'gemini-4-neon',
+        thought: 'high',
+        mode: 'default',
+      };
+      const isOrch = cur.model.includes('orchestrator');
+      const opts: Array<Record<string, unknown>> = [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: cur.model,
+          options: [
+            { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+            { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator Neon' },
+          ],
+        },
+      ];
+      if (!isOrch) {
+        opts.push({
+          id: 'thought_level',
+          name: 'Thought Level',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: cur.thought,
+          options:
+            cur.model === 'gemini-4-carbon'
+              ? [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                ]
+              : [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                  { value: 'xhigh', name: 'Extra' },
+                ],
+        });
+      }
+      opts.push({
+        id: 'mode',
+        name: 'Mode',
+        category: 'mode',
+        type: 'select',
+        currentValue: cur.mode,
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'accept-edits', name: 'Accept Edits' },
+          { value: 'auto', name: 'Auto' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      });
+      return opts;
+    };
+
+    acpA.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        sessionSeq += 1;
+        const sid = `sess-co-${sessionSeq}`;
+        // Server always initializes new sessions with defaults
+        sessionState.set(sid, { model: 'gemini-4-neon', thought: 'high', mode: 'default' });
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: buildConfigOptionsFor(sid) },
+        });
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { sessionId: string; configId: string; value: string };
+        setConfigCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+        const reply = () => {
+          if (p.configId === 'model' && failNextModelSet) {
+            failNextModelSet = false;
+            server.send({
+              jsonrpc: '2.0',
+              id: msg.id,
+              error: { code: -32602, message: 'Model unavailable' },
+            });
+            return;
+          }
+          const cur = sessionState.get(p.sessionId) ?? {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          };
+          if (p.configId === 'model') {
+            cur.model = p.value;
+            if (cur.model === 'gemini-4-carbon' && cur.thought === 'xhigh') {
+              cur.thought = 'high';
+            }
+          } else if (p.configId === 'thought_level') {
+            cur.thought = p.value;
+          } else if (p.configId === 'mode') {
+            cur.mode = p.value;
+          }
+          sessionState.set(p.sessionId, cur);
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        };
+        if (p.configId === 'model' && holdNextModelSet) {
+          const gate = holdNextModelSet;
+          holdNextModelSet = null;
+          void gate.promise.then(reply);
+          return;
+        }
+        reply();
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerA = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmpA,
+      session: sessionA,
+      output: hostA.safeOutput,
+      acpSpawn: acpA.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmpA, 'sessions') }),
+      configPath: join(tmpA, 'config.toml'),
+      agySettingsPath,
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runA = controllerA.run();
+    await controllerA.readyPromise;
+    await waitFor(
+      () => controllerA.store.getState().orchestratorSettings.planner === 'Gemini 4 Neon (Extra)',
+    );
+
+    // 1. Switch model + thought + mode, then run `/new` -> carries all three over
+    await controllerA.submitInput('/model gemini-4-carbon');
+    await controllerA.submitInput('/thought low');
+    await controllerA.submitInput('/mode accept-edits');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('accept-edits');
+
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-2');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('accept-edits');
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-2')).toEqual([
+      { sessionId: 'sess-co-2', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-co-2', configId: 'thought_level', value: 'low' },
+      { sessionId: 'sess-co-2', configId: 'mode', value: 'accept-edits' },
+    ]);
+
+    // 2. Diff-skip check: switch back to server default model + mode while keeping `low` thought,
+    //    then run `/clear` -> only `thought_level` RPC is sent
+    await controllerA.submitInput('/model gemini-4-neon');
+    await controllerA.submitInput('/mode default');
+    await controllerA.submitInput('/clear');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-3');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('default');
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-3')).toEqual([
+      { sessionId: 'sess-co-3', configId: 'thought_level', value: 'low' },
+    ]);
+
+    // 3. Orchestrator variant + mode carry-over without `thought_level`, preserving orchestratorSettings
+    await controllerA.submitInput('/model gemini-pro-orchestrator-neon');
+    await controllerA.submitInput('/mode plan');
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-4');
+    expect(controllerA.store.getState().controls.currentModelId).toBe(
+      'gemini-pro-orchestrator-neon',
+    );
+    expect(controllerA.store.getState().controls.supportsThoughtLevel).toBe(false);
+    expect(controllerA.store.getState().controls.currentModeId).toBe('plan');
+    expect(controllerA.store.getState().orchestratorSettings).toEqual({
+      planner: 'Gemini 4 Neon (Extra)',
+      executor: 'Claude Sonnet 5.5 (High)',
+    });
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-4')).toEqual([
+      { sessionId: 'sess-co-4', configId: 'model', value: 'gemini-pro-orchestrator-neon' },
+      { sessionId: 'sess-co-4', configId: 'mode', value: 'plan' },
+    ]);
+
+    // 4. Rapid double `/new` while carry-over `set_config_option(model)` is still in flight
+    await controllerA.submitInput('/model gemini-4-carbon');
+    await controllerA.submitInput('/thought medium');
+    await controllerA.submitInput('/mode auto');
+    const heldCarryOver = Promise.withResolvers<void>();
+    holdNextModelSet = heldCarryOver;
+    const firstNew = controllerA.submitInput('/new');
+    await waitFor(() => setConfigCalls.some(c => c.sessionId === 'sess-co-5' && c.configId === 'model'));
+    const secondNew = controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-6');
+    heldCarryOver.resolve();
+    await Promise.all([firstNew, secondNew]);
+    expect(controllerA.store.getState().sessionId).toBe('sess-co-6');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerA.store.getState().controls.currentThoughtLevel).toBe('medium');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('auto');
+
+    // 5. Graceful degradation when carry-over `model` RPC fails: new session succeeds,
+    //    `thought_level` is skipped, warning toast is shown, and `mode` is still restored
+    failNextModelSet = true;
+    await controllerA.submitInput('/new');
+    await waitFor(() => controllerA.store.getState().sessionId === 'sess-co-7');
+    expect(controllerA.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    expect(controllerA.store.getState().controls.currentModeId).toBe('auto');
+    expect(
+      controllerA.store
+        .getState()
+        .toasts.some(t => t.tone === 'warning' && t.text.includes('Failed to carry over model')),
+    ).toBe(true);
+    expect(setConfigCalls.filter(c => c.sessionId === 'sess-co-7')).toEqual([
+      { sessionId: 'sess-co-7', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-co-7', configId: 'mode', value: 'auto' },
+    ]);
+
+    await controllerA.shutdown({ cleanExit: true });
+    await runA;
+
+    // -----------------------------------------------------------------------
+    // Part B: Legacy `models` / `modes` track (no `configOptions`)
+    // -----------------------------------------------------------------------
+    const tmpB = makeTempDir();
+    const hostB = new FakeTernHost();
+    const sessionB = await createConnectedSession(hostB);
+    const acpB = new MockAcpHarness();
+
+    let legacySeq = 0;
+    const legacySetModelCalls: Array<{ sessionId: string; modelId: string }> = [];
+    const legacySetModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+
+    acpB.setHandler((msg, server) => {
+      if (msg.method === 'initialize') {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        legacySeq += 1;
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: `sess-legacy-${legacySeq}`,
+            models: {
+              currentModelId: 'gemini-4-neon',
+              availableModels: [
+                { modelId: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+                { modelId: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+              ],
+            },
+            modes: {
+              currentModeId: 'default',
+              availableModes: [
+                { id: 'default', name: 'Default' },
+                { id: 'plan', name: 'Plan' },
+              ],
+            },
+          },
+        });
+      } else if (msg.method === 'session/set_model') {
+        const p = msg.params as { sessionId: string; modelId: string };
+        legacySetModelCalls.push({ sessionId: p.sessionId, modelId: p.modelId });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/set_mode') {
+        const p = msg.params as { sessionId: string; modeId: string };
+        legacySetModeCalls.push({ sessionId: p.sessionId, modeId: p.modeId });
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controllerB = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmpB,
+      session: sessionB,
+      output: hostB.safeOutput,
+      acpSpawn: acpB.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmpB, 'sessions') }),
+      configPath: join(tmpB, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runB = controllerB.run();
+    await controllerB.readyPromise;
+    expect(controllerB.store.getState().sessionId).toBe('sess-legacy-1');
+
+    await controllerB.submitInput('/model gemini-4-carbon');
+    await controllerB.submitInput('/mode plan');
+    expect(controllerB.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerB.store.getState().controls.currentModeId).toBe('plan');
+
+    await controllerB.submitInput('/new');
+    await waitFor(() => controllerB.store.getState().sessionId === 'sess-legacy-2');
+    expect(controllerB.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(controllerB.store.getState().controls.currentModeId).toBe('plan');
+    expect(legacySetModelCalls).toEqual([
+      { sessionId: 'sess-legacy-1', modelId: 'gemini-4-carbon' },
+      { sessionId: 'sess-legacy-2', modelId: 'gemini-4-carbon' },
+    ]);
+    expect(legacySetModeCalls).toEqual([
+      { sessionId: 'sess-legacy-1', modeId: 'plan' },
+      { sessionId: 'sess-legacy-2', modeId: 'plan' },
+    ]);
+
+    await controllerB.shutdown({ cleanExit: true });
+    await runB;
+  });
+
+  test('oma -c (--continue) and /resume restore saved model, thoughtLevel, Orchestrator variant, and mode (with CLI overrides and transcript.jsonl fallback)', async () => {
+    const tmp = makeTempDir();
+    const sessionsDir = join(tmp, 'sessions');
+    const brainDir = join(tmp, 'brain');
+    const previewStore = new PreviewStore({ sessionsDir });
+
+    // Pre-populate saved oma anchors for `sess-resume-c1` and `sess-resume-orch`
+    await previewStore.save({
+      sessionId: 'sess-resume-c1',
+      cwd: tmp,
+      title: 'Saved Carbon Session',
+      model: 'gemini-4-carbon',
+      thoughtLevel: 'low',
+      mode: 'accept-edits',
+      turnCount: 1,
+      updatedAt: '2026-11-23T08:00:00.000Z',
+      preview: [{ role: 'user', text: 'Continue carbon work' }],
+    });
+    await previewStore.save({
+      sessionId: 'sess-resume-orch',
+      cwd: tmp,
+      title: 'Saved Orchestrator Session',
+      model: 'gemini-pro-orchestrator-neon',
+      mode: 'plan',
+      turnCount: 2,
+      updatedAt: '2026-11-23T07:00:00.000Z',
+      preview: [{ role: 'user', text: 'Resume orchestrator work' }],
+    });
+
+    // Pre-populate agy transcript.jsonl without oma anchor for `sess-no-anchor-1` and `sess-no-anchor-2`
+    const noAnchor1Logs = join(brainDir, 'sess-no-anchor-1', '.system_generated', 'logs');
+    mkdirSync(noAnchor1Logs, { recursive: true });
+    writeFileSync(
+      join(noAnchor1Logs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const noAnchor2Logs = join(brainDir, 'sess-no-anchor-2', '.system_generated', 'logs');
+    mkdirSync(noAnchor2Logs, { recursive: true });
+    writeFileSync(
+      join(noAnchor2Logs, 'transcript.jsonl'),
+      [
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-pro-orchestrator-neon' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const makeMockServer = (
+      sessionList: Array<{ sessionId: string; cwd: string; title: string; updatedAt: string }>,
+    ) => {
+      const harness = new MockAcpHarness();
+      const loadedState = new Map<string, { model: string; thought: string; mode: string }>();
+      const setCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+
+      const buildConfigOptionsFor = (sid: string) => {
+        const cur = loadedState.get(sid) ?? {
+          model: 'gemini-4-neon',
+          thought: 'high',
+          mode: 'default',
+        };
+        const isOrch = cur.model.includes('orchestrator');
+        const opts: Array<Record<string, unknown>> = [
+          {
+            id: 'model',
+            name: 'Model',
+            category: 'model',
+            type: 'select',
+            currentValue: cur.model,
+            options: [
+              { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+              { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+              { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator Neon' },
+            ],
+          },
+        ];
+        if (!isOrch) {
+          opts.push({
+            id: 'thought_level',
+            name: 'Thought Level',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: cur.thought,
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'medium', name: 'Medium' },
+              { value: 'high', name: 'High' },
+              { value: 'xhigh', name: 'Extra' },
+            ],
+          });
+        }
+        opts.push({
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue: cur.mode,
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'accept-edits', name: 'Accept Edits' },
+            { value: 'auto', name: 'Auto' },
+            { value: 'plan', name: 'Plan' },
+          ],
+        });
+        return opts;
+      };
+
+      harness.setHandler((msg, server) => {
+        if (msg.method === 'initialize') {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+        } else if (msg.method === 'session/list') {
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessions: sessionList },
+          });
+        } else if (msg.method === 'session/new') {
+          const sid = 'sess-fresh-init';
+          loadedState.set(sid, { model: 'gemini-4-neon', thought: 'high', mode: 'default' });
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: sid, configOptions: buildConfigOptionsFor(sid) },
+          });
+        } else if (msg.method === 'session/load') {
+          const p = msg.params as { sessionId: string };
+          // Server returns default config on session/load rather than previous selection
+          loadedState.set(p.sessionId, {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          });
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: p.sessionId, configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        } else if (msg.method === 'session/set_config_option') {
+          const p = msg.params as { sessionId: string; configId: string; value: string };
+          setCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+          const cur = loadedState.get(p.sessionId) ?? {
+            model: 'gemini-4-neon',
+            thought: 'high',
+            mode: 'default',
+          };
+          if (p.configId === 'model') cur.model = p.value;
+          else if (p.configId === 'thought_level') cur.thought = p.value;
+          else if (p.configId === 'mode') cur.mode = p.value;
+          loadedState.set(p.sessionId, cur);
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { configOptions: buildConfigOptionsFor(p.sessionId) },
+          });
+        } else if (msg.id !== undefined) {
+          server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      });
+
+      return { harness, setCalls };
+    };
+
+    const conflictingDefaults = {
+      ...DEFAULT_CONFIG,
+      default_model: 'gemini-4-neon',
+      default_thought: 'xhigh',
+      default_mode: 'default',
+    };
+
+    // 1) `oma -c` restores saved model + thoughtLevel + mode over conflicting config.toml defaults
+    const s1 = makeMockServer([
+      {
+        sessionId: 'sess-resume-c1',
+        cwd: tmp,
+        title: 'Saved Carbon Session',
+        updatedAt: '2026-11-23T08:00:00.000Z',
+      },
+    ]);
+    const host1 = new FakeTernHost();
+    const term1 = await createConnectedSession(host1);
+    const ctrl1 = new AppController({
+      cli: parseCliArgs(['-c']),
+      config: conflictingDefaults,
+      cwd: tmp,
+      session: term1,
+      output: host1.safeOutput,
+      acpSpawn: s1.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run1 = ctrl1.run();
+    await ctrl1.readyPromise;
+    expect(ctrl1.store.getState().sessionId).toBe('sess-resume-c1');
+    expect(ctrl1.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(ctrl1.store.getState().controls.currentThoughtLevel).toBe('low');
+    expect(ctrl1.store.getState().controls.currentModeId).toBe('accept-edits');
+    // Anchor file on disk retains restored controls rather than getting overwritten with defaults
+    const anchorAfterC1 = await previewStore.load('sess-resume-c1');
+    expect(anchorAfterC1?.model).toBe('gemini-4-carbon');
+    expect(anchorAfterC1?.thoughtLevel).toBe('low');
+    expect(anchorAfterC1?.mode).toBe('accept-edits');
+    await ctrl1.shutdown({ cleanExit: true });
+    await run1;
+
+    // 2) `oma -c --model gemini-4-neon` explicit CLI flag overrides saved model
+    const s2 = makeMockServer([
+      {
+        sessionId: 'sess-resume-c1',
+        cwd: tmp,
+        title: 'Saved Carbon Session',
+        updatedAt: '2026-11-23T08:00:00.000Z',
+      },
+    ]);
+    const host2 = new FakeTernHost();
+    const term2 = await createConnectedSession(host2);
+    const ctrl2 = new AppController({
+      cli: parseCliArgs(['-c', '--model', 'gemini-4-neon']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term2,
+      output: host2.safeOutput,
+      acpSpawn: s2.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = ctrl2.run();
+    await ctrl2.readyPromise;
+    expect(ctrl2.store.getState().controls.currentModelId).toBe('gemini-4-neon');
+    await ctrl2.shutdown({ cleanExit: true });
+    await run2;
+
+    // Restore saved anchor for `sess-resume-c1` before Part 3
+    await previewStore.save({
+      sessionId: 'sess-resume-c1',
+      cwd: tmp,
+      title: 'Saved Carbon Session',
+      model: 'gemini-4-carbon',
+      thoughtLevel: 'low',
+      mode: 'accept-edits',
+      turnCount: 1,
+      updatedAt: '2026-11-23T08:00:00.000Z',
+      preview: [{ role: 'user', text: 'Continue carbon work' }],
+    });
+
+    // 3) In-session `/resume` restores Orchestrator anchor, `/mode` persists mode, and missing anchor falls back to transcript.jsonl
+    const s3 = makeMockServer([
+      {
+        sessionId: 'sess-resume-orch',
+        cwd: tmp,
+        title: 'Saved Orchestrator Session',
+        updatedAt: '2026-11-23T07:00:00.000Z',
+      },
+      {
+        sessionId: 'sess-no-anchor-1',
+        cwd: tmp,
+        title: 'Transcript Only Session',
+        updatedAt: '2026-11-23T06:00:00.000Z',
+      },
+    ]);
+    const host3 = new FakeTernHost();
+    const term3 = await createConnectedSession(host3);
+    const ctrl3 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term3,
+      output: host3.safeOutput,
+      acpSpawn: s3.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run3 = ctrl3.run();
+    await ctrl3.readyPromise;
+
+    await ctrl3.submitInput('/resume sess-resume-orch');
+    await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-resume-orch');
+    host3.input.emit('\r');
+    await waitFor(() => ctrl3.store.getState().sessionId === 'sess-resume-orch');
+    expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
+    expect(ctrl3.store.getState().controls.supportsThoughtLevel).toBe(false);
+    expect(ctrl3.store.getState().controls.currentModeId).toBe('plan');
+
+    // Switching `/mode` updates anchor JSON on disk
+    await ctrl3.submitInput('/mode auto');
+    await waitFor(() => ctrl3.store.getState().controls.currentModeId === 'auto');
+    expect((await previewStore.load('sess-resume-orch'))?.mode).toBe('auto');
+
+    // Resuming a session with no oma anchor recovers model + thought from transcript.jsonl (skipping worker model)
+    await ctrl3.submitInput('/resume sess-no-anchor-1');
+    await waitFor(() => ctrl3.store.getState().picker?.selectedId === 'sess-no-anchor-1');
+    host3.input.emit('\r');
+    await waitFor(() => ctrl3.store.getState().sessionId === 'sess-no-anchor-1');
+    expect(ctrl3.store.getState().controls.currentModelId).toBe('gemini-4-carbon');
+    expect(ctrl3.store.getState().controls.currentThoughtLevel).toBe('low');
+    await ctrl3.shutdown({ cleanExit: true });
+    await run3;
+
+    // 4) `oma -c` on a transcript-only session recovers Orchestrator variant (skipping internal worker model)
+    const s4 = makeMockServer([
+      {
+        sessionId: 'sess-no-anchor-2',
+        cwd: tmp,
+        title: 'Transcript Only Orch',
+        updatedAt: '2026-11-23T09:00:00.000Z',
+      },
+    ]);
+    const host4 = new FakeTernHost();
+    const term4 = await createConnectedSession(host4);
+    const ctrl4 = new AppController({
+      cli: parseCliArgs(['-c']),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: term4,
+      output: host4.safeOutput,
+      acpSpawn: s4.harness.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run4 = ctrl4.run();
+    await ctrl4.readyPromise;
+    expect(ctrl4.store.getState().sessionId).toBe('sess-no-anchor-2');
+    expect(ctrl4.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
+    expect(ctrl4.store.getState().controls.supportsThoughtLevel).toBe(false);
+    await ctrl4.shutdown({ cleanExit: true });
+    await run4;
+  });
 });

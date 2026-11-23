@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import type { AcpChildProcess, AcpSpawnFn } from '../src/acp/client';
+import { saveSessionPreview } from '../src/preview/store';
+import { getTranscriptPath } from '../src/state/session_metrics';
 import {
   CliParseError,
   OMA_VERSION,
+  createAcpPlainAdapter,
   formatVersionText,
   parseCliArgs,
   resolveResumeTarget,
@@ -157,6 +161,28 @@ describe('resolveResumeTarget & stripOuterQuotes', () => {
     expect(resolved.title).toBe('Oh My Agy 设计');
     expect(resolved.model).toBe('gemini-4-neon');
     expect(resolved.thoughtLevel).toBe('high');
+  });
+
+  test('parses optional mode field from anchor JSON', () => {
+    const dir = makeTempDir();
+    const file = join(dir, 'anchor-mode.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        sessionId: 'd9834138-aa41-4c57-8242-dbca52334d8f',
+        cwd: dir,
+        model: 'gemini-4-carbon',
+        thoughtLevel: 'low',
+        mode: 'plan',
+      }),
+      'utf8',
+    );
+    const resolved = resolveResumeTarget(file);
+    expect(resolved.source).toBe('anchor_file');
+    expect(resolved.model).toBe('gemini-4-carbon');
+    expect(resolved.thoughtLevel).toBe('low');
+    expect(resolved.mode).toBe('plan');
   });
 
   test('returns invalid_anchor for missing or malformed .json anchor files', () => {
@@ -397,6 +423,534 @@ describe('runPlainRepl (--plain)', () => {
     expect(out).toContain('reply:initial hello');
     expect(out).toContain('reply:run cmd');
     expect(out).toContain('[new session sess-2]');
+  });
+
+  test('carries over CLI and interactive model, thought, and mode across /new and /clear and handles carry-over failures', async () => {
+    const stdin = new PassThrough();
+    let out = '';
+    let err = '';
+    const stdout = { write: (chunk: string) => { out += chunk; return true; } };
+    const stderr = { write: (chunk: string) => { err += chunk; return true; } };
+
+    let sessionSeq = 0;
+    const configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    let failModelOnSession = '';
+
+    const adapter: PlainAcpAdapter = {
+      async start() {},
+      async initialize() {
+        return { agentInfo: { name: 'agy', version: '1.5.14' } };
+      },
+      async newSession() {
+        sessionSeq += 1;
+        return { sessionId: `sess-plain-${sessionSeq}` };
+      },
+      async loadSession(id) {
+        return { sessionId: id };
+      },
+      async listSessions() {
+        return [];
+      },
+      async prompt() {
+        return { stopReason: 'end_turn' };
+      },
+      async cancel() {},
+      async setConfigOption(sid, configId, value) {
+        configCalls.push({ sessionId: sid, configId, value });
+        if (sid === failModelOnSession && configId === 'model') {
+          throw new Error('model temporarily unavailable');
+        }
+      },
+      async closeSession() {},
+      async shutdown() {},
+      onUpdate() {},
+      onPermission() {},
+    };
+
+    const cli = parseCliArgs([
+      '--plain',
+      '--model',
+      'gemini-4-carbon',
+      '--thought',
+      'medium',
+      '--mode',
+      'plan',
+    ]);
+
+    const runPromise = runPlainRepl({
+      cli,
+      cwd: 'D:/work',
+      adapter,
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    stdin.write('/new\n');
+    stdin.write('/model gemini-4-neon-xhigh\n');
+    stdin.write('/mode auto\n');
+    stdin.write('/clear\n');
+    stdin.write('/thought low\n');
+    failModelOnSession = 'sess-plain-4';
+    stdin.write('/new\n');
+    stdin.write('/quit\n');
+    stdin.end();
+
+    const code = await runPromise;
+    expect(code).toBe(0);
+    expect(configCalls).toEqual([
+      // sess-plain-1 initial CLI flags
+      { sessionId: 'sess-plain-1', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-plain-1', configId: 'thought_level', value: 'medium' },
+      { sessionId: 'sess-plain-1', configId: 'mode', value: 'plan' },
+      // /new -> sess-plain-2 replays all three
+      { sessionId: 'sess-plain-2', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-plain-2', configId: 'thought_level', value: 'medium' },
+      { sessionId: 'sess-plain-2', configId: 'mode', value: 'plan' },
+      // interactive changes on sess-plain-2
+      { sessionId: 'sess-plain-2', configId: 'model', value: 'gemini-4-neon-xhigh' },
+      { sessionId: 'sess-plain-2', configId: 'mode', value: 'auto' },
+      // /clear -> sess-plain-3 replays suffix model + mode (no stale medium thought)
+      { sessionId: 'sess-plain-3', configId: 'model', value: 'gemini-4-neon-xhigh' },
+      { sessionId: 'sess-plain-3', configId: 'mode', value: 'auto' },
+      // interactive /thought low on sess-plain-3
+      { sessionId: 'sess-plain-3', configId: 'thought_level', value: 'low' },
+      // /new -> sess-plain-4 fails model carry-over, skips thought_level, still restores mode
+      { sessionId: 'sess-plain-4', configId: 'model', value: 'gemini-4-neon-xhigh' },
+      { sessionId: 'sess-plain-4', configId: 'mode', value: 'auto' },
+    ]);
+    expect(err).toContain('[oma] warning: failed to carry over model "gemini-4-neon-xhigh": model temporarily unavailable');
+    expect(out).toContain('[new session sess-plain-2]');
+    expect(out).toContain('[new session sess-plain-3]');
+    expect(out).toContain('[new session sess-plain-4]');
+  });
+
+  test('createAcpPlainAdapter exposes live control state and diff-skips unchanged controls across /new', async () => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const setConfigCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    let sessionSeq = 0;
+
+    const buildConfigOptions = (model: string, thought: string, mode: string) => [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: model,
+        options: [
+          { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        name: 'Thought Level',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: thought,
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+      {
+        id: 'mode',
+        name: 'Mode',
+        category: 'mode',
+        type: 'select',
+        currentValue: mode,
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      },
+    ];
+
+    const spawn: AcpSpawnFn = (): AcpChildProcess => {
+      let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const exited = Promise.withResolvers<number>();
+      const sessionValues = new Map<string, { model: string; thought: string; mode: string }>();
+      let buf = '';
+
+      const send = (payload: Record<string, unknown>) => {
+        stdoutController?.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
+      };
+
+      return {
+        stdout: new ReadableStream<Uint8Array>({
+          start(controller) {
+            stdoutController = controller;
+          },
+        }),
+        stderr: new ReadableStream<Uint8Array>({
+          start() {},
+        }),
+        exited: exited.promise,
+        pid: 4242,
+        stdin: {
+          write(chunk) {
+            buf += typeof chunk === 'string' ? chunk : decoder.decode(chunk);
+            for (;;) {
+              const nl = buf.indexOf('\n');
+              if (nl < 0) break;
+              const line = buf.slice(0, nl).trim();
+              buf = buf.slice(nl + 1);
+              if (!line) continue;
+              const msg = JSON.parse(line) as {
+                id?: number | string;
+                method?: string;
+                params?: Record<string, unknown>;
+              };
+              if (msg.method === 'initialize') {
+                send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+              } else if (msg.method === 'session/new') {
+                sessionSeq += 1;
+                const sid = `sess-acp-${sessionSeq}`;
+                const initVals = { model: 'gemini-4-neon', thought: 'high', mode: 'default' };
+                sessionValues.set(sid, initVals);
+                send({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    sessionId: sid,
+                    configOptions: buildConfigOptions(initVals.model, initVals.thought, initVals.mode),
+                  },
+                });
+              } else if (msg.method === 'session/set_config_option') {
+                const p = msg.params as { sessionId: string; configId: string; value: string };
+                setConfigCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+                const cur = sessionValues.get(p.sessionId) ?? {
+                  model: 'gemini-4-neon',
+                  thought: 'high',
+                  mode: 'default',
+                };
+                if (p.configId === 'model') cur.model = p.value;
+                else if (p.configId === 'thought_level') cur.thought = p.value;
+                else if (p.configId === 'mode') cur.mode = p.value;
+                sessionValues.set(p.sessionId, cur);
+                send({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    configOptions: buildConfigOptions(cur.model, cur.thought, cur.mode),
+                  },
+                });
+              } else if (msg.id !== undefined) {
+                send({ jsonrpc: '2.0', id: msg.id, result: {} });
+              }
+            }
+          },
+          flush() {},
+          end() {
+            try {
+              stdoutController?.close();
+            } catch {}
+            exited.resolve(0);
+          },
+        },
+        kill() {
+          try {
+            stdoutController?.close();
+          } catch {}
+          exited.resolve(0);
+        },
+      };
+    };
+
+    const adapter = createAcpPlainAdapter({ spawn, cwd: 'D:/work' });
+    const stdin = new PassThrough();
+    let out = '';
+    let err = '';
+    const runPromise = runPlainRepl({
+      cli: parseCliArgs(['--plain']),
+      cwd: 'D:/work',
+      adapter,
+      stdin,
+      stdout: { write: chunk => { out += chunk; return true; } },
+      stderr: { write: chunk => { err += chunk; return true; } },
+    });
+
+    stdin.write('/thought low\n');
+    stdin.write('/new\n');
+    stdin.write('/quit\n');
+    stdin.end();
+
+    const code = await runPromise;
+    expect(code).toBe(0);
+    expect(err).toBe('');
+    // Since model (`gemini-4-neon`) and mode (`default`) already match new session defaults,
+    // only `thought_level=low` is replayed onto `sess-acp-2`.
+    expect(setConfigCalls).toEqual([
+      { sessionId: 'sess-acp-1', configId: 'thought_level', value: 'low' },
+      { sessionId: 'sess-acp-2', configId: 'thought_level', value: 'low' },
+    ]);
+    expect(adapter.getControlState?.()).toEqual({
+      modelId: 'gemini-4-neon',
+      supportsThoughtLevel: true,
+      thoughtLevel: 'low',
+      modeId: 'default',
+    });
+    expect(out).toContain('[new session sess-acp-2]');
+  });
+
+  test('--continue and --resume restore saved controls from anchor JSON and fall back to transcript.jsonl in --plain mode', async () => {
+    const tmp = makeTempDir();
+    const sessionsDir = join(tmp, 'sessions');
+    const brainDir = join(tmp, 'brain');
+    await saveSessionPreview(
+      {
+        sessionId: 'sess-plain-anchor',
+        cwd: 'D:/work',
+        title: 'Plain Saved Session',
+        model: 'gemini-4-carbon',
+        thoughtLevel: 'low',
+        mode: 'plan',
+        preview: [],
+      },
+      { sessionsDir },
+    );
+
+    const transcriptPath = getTranscriptPath('sess-plain-transcript', { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptPath), { recursive: true });
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-carbon-low' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-flash-worker-agy' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    // 1) `--continue` restores anchor model, thoughtLevel, and mode; CLI override wins when passed
+    const calls1: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const makeResumeAdapter = (calls: Array<{ sessionId: string; configId: string; value: string }>): PlainAcpAdapter => ({
+      async start() {},
+      async initialize() {
+        return { agentInfo: { name: 'agy', version: '1.5.14' } };
+      },
+      async newSession() {
+        return { sessionId: 'sess-fallback-new' };
+      },
+      async loadSession(id) {
+        return { sessionId: id };
+      },
+      async listSessions() {
+        return [
+          {
+            sessionId: 'sess-plain-anchor',
+            cwd: 'D:/work',
+            title: 'Plain Saved Session',
+            updatedAt: '2026-11-23T09:00:00.000Z',
+          },
+        ];
+      },
+      async prompt() {
+        return { stopReason: 'end_turn' };
+      },
+      async cancel() {},
+      async setConfigOption(sid, configId, value) {
+        calls.push({ sessionId: sid, configId, value });
+      },
+      async closeSession() {},
+      async shutdown() {},
+      onUpdate() {},
+      onPermission() {},
+    });
+
+    const stdin1 = new PassThrough();
+    stdin1.write('/quit\n');
+    stdin1.end();
+    expect(
+      await runPlainRepl({
+        cli: parseCliArgs(['--plain', '-c']),
+        cwd: 'D:/work',
+        adapter: makeResumeAdapter(calls1),
+        stdin: stdin1,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        sessionsDir,
+        baseBrainDir: brainDir,
+      }),
+    ).toBe(0);
+    expect(calls1).toEqual([
+      { sessionId: 'sess-plain-anchor', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-plain-anchor', configId: 'thought_level', value: 'low' },
+      { sessionId: 'sess-plain-anchor', configId: 'mode', value: 'plan' },
+    ]);
+
+    const callsOverride: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const stdinOverride = new PassThrough();
+    stdinOverride.write('/quit\n');
+    stdinOverride.end();
+    expect(
+      await runPlainRepl({
+        cli: parseCliArgs(['--plain', '-c', '--model', 'gemini-4-neon', '--mode', 'auto']),
+        cwd: 'D:/work',
+        adapter: makeResumeAdapter(callsOverride),
+        stdin: stdinOverride,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        sessionsDir,
+        baseBrainDir: brainDir,
+      }),
+    ).toBe(0);
+    expect(callsOverride).toEqual([
+      { sessionId: 'sess-plain-anchor', configId: 'model', value: 'gemini-4-neon' },
+      { sessionId: 'sess-plain-anchor', configId: 'mode', value: 'auto' },
+    ]);
+
+    // 2) `--resume` on a transcript-only session via `createAcpPlainAdapter` skips worker model & splits `gemini-4-carbon-low`
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const acpSetCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const buildConfigOptions = (model: string, thought: string, mode: string) => [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: model,
+        options: [
+          { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+        ],
+      },
+      {
+        id: 'thought_level',
+        name: 'Thought Level',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: thought,
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+      {
+        id: 'mode',
+        name: 'Mode',
+        category: 'mode',
+        type: 'select',
+        currentValue: mode,
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      },
+    ];
+    const spawn: AcpSpawnFn = (): AcpChildProcess => {
+      let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const exited = Promise.withResolvers<number>();
+      const sessionValues = new Map<string, { model: string; thought: string; mode: string }>();
+      let buf = '';
+      const send = (payload: Record<string, unknown>) => {
+        stdoutController?.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
+      };
+      return {
+        stdout: new ReadableStream<Uint8Array>({
+          start(controller) {
+            stdoutController = controller;
+          },
+        }),
+        stderr: new ReadableStream<Uint8Array>({ start() {} }),
+        exited: exited.promise,
+        pid: 4343,
+        stdin: {
+          write(chunk) {
+            buf += typeof chunk === 'string' ? chunk : decoder.decode(chunk);
+            for (;;) {
+              const nl = buf.indexOf('\n');
+              if (nl < 0) break;
+              const line = buf.slice(0, nl).trim();
+              buf = buf.slice(nl + 1);
+              if (!line) continue;
+              const msg = JSON.parse(line) as {
+                id?: number | string;
+                method?: string;
+                params?: Record<string, unknown>;
+              };
+              if (msg.method === 'initialize') {
+                send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+              } else if (msg.method === 'session/load') {
+                const p = msg.params as { sessionId: string };
+                const initVals = { model: 'gemini-4-neon', thought: 'high', mode: 'default' };
+                sessionValues.set(p.sessionId, initVals);
+                send({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    sessionId: p.sessionId,
+                    configOptions: buildConfigOptions(initVals.model, initVals.thought, initVals.mode),
+                  },
+                });
+              } else if (msg.method === 'session/set_config_option') {
+                const p = msg.params as { sessionId: string; configId: string; value: string };
+                acpSetCalls.push({ sessionId: p.sessionId, configId: p.configId, value: p.value });
+                const cur = sessionValues.get(p.sessionId) ?? {
+                  model: 'gemini-4-neon',
+                  thought: 'high',
+                  mode: 'default',
+                };
+                if (p.configId === 'model') cur.model = p.value;
+                else if (p.configId === 'thought_level') cur.thought = p.value;
+                else if (p.configId === 'mode') cur.mode = p.value;
+                sessionValues.set(p.sessionId, cur);
+                send({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: { configOptions: buildConfigOptions(cur.model, cur.thought, cur.mode) },
+                });
+              } else if (msg.id !== undefined) {
+                send({ jsonrpc: '2.0', id: msg.id, result: {} });
+              }
+            }
+          },
+          flush() {},
+          end() {
+            try {
+              stdoutController?.close();
+            } catch {}
+            exited.resolve(0);
+          },
+        },
+        kill() {
+          try {
+            stdoutController?.close();
+          } catch {}
+          exited.resolve(0);
+        },
+      };
+    };
+
+    const acpAdapter = createAcpPlainAdapter({ spawn, cwd: 'D:/work' });
+    const stdin2 = new PassThrough();
+    stdin2.write('/quit\n');
+    stdin2.end();
+    expect(
+      await runPlainRepl({
+        cli: parseCliArgs(['--plain', '--resume', 'sess-plain-transcript']),
+        cwd: 'D:/work',
+        adapter: acpAdapter,
+        stdin: stdin2,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        sessionsDir,
+        baseBrainDir: brainDir,
+      }),
+    ).toBe(0);
+    expect(acpSetCalls).toEqual([
+      { sessionId: 'sess-plain-transcript', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'sess-plain-transcript', configId: 'thought_level', value: 'low' },
+    ]);
+    expect(acpAdapter.getControlState?.()).toEqual({
+      modelId: 'gemini-4-carbon',
+      supportsThoughtLevel: true,
+      thoughtLevel: 'low',
+      modeId: 'default',
+    });
   });
 });
 

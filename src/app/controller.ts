@@ -109,6 +109,7 @@ import {
 } from '../state/git_tui';
 import {
   areSessionMetricsEqual,
+  readTranscriptModelCandidates,
   SessionMetricsTracker,
   type SessionMetricsSnapshot,
 } from '../state/session_metrics';
@@ -353,6 +354,24 @@ function extractMentionedPaths(text: string): string[] {
   return found;
 }
 
+interface SessionControlCarryOver {
+  readonly modelId: string | null;
+  readonly thoughtLevel: string | null;
+  readonly modeId: string | null;
+}
+
+interface ResumeAnchorHint {
+  readonly model?: string;
+  readonly thoughtLevel?: string;
+  readonly mode?: string;
+}
+
+interface InitialSessionOutcome {
+  readonly kind: 'new' | 'resumed';
+  readonly epoch: number;
+  readonly anchorHint?: ResumeAnchorHint;
+}
+
 export class AppController {
   readonly store: AppStore;
   readonly session: Session;
@@ -415,6 +434,7 @@ export class AppController {
   #replayingSessionEpoch: number | null = null;
   #creatingSessionEpoch: number | null = null;
   #pendingNewSessionUpdates: SessionUpdateParams[] = [];
+  #pendingCarryOverControls: SessionControlCarryOver | null = null;
   #suppressedMentionPaths = new Set<string>();
   #configWriteBlockedReason: string | null = null;
   #configVerifiedWritable = false;
@@ -917,6 +937,7 @@ export class AppController {
     this.#workingStartedAt = undefined;
     this.#activePromptTask = null;
     this.#pendingNewSessionUpdates = [];
+    this.#pendingCarryOverControls = null;
 
     if (mode === 'replaying') {
       this.#creatingSessionEpoch = null;
@@ -996,10 +1017,10 @@ export class AppController {
         { supportsLogout: client.supportsLogout }
       );
 
-      await this.#openInitialSession(client, retrySessionId);
+      const initialOutcome = await this.#openInitialSession(client, retrySessionId);
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
-      await this.#applyInitialPreferences(client);
+      await this.#applyInitialPreferences(client, initialOutcome, Boolean(retrySessionId));
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
 
       this.store.setConnectionStatus('ready');
@@ -1044,13 +1065,18 @@ export class AppController {
     }
   }
 
-  async #openInitialSession(client: AcpClient, retrySessionId?: string): Promise<void> {
+  async #openInitialSession(
+    client: AcpClient,
+    retrySessionId?: string
+  ): Promise<InitialSessionOutcome> {
     const cwd = this.store.getState().cwd;
 
     if (retrySessionId) {
       try {
-        await this.#loadSessionWithReplay(client, retrySessionId, cwd);
-        return;
+        const loaded = await this.#loadSessionWithReplay(client, retrySessionId, cwd);
+        if (loaded) {
+          return { kind: 'resumed', epoch: this.#sessionEpoch };
+        }
       } catch (err) {
         if (!this.#isAcpClientLive(client)) throw err;
         // Fallback to new session if previous session cannot be reloaded
@@ -1069,8 +1095,24 @@ export class AppController {
       if (target.sessionId) {
         const targetCwd = target.cwd || cwd;
         try {
-          await this.#loadSessionWithReplay(client, target.sessionId, targetCwd, target.title);
-          return;
+          const loaded = await this.#loadSessionWithReplay(
+            client,
+            target.sessionId,
+            targetCwd,
+            target.title
+          );
+          if (loaded) {
+            const anchorHint: ResumeAnchorHint = {
+              ...(target.model ? { model: target.model } : {}),
+              ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
+              ...(target.mode ? { mode: target.mode } : {}),
+            };
+            return {
+              kind: 'resumed',
+              epoch: this.#sessionEpoch,
+              ...(Object.keys(anchorHint).length > 0 ? { anchorHint } : {}),
+            };
+          }
         } catch (err) {
           if (!this.#isAcpClientLive(client)) throw err;
           if (err instanceof AcpRpcError && err.isAuthRequired()) {
@@ -1093,13 +1135,15 @@ export class AppController {
         sessions.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
         const latest = sessions[0];
         if (latest) {
-          await this.#loadSessionWithReplay(
+          const loaded = await this.#loadSessionWithReplay(
             client,
             latest.sessionId,
             cwd,
             latest.title ?? undefined
           );
-          return;
+          if (loaded) {
+            return { kind: 'resumed', epoch: this.#sessionEpoch };
+          }
         }
       } catch (err) {
         if (!this.#isAcpClientLive(client)) throw err;
@@ -1134,6 +1178,7 @@ export class AppController {
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
+      return { kind: 'new', epoch: createEpoch };
     } finally {
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
@@ -1205,7 +1250,11 @@ export class AppController {
     sessionId: string,
     cwd: string,
     knownTitle?: string,
-    existingEpoch?: number
+    existingEpoch?: number,
+    options?: {
+      readonly restoreSavedControls?: boolean;
+      readonly anchorHint?: ResumeAnchorHint;
+    }
   ): Promise<boolean> {
     const loadEpoch =
       existingEpoch !== undefined
@@ -1255,6 +1304,23 @@ export class AppController {
       if (!this.#isAcpClientLive(client)) {
         throw new Error('ACP connection closed during session restore');
       }
+      if (options?.restoreSavedControls) {
+        const savedControls = await this.#resolveResumedSessionControls(
+          loaded.sessionId,
+          options.anchorHint
+        );
+        if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
+        if (!this.#isAcpClientLive(client)) {
+          throw new Error('ACP connection closed during session restore');
+        }
+        if (savedControls) {
+          await this.#applyCarryOverControls(client, loaded.sessionId, savedControls, loadEpoch);
+          if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
+          if (!this.#isAcpClientLive(client)) {
+            throw new Error('ACP connection closed during session restore');
+          }
+        }
+      }
       void this.#refreshGitStatus({ force: true });
 
       this.scheduler.resumeAfterReplay(true);
@@ -1291,45 +1357,119 @@ export class AppController {
     }
   }
 
-  async #applyInitialPreferences(client: AcpClient): Promise<void> {
+  async #applyInitialPreferences(
+    client: AcpClient,
+    outcome: InitialSessionOutcome,
+    preferSavedOverCli = false
+  ): Promise<void> {
     const state = this.store.getState();
     const sessionId = state.sessionId;
     if (!sessionId) return;
 
-    const desiredModel = this.#cli.model?.trim() || this.#config.default_model?.trim();
-    const desiredThought = this.#cli.thought?.trim() || this.#config.default_thought?.trim();
-    const desiredMode = this.#cli.mode?.trim() || this.#config.default_mode?.trim();
-
-    if (desiredModel) {
-      const resolved = resolveModelSelection(desiredModel, {
-        configOptions: [...state.configOptions],
-        models: state.models,
-        modes: state.modes,
-      });
-      if (resolved) {
-        try {
-          const applied = await applyModelSelection(
-            client,
-            sessionId,
-            resolved,
-            desiredThought || undefined
-          );
-          if (applied.configOptions) {
-            this.store.updateConfigOptions(applied.configOptions);
+    const applyModelAndThoughtPreference = async (
+      desiredModel: string,
+      desiredThought: string
+    ): Promise<void> => {
+      if (desiredModel) {
+        const curState = this.store.getState();
+        const resolved = resolveModelSelection(desiredModel, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (resolved) {
+          try {
+            const applied = await applyModelSelection(
+              client,
+              sessionId,
+              resolved,
+              desiredThought || undefined
+            );
+            if (applied.configOptions) {
+              this.store.updateConfigOptions(applied.configOptions);
+            } else {
+              this.store.updateCurrentModelId(applied.appliedModelId);
+            }
+          } catch (err) {
+            this.store.pushToast(
+              `Failed to apply initial model "${desiredModel}": ${err instanceof Error ? err.message : String(err)}`,
+              'warning'
+            );
           }
-        } catch (err) {
-          this.store.pushToast(
-            `Failed to apply initial model "${desiredModel}": ${err instanceof Error ? err.message : String(err)}`,
-            'warning'
-          );
         }
+      } else if (desiredThought) {
+        await this.#applyThoughtLevel(desiredThought, true);
       }
-    } else if (desiredThought) {
-      await this.#applyThoughtLevel(desiredThought, true);
+    };
+
+    if (outcome.kind === 'new') {
+      const desiredModel = this.#cli.model?.trim() || this.#config.default_model?.trim() || '';
+      const desiredThought =
+        this.#cli.thought?.trim() || this.#config.default_thought?.trim() || '';
+      const desiredMode = this.#cli.mode?.trim() || this.#config.default_mode?.trim() || '';
+
+      await applyModelAndThoughtPreference(desiredModel, desiredThought);
+      if (desiredMode) {
+        await this.#applyMode(desiredMode, true);
+      }
+      return;
     }
 
-    if (desiredMode) {
-      await this.#applyMode(desiredMode, true);
+    const saved = await this.#resolveResumedSessionControls(sessionId, outcome.anchorHint);
+    if (
+      this.#shuttingDown ||
+      !this.#isAcpClientLive(client) ||
+      outcome.epoch !== this.#sessionEpoch
+    ) {
+      return;
+    }
+
+    const cliModel = preferSavedOverCli ? '' : (this.#cli.model?.trim() || '');
+    const cliThought = preferSavedOverCli ? '' : (this.#cli.thought?.trim() || '');
+    const cliMode = preferSavedOverCli ? '' : (this.#cli.mode?.trim() || '');
+
+    if (cliModel) {
+      await applyModelAndThoughtPreference(
+        cliModel,
+        cliThought || this.#config.default_thought?.trim() || ''
+      );
+    } else if (saved?.modelId || saved?.thoughtLevel) {
+      await this.#applyCarryOverControls(
+        client,
+        sessionId,
+        {
+          modelId: saved.modelId,
+          thoughtLevel: cliThought || saved.thoughtLevel,
+          modeId: null,
+        },
+        outcome.epoch
+      );
+    } else {
+      await applyModelAndThoughtPreference(
+        this.#config.default_model?.trim() || '',
+        cliThought || this.#config.default_thought?.trim() || ''
+      );
+    }
+
+    if (
+      this.#shuttingDown ||
+      !this.#isAcpClientLive(client) ||
+      outcome.epoch !== this.#sessionEpoch
+    ) {
+      return;
+    }
+
+    if (cliMode) {
+      await this.#applyMode(cliMode, true);
+    } else if (saved?.modeId) {
+      await this.#applyCarryOverControls(
+        client,
+        sessionId,
+        { modelId: null, thoughtLevel: null, modeId: saved.modeId },
+        outcome.epoch
+      );
+    } else if (this.#config.default_mode?.trim()) {
+      await this.#applyMode(this.#config.default_mode.trim(), true);
     }
   }
 
@@ -4033,6 +4173,7 @@ export class AppController {
             updatedAt: cached.updatedAt || '',
             ...(cached.model ? { model: cached.model } : {}),
             ...(cached.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+            ...(cached.mode ? { mode: cached.mode } : {}),
             ...(cached.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
             ...(cached.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
           });
@@ -4069,6 +4210,7 @@ export class AppController {
           updatedAt: s.updatedAt || cached?.updatedAt || '',
           ...(cached?.model ? { model: cached.model } : {}),
           ...(cached?.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
+          ...(cached?.mode ? { mode: cached.mode } : {}),
           ...(cached?.turnCount !== undefined ? { turnCount: cached.turnCount } : {}),
           ...(cached?.preview && cached.preview.length > 0 ? { preview: cached.preview } : {}),
         };
@@ -4495,7 +4637,8 @@ export class AppController {
         sessionId,
         targetCwd,
         meta?.title,
-        switchEpoch
+        switchEpoch,
+        { restoreSavedControls: true }
       );
       if (
         !applied ||
@@ -4540,13 +4683,213 @@ export class AppController {
     }
   }
 
+  async #resolveResumedSessionControls(
+    sessionId: string,
+    anchorHint?: ResumeAnchorHint
+  ): Promise<SessionControlCarryOver | null> {
+    const storedAnchor = await this.#previewStore.load(sessionId).catch(() => null);
+    let modelId = anchorHint?.model?.trim() || storedAnchor?.model?.trim() || null;
+    let thoughtLevel = anchorHint?.model?.trim()
+      ? (anchorHint.thoughtLevel?.trim() || null)
+      : (anchorHint?.thoughtLevel?.trim() || storedAnchor?.thoughtLevel?.trim() || null);
+    const modeId = anchorHint?.mode?.trim() || storedAnchor?.mode?.trim() || null;
+
+    const curState = this.store.getState();
+    if (modelId && curState.controls.availableModels.length > 0) {
+      const resolved = resolveModelSelection(modelId, {
+        configOptions: [...curState.configOptions],
+        models: curState.models,
+        modes: curState.modes,
+      });
+      if (
+        resolved &&
+        resolved.matchKind !== 'fuzzy_config_model' &&
+        resolved.matchKind !== 'legacy_fuzzy'
+      ) {
+        modelId = resolved.modelId;
+        if (!thoughtLevel && resolved.thoughtLevel) {
+          thoughtLevel = resolved.thoughtLevel;
+        }
+      }
+    } else if (!modelId && curState.controls.availableModels.length > 0) {
+      const candidates = await readTranscriptModelCandidates(sessionId, {
+        ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
+      });
+      for (const candidate of candidates) {
+        const resolved = resolveModelSelection(candidate, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (
+          resolved &&
+          resolved.matchKind !== 'fuzzy_config_model' &&
+          resolved.matchKind !== 'legacy_fuzzy'
+        ) {
+          modelId = resolved.modelId;
+          if (!thoughtLevel && resolved.thoughtLevel) {
+            thoughtLevel = resolved.thoughtLevel;
+          }
+          break;
+        }
+      }
+    }
+
+    return modelId || thoughtLevel || modeId
+      ? { modelId, thoughtLevel, modeId }
+      : null;
+  }
+
+  async #applyCarryOverControls(
+    client: AcpClient,
+    sessionId: string,
+    carryOver: SessionControlCarryOver,
+    createEpoch: number
+  ): Promise<void> {
+    const isStale = (): boolean =>
+      this.#shuttingDown || createEpoch !== this.#sessionEpoch || !this.#isAcpClientLive(client);
+
+    let modelRestoreFailed = false;
+    let curState = this.store.getState();
+
+    // 1. Model
+    if (
+      carryOver.modelId &&
+      carryOver.modelId !== curState.controls.currentModelId &&
+      curState.controls.availableModels.length > 0
+    ) {
+      const resolved = resolveModelSelection(carryOver.modelId, {
+        configOptions: [...curState.configOptions],
+        models: curState.models,
+        modes: curState.modes,
+      });
+      if (
+        resolved &&
+        resolved.matchKind !== 'fuzzy_config_model' &&
+        resolved.matchKind !== 'legacy_fuzzy'
+      ) {
+        try {
+          const applied = await applyModelSelection(client, sessionId, resolved);
+          if (isStale()) return;
+          if (applied.configOptions) {
+            this.store.updateConfigOptions(applied.configOptions);
+          } else {
+            this.store.updateCurrentModelId(applied.appliedModelId);
+          }
+        } catch (err) {
+          modelRestoreFailed = true;
+          if (isStale()) return;
+          this.store.pushToast(
+            `Failed to carry over model "${carryOver.modelId}": ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            'warning',
+            { ttl: 3000 }
+          );
+        }
+      }
+    }
+
+    // 2. Thought level
+    if (!modelRestoreFailed && carryOver.thoughtLevel) {
+      curState = this.store.getState();
+      if (
+        curState.controls.supportsThoughtLevel &&
+        curState.controls.currentThoughtLevel !== carryOver.thoughtLevel
+      ) {
+        const resolvedThought = resolveThoughtLevel(carryOver.thoughtLevel, [
+          ...curState.configOptions,
+        ]);
+        const targetThought = resolvedThought.ok
+          ? resolvedThought.value
+          : resolvedThought.reason === 'invalid'
+            ? clampThoughtLevelForChoices(
+                carryOver.thoughtLevel,
+                curState.controls.availableThoughtLevels
+              )
+            : undefined;
+        if (targetThought && targetThought !== curState.controls.currentThoughtLevel) {
+          try {
+            const res = await client.setConfigOption({
+              sessionId,
+              configId: 'thought_level',
+              value: targetThought,
+            });
+            if (isStale()) return;
+            this.store.updateConfigOptions(res.configOptions);
+          } catch (err) {
+            if (isStale()) return;
+            this.store.pushToast(
+              `Failed to carry over thought level "${targetThought}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              'warning',
+              { ttl: 3000 }
+            );
+          }
+        }
+      }
+    }
+
+    // 3. Mode
+    if (carryOver.modeId) {
+      curState = this.store.getState();
+      const targetModeId = carryOver.modeId;
+      if (
+        targetModeId !== curState.controls.currentModeId &&
+        curState.controls.availableModes.some(
+          m => m.value.toLowerCase() === targetModeId.toLowerCase()
+        )
+      ) {
+        const resolvedMode = resolveModeSelection(targetModeId, {
+          configOptions: [...curState.configOptions],
+          models: curState.models,
+          modes: curState.modes,
+        });
+        if (resolvedMode) {
+          try {
+            if (resolvedMode.strategy === 'config_option') {
+              const res = await client.setConfigOption({
+                sessionId,
+                configId: 'mode',
+                value: resolvedMode.modeId,
+              });
+              if (isStale()) return;
+              this.store.updateConfigOptions(res.configOptions);
+            } else {
+              await client.setMode({ sessionId, modeId: resolvedMode.modeId });
+              if (isStale()) return;
+              this.store.updateCurrentModeId(resolvedMode.modeId);
+            }
+          } catch (err) {
+            if (isStale()) return;
+            this.store.pushToast(
+              `Failed to carry over mode "${targetModeId}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              'warning',
+              { ttl: 3000 }
+            );
+          }
+        }
+      }
+    }
+  }
+
   async #startNewSession(): Promise<void> {
     const client = this.#acpClient;
     if (!client) return;
     const state = this.store.getState();
     const oldId = state.sessionId;
     const wasStreaming = state.isStreaming;
+    const carryOver: SessionControlCarryOver = this.#pendingCarryOverControls ?? {
+      modelId: state.controls.currentModelId,
+      thoughtLevel: state.controls.supportsThoughtLevel ? state.controls.currentThoughtLevel : null,
+      modeId: state.controls.currentModeId,
+    };
+    const hasCarryOver = Boolean(carryOver.modelId || carryOver.thoughtLevel || carryOver.modeId);
     const createEpoch = this.#beginSessionTransition('creating');
+    this.#pendingCarryOverControls = hasCarryOver ? carryOver : null;
 
     if (oldId) {
       if (wasStreaming) {
@@ -4563,6 +4906,9 @@ export class AppController {
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
         this.#pendingNewSessionUpdates = [];
+      }
+      if (createEpoch === this.#sessionEpoch) {
+        this.#pendingCarryOverControls = null;
       }
       return;
     }
@@ -4591,6 +4937,16 @@ export class AppController {
         this.#creatingSessionEpoch = null;
       }
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
+      if (hasCarryOver) {
+        await this.#applyCarryOverControls(client, created.sessionId, carryOver, createEpoch);
+        if (
+          this.#shuttingDown ||
+          !this.#isAcpClientLive(client) ||
+          createEpoch !== this.#sessionEpoch
+        ) {
+          return;
+        }
+      }
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
@@ -4618,6 +4974,9 @@ export class AppController {
       if (this.#creatingSessionEpoch === createEpoch) {
         this.#creatingSessionEpoch = null;
         this.#pendingNewSessionUpdates = [];
+      }
+      if (createEpoch === this.#sessionEpoch) {
+        this.#pendingCarryOverControls = null;
       }
     }
   }
@@ -4704,6 +5063,8 @@ export class AppController {
       );
       if (applied.configOptions) {
         this.store.updateConfigOptions(applied.configOptions);
+      } else {
+        this.store.updateCurrentModelId(applied.appliedModelId);
       }
 
       // Record & persist `recent_models` to `config.toml`
@@ -4844,6 +5205,7 @@ export class AppController {
               value: targetOrchId,
             });
             this.store.updateConfigOptions(res.configOptions);
+            await this.#persistSessionAnchorAndOsc();
           } catch {
             // Non-fatal: settings.json is already updated
           }
@@ -5076,6 +5438,7 @@ export class AppController {
         this.store.pushToast(`Mode: ${resolved.modeName ?? resolved.modeId}`, 'info', {
           ttl: 2000,
         });
+        await this.#persistSessionAnchorAndOsc();
       }
       this.scheduler.renderNow();
     } catch (err) {

@@ -294,6 +294,7 @@ export interface ResumeSessionEntry {
   readonly updatedAt: string;
   readonly model?: string;
   readonly thoughtLevel?: string;
+  readonly mode?: string;
   readonly turnCount?: number;
   readonly preview?: readonly PreviewMessageSummary[];
 }
@@ -1247,6 +1248,19 @@ export class AppStore {
 
   updateConfigOptions(configOptions: readonly ConfigOption[]): void {
     this._configOptions = [...configOptions];
+    this.recomputeControls();
+    this.emit();
+  }
+
+  updateCurrentModelId(modelId: string): void {
+    if (this._models) {
+      this._models = { ...this._models, currentModelId: modelId };
+    }
+    this._configOptions = this._configOptions.map((opt) =>
+      opt.id === 'model' || opt.category === 'model'
+        ? { ...opt, currentValue: modelId }
+        : opt,
+    );
     this.recomputeControls();
     this.emit();
   }

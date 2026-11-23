@@ -810,3 +810,67 @@ async function readFileSlice(filePath: string, offset: number, length: number): 
     await fh.close();
   }
 }
+
+const MAX_MODEL_SCAN_BYTES = 512 * 1024;
+
+/**
+ * Scan the tail of local `agy` `transcript.jsonl` from newest to oldest and
+ * return deduplicated candidate model IDs recorded on transcript entries.
+ */
+export async function readTranscriptModelCandidates(
+  sessionId: string,
+  opts?: TranscriptPathOptions,
+): Promise<string[]> {
+  const trimmedId = sessionId.trim();
+  if (!trimmedId) return [];
+
+  const filePath = getTranscriptPath(trimmedId, opts);
+  let size: number;
+  try {
+    const st = await fs.stat(filePath);
+    if (!st.isFile() || st.size <= 0) return [];
+    size = st.size;
+  } catch {
+    return [];
+  }
+
+  const startOffset = Math.max(0, size - MAX_MODEL_SCAN_BYTES);
+  const length = size - startOffset;
+  let buf: Buffer;
+  try {
+    buf = await readFileSlice(filePath, startOffset, length);
+  } catch {
+    return [];
+  }
+
+  let text = buf.toString('utf8');
+  if (startOffset === 0 && text.charCodeAt(0) === 0xfeff) {
+    text = text.slice(1);
+  }
+  if (startOffset > 0) {
+    const firstNl = text.indexOf('\n');
+    if (firstNl === -1) return [];
+    text = text.slice(firstNl + 1);
+  }
+
+  const lines = text.split(/\r?\n/);
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]?.trim();
+    if (!line || !line.includes('"model"')) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isPlainObject(raw)) continue;
+    const model = typeof raw['model'] === 'string' ? raw['model'].trim() : '';
+    if (model && !seen.has(model)) {
+      seen.add(model);
+      candidates.push(model);
+    }
+  }
+  return candidates;
+}
