@@ -26,7 +26,10 @@ import {
 } from '../acp/model';
 import { sameDir } from '../acp/path';
 import { fuzzyMatchText, type SlashCommandDef } from '../commands/registry';
-import { parseOrchestratorModelSpec } from '../config/agy_settings';
+import {
+  formatAutoCompactSummary,
+  parseOrchestratorModelSpec,
+} from '../config/agy_settings';
 import {
   inferModelProvider,
   MODEL_PROVIDER_META,
@@ -687,7 +690,7 @@ export function computePickerData(
     const rawSelectedThought =
       picker.modelPickerThinking ??
       (isOrchestratorRole
-        ? currentRoleSpec?.thoughtLevel
+        ? (currentRoleSpec?.thoughtLevel ?? 'high')
         : selectedId === state.controls.currentModelId
           ? state.controls.currentThoughtLevel
           : undefined) ??
@@ -715,6 +718,11 @@ export function computePickerData(
             : 'Not supported by this model',
         };
 
+    const autoCompact =
+      picker.kind === 'model'
+        ? formatAutoCompactSummary(state.autoCompactOverrideRaw, state.usage?.size)
+        : null;
+
     return {
       ...(isOrchestratorRole
         ? {
@@ -723,7 +731,9 @@ export function computePickerData(
                 ? 'Orchestrator · Planner'
                 : 'Orchestrator · Executor',
           }
-        : {}),
+        : autoCompact?.isOverride
+          ? { subtitle: `Auto-compact: ${autoCompact.compactLabel} (override)` }
+          : {}),
       icon: isOrchestratorRole ? 'plan' : 'cpu',
       size: 'md',
       layout: 'rows',

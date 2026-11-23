@@ -770,9 +770,21 @@ export interface ExtractedUserTodoSyncReminder {
 const LEADING_OMA_TODO_REMINDER_RE =
   /^\s*<system-reminder>\r?\nThe user manually modified the todo list \([^\r\n]*\)\.\r?\n[\s\S]*?Current todo list:\r?\n\r?\n([\s\S]*?)\r?\n<\/system-reminder>[ \t]*(?:\r?\n)*/;
 
+const TRAILING_OMA_TODO_REMINDER_RE =
+  /(?:\r?\n)*[ \t]*<system-reminder>\r?\nThe user manually modified the todo list \([^\r\n]*\)\.\r?\n[\s\S]*?Current todo list:\r?\n\r?\n([\s\S]*?)\r?\n<\/system-reminder>\s*$/;
+
+function parseReminderTodoBody(body: string): TodoPhase[] | undefined {
+  const trimmed = body.trim();
+  if (trimmed === '(empty)') {
+    return [];
+  }
+  const parsed = parseTodoMarkdown(trimmed);
+  return parsed.errors.length === 0 ? parsed.phases : undefined;
+}
+
 /**
- * Strip leading `oma`-injected `<system-reminder>` todo-sync blocks from replayed
- * `user_message_chunk` text and recover their embedded Markdown todo snapshot.
+ * Strip leading or trailing `oma`-injected `<system-reminder>` todo-sync blocks
+ * from replayed `user_message_chunk` text and recover their embedded Markdown todo snapshot.
  */
 export function extractUserTodoSyncReminderFromText(
   text: string,
@@ -785,16 +797,22 @@ export function extractUserTodoSyncReminderFromText(
     const match = LEADING_OMA_TODO_REMINDER_RE.exec(remaining);
     if (!match) break;
     hasReminder = true;
-    const body = (match[1] ?? '').trim();
-    if (body === '(empty)') {
-      latestPhases = [];
-    } else {
-      const parsed = parseTodoMarkdown(body);
-      if (parsed.errors.length === 0) {
-        latestPhases = parsed.phases;
-      }
+    const parsed = parseReminderTodoBody(match[1] ?? '');
+    if (parsed !== undefined) {
+      latestPhases = parsed;
     }
     remaining = remaining.slice(match[0].length);
+  }
+
+  while (true) {
+    const match = TRAILING_OMA_TODO_REMINDER_RE.exec(remaining);
+    if (!match) break;
+    hasReminder = true;
+    const parsed = parseReminderTodoBody(match[1] ?? '');
+    if (parsed !== undefined) {
+      latestPhases = parsed;
+    }
+    remaining = remaining.slice(0, match.index);
   }
 
   return {

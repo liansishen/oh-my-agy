@@ -186,6 +186,14 @@ describe('todo state machine', () => {
     const extractedOther = extractUserTodoSyncReminderFromText(unrelated);
     expect(extractedOther.hasReminder).toBe(false);
     expect(extractedOther.strippedText).toBe(unrelated);
+
+    const trailingReminder = formatUserTodoSyncReminder('/todo done', sample, false);
+    const extractedTrailing = extractUserTodoSyncReminderFromText(
+      `/plan build feature\n\n${trailingReminder}`
+    );
+    expect(extractedTrailing.hasReminder).toBe(true);
+    expect(extractedTrailing.strippedText).toBe('/plan build feature');
+    expect(extractedTrailing.phases).toEqual(parsed.phases);
   });
 });
 

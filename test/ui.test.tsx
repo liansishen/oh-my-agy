@@ -19,7 +19,7 @@ import {
   type WireNode,
 } from '@stencil-hq/tern';
 import type { AcpChildProcess, AcpSpawnFn } from '../src/acp/client';
-import { AppController } from '../src/app/controller';
+import { AppController, isSemverAtLeast } from '../src/app/controller';
 import { parseCliArgs } from '../src/app/fallback';
 import { DEFAULT_CONFIG, parseConfigToml } from '../src/config/config';
 import type { ExecCommandFn } from '../src/ecosystem/cli';
@@ -12170,6 +12170,402 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const nodes = replayCurrentWireNodes();
     expect(nodes.get('layer.info')?.p['role']).toBe('omp.overlay.jobs');
     expect(nodes.get('layer.info.body.actions.summary')?.p['text']).toBe('7 recent');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('agy 1.5.15 parity: reattached session/load prompts, passthrough command attachments + trailing todo reminder, -32002 anchor cleanup, merged-turn TPS & auto-compact display', async () => {
+    expect(isSemverAtLeast('1.5.15', 1, 5, 15)).toBe(true);
+    expect(isSemverAtLeast('v1.6.0-rc1', 1, 5, 15)).toBe(true);
+    expect(isSemverAtLeast('1.5.14', 1, 5, 15)).toBe(false);
+    expect(isSemverAtLeast(undefined, 1, 5, 15)).toBe(false);
+
+    const tmp = makeTempDir();
+    const sessionsDir = join(tmp, 'sessions');
+    const previewStore = new PreviewStore({ sessionsDir });
+    const imgFile = join(tmp, 'shot.png');
+    writeFileSync(imgFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+    // Seed stale anchor for sess-missing (-32002 cleanup) and active running session sess-attach
+    await previewStore.save({
+      sessionId: 'sess-missing',
+      cwd: tmp,
+      title: 'Deleted session',
+      preview: [{ role: 'user', text: 'gone' }],
+    });
+    await previewStore.save({
+      sessionId: 'sess-attach',
+      cwd: tmp,
+      title: 'Running session',
+      preview: [{ role: 'user', text: 'run check' }],
+    });
+
+    const host = new FakeTernHost({
+      features: ['edit', 'undo', 'send', 'styles', 'blobs', 'aside'],
+    });
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 500_000;
+    const sentPrompts: Array<{ sessionId: string; prompt: Array<{ type: string; text?: string; uri?: string }> }> = [];
+    const serverReplies: Array<{ id: number | string; result?: unknown }> = [];
+    let currentSessionId = 'sess-init';
+    let loadCount = 0;
+
+    acp.setHandler((msg, server) => {
+      if (msg.id !== undefined && msg.method === undefined) {
+        serverReplies.push({ id: msg.id, result: (msg as { result?: unknown }).result });
+        return;
+      }
+      if (msg.method === 'initialize') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'agy', version: '1.5.15' },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'sess-init',
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                name: 'Model',
+                type: 'select',
+                currentValue: 'gemini-4-neon',
+                options: [{ value: 'gemini-4-neon', name: 'Gemini 4 Neon' }],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                name: 'Thinking',
+                type: 'select',
+                currentValue: 'high',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                  { value: 'xhigh', name: 'Extra' },
+                ],
+              },
+            ],
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-init',
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [{ name: 'swarm', description: 'Run swarm' }],
+            },
+          },
+        });
+      } else if (msg.method === 'session/list') {
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [
+              { sessionId: 'sess-missing', cwd: tmp, title: 'Deleted session', updatedAt: '2026-11-23T01:00:00Z' },
+              { sessionId: 'sess-attach', cwd: tmp, title: 'Running session', updatedAt: '2026-11-23T02:00:00Z' },
+            ],
+            nextCursor: null,
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        const p = msg.params as { sessionId: string };
+        loadCount += 1;
+        if (p.sessionId === 'sess-missing') {
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32002, message: 'Session not found' },
+          });
+          return;
+        }
+        currentSessionId = p.sessionId;
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: p.sessionId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: { type: 'text', text: '/plan build feature\n\n<system-reminder>\nThe user manually modified the todo list (manual).\nCurrent todo list:\n\n# Todos\n- [/] First task\n</system-reminder>' },
+            },
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: p.sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-attach-perm',
+              name: 'run_command',
+              kind: 'execute',
+              status: 'pending',
+              title: 'Run echo ok',
+            },
+          },
+        });
+        // Reattached active permission & foreign-session stale permission during session/load replay
+        server.send({
+          jsonrpc: '2.0',
+          id: 7001,
+          method: 'session/request_permission',
+          params: {
+            sessionId: p.sessionId,
+            toolCall: { toolCallId: 'tc-attach-perm', name: 'run_command', kind: 'execute', title: 'Run echo ok' },
+            options: [
+              { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+            ],
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          id: 7002,
+          method: 'session/request_permission',
+          params: {
+            sessionId: 'sess-other-stale',
+            toolCall: { toolCallId: 'tc-stale', title: 'Stale' },
+            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+          },
+        });
+        server.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: p.sessionId },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const p = msg.params as { sessionId: string; prompt: Array<{ type: string; text?: string; uri?: string }> };
+        sentPrompts.push(p);
+        // Merged turn: 1s output -> tool -> 20s wait -> 1s output -> end_turn with usage.outputTokens
+        void (async () => {
+          await Bun.sleep(15);
+          clock += 1000;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Starting subagent...' } },
+            },
+          });
+          await Bun.sleep(15);
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-sub-1',
+                name: 'invoke_subagent',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'invoke_subagent',
+              },
+            },
+          });
+          await Bun.sleep(15);
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-sub-1',
+                status: 'completed',
+                rawOutput: { output: 'Launched subagent' },
+              },
+            },
+          });
+          // Wait 20s for background subagent wakeup before model resumes streaming
+          await Bun.sleep(15);
+          clock += 20_000;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' All done.' } },
+            },
+          });
+          await Bun.sleep(15);
+          clock += 1000;
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: { sessionUpdate: 'usage_update', used: 200_000, size: 1_000_000 },
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn', usage: { outputTokens: 200 } },
+          });
+        })();
+      } else if (msg.id !== undefined) {
+        server.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      env: { AGY_CLI_AUTO_COMPACT_OVERRIDE: '800K' },
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      agySettingsPath: join(tmp, 'agy-settings.json'),
+      now: () => clock,
+      installSignals: false,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(() => controller.store.getState().isReady);
+
+    // 1. Passthrough `/swarm` with attachment + pending todo sync reminder:
+    //    - preserves attachment in outbound prompt blocks
+    //    - appends todo reminder AFTER the leading `/swarm` text block
+    //    - excludes 20s tool wait from merged-turn TPS (~200 / 2s = 100 tok/s, NOT ~9 tok/s)
+    controller.store.transcript.setTodoPhases(
+      [{ name: 'Todos', tasks: [{ content: 'Verify 1.5.15', status: 'in_progress' }] }],
+      { source: 'user' },
+    );
+    await controller.submitInput('/todo done Verify 1.5.15');
+    controller.store.addAttachment({
+      id: 'att-img',
+      kind: 'image',
+      name: 'shot.png',
+      mime: 'image/png',
+      base64Data: Buffer.from('png').toString('base64'),
+    });
+    await controller.submitInput('/swarm inspect screenshot');
+    await waitFor(() => sentPrompts.length === 1 && !controller.store.getState().isStreaming);
+
+    expect(controller.store.getState().hasSwarm).toBe(true);
+    const p0Blocks = sentPrompts[0]!.prompt;
+    expect(p0Blocks[0]!.type).toBe('image');
+    expect(p0Blocks[1]).toEqual({ type: 'text', text: '/swarm inspect screenshot' });
+    expect(p0Blocks[2]!.type).toBe('text');
+    expect(p0Blocks[2]!.text).toContain('<system-reminder>');
+
+    const tps = controller.store.getState().sessionMetrics?.currentTps ?? 0;
+    expect(tps).toBeGreaterThan(50);
+
+    // 2. `/context` and `/model` display AGY_CLI_AUTO_COMPACT_OVERRIDE (800k (80%))
+    const replayCurrentWireNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSubtree(child);
+        }
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          addSubtree(op[4]);
+        } else if (op[0] === 'del') {
+          deleteSubtree(op[1]);
+        } else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    await controller.submitInput('/context');
+    await waitFor(() => controller.store.getState().infoOverlay?.kind === 'context');
+    const ctxNodes = replayCurrentWireNodes();
+    expect(ctxNodes.get('layer.info.context-body.compaction')?.p['items']).toEqual([
+      {
+        k: [{ t: 'Auto-compact', s: 'muted' }],
+        v: [
+          {
+            t: '800k (80%) · override (AGY_CLI_AUTO_COMPACT_OVERRIDE=800K)',
+            s: 'accent mono',
+          },
+        ],
+      },
+    ]);
+    controller.store.closeInfoOverlay();
+
+    await controller.submitInput('/model');
+    await waitFor(() => controller.store.getState().picker?.kind === 'model');
+    const modelNodes = replayCurrentWireNodes();
+    expect(modelNodes.get('layer.modal')?.p['subtitle']).toBe('Auto-compact: 800k (80%) (override)');
+    controller.store.closePicker();
+
+    // 3. Switching to deleted session (-32002) cleans stale local anchor and warns cleanly
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        controller.store.getState().picker?.loading === false,
+    );
+    controller.store.setPickerSelected('sess-missing');
+    host.input.emit('\r');
+    await waitFor(() => loadCount === 1);
+    await waitFor(() => !existsSync(previewStore.getFilePath('sess-missing')));
+    expect(controller.store.getState().activeToast?.text).toContain('not found');
+
+    // 4. Reattaching to running session preserves buffered permission prompt, sets OSC blocked,
+    //    rejects foreign-session request, and strips trailing `<system-reminder>` on replay
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        controller.store.getState().picker?.loading === false,
+    );
+    controller.store.setPickerSelected('sess-attach');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().sessionId === 'sess-attach' && controller.store.approvals.hasPending());
+
+    expect(serverReplies.find(r => r.id === 7002)?.result).toEqual({ outcome: { outcome: 'cancelled' } });
+    expect(serverReplies.some(r => r.id === 7001)).toBe(false);
+    expect(host.osc7501[host.osc7501.length - 1]).toBe('state=blocked:kind=permission');
+    expect(controller.store.transcript.getVisibleTurns()[0]?.user?.text).toBe('/plan build feature');
+    expect(controller.store.transcript.todoPhases[0]?.tasks[0]?.content).toBe('First task');
+
+    // Approve reattached permission -> replies selected
+    controller.handleApprovalDecision('allow');
+    await waitFor(() => serverReplies.some(r => r.id === 7001));
+    expect(serverReplies.find(r => r.id === 7001)?.result).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow' },
+    });
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;

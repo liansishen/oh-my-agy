@@ -8,6 +8,7 @@ import {
   type TableRow,
   type Tone,
 } from '@stencil-hq/tern';
+import { formatAutoCompactSummary } from '../config/agy_settings';
 import {
   formatCompactTokens,
   formatContextUsage,
@@ -558,6 +559,7 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
       hasUsage && state.usage
         ? Math.min(1, Math.max(0, state.usage.used / state.usage.size))
         : undefined;
+    const autoCompact = formatAutoCompactSummary(state.autoCompactOverrideRaw, state.usage?.size);
 
     const rows: TableRow[] = (breakdown?.categories ?? []).map(cat => ({
       id: cat.category,
@@ -602,6 +604,22 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
             }
             total={hasUsage && state.usage ? formatCompactTokens(state.usage.size) : undefined}
             title={usageText ?? undefined}
+          />
+
+          <kv
+            key="compaction"
+            layout="inline"
+            items={[
+              {
+                k: [{ t: 'Auto-compact', s: 'muted' }],
+                v: [
+                  {
+                    t: autoCompact.label,
+                    s: autoCompact.isOverride ? 'accent mono' : 'muted',
+                  },
+                ],
+              },
+            ]}
           />
 
           <section key="breakdown" head="Local transcript estimate">
@@ -652,7 +670,12 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
               },
               { t: '/compact', s: 'code' },
               {
-                t: ' to ask agy acp to summarize and compress the active context window.',
+                t: ' to summarize and compress now, or set ',
+                s: 'muted',
+              },
+              { t: 'AGY_CLI_AUTO_COMPACT_OVERRIDE', s: 'code' },
+              {
+                t: ' to override the auto-compaction threshold.',
                 s: 'muted',
               },
             ]}

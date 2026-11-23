@@ -2651,6 +2651,9 @@ export class TranscriptStore {
     tool.awaitingPermission = true;
     tool.permissionRequestId = requestId;
     tool.ask = mapped.ask;
+    tool.endedAt = undefined;
+    tool.tookMs = undefined;
+    tool.cancelled = false;
     tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
       awaitingPermission: true,
       cancelled: tool.cancelled,

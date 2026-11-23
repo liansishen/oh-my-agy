@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/liansishen/oh-my-agy/main/scripts/i
 默认安装到 `~/.local/bin/oma`（以 `root` 运行且存在 `/usr/local/bin` 时自动创建 `/usr/local/bin/oma` 软链接）；若检测到 `tern`，自动安装 `oma-reopen` 插件。
 
 > **安装脚本可选环境变量**：
-> - `OMA_VERSION`：指定版本（如 `v0.3.0`，默认 `latest`）
+> - `OMA_VERSION`：指定版本（如 `v0.3.1`，默认 `latest`）
 > - `OMA_INSTALL_DIR`：自定义安装目录
 > - `OMA_SKIP_PLUGIN=1`：跳过自动安装 `oma-reopen` Tern 插件
 > - `OMA_REPO`：自定义 GitHub 仓库（默认 `liansishen/oh-my-agy`）
@@ -49,7 +49,7 @@ oma update --check
 
 # 强制重装或切换到指定版本
 oma update --force
-oma update --version v0.3.0
+oma update --version v0.3.1
 ```
 
 ## 核心特性
@@ -59,7 +59,7 @@ oma update --version v0.3.0
   - **压缩前历史折叠与会话配置持久继承**：提供 `ui.collapse_compacted` 设置（默认开启），自动识别 `CHECKPOINT` / `USER_INPUT` 与自动压缩边界并将较早对话折叠为可交互展开/收起的横幅，同时保留完整历史供 `/copy`、`/export`、`/status` 与 `/context` 使用；`/new` 与 `/resume` 自动延续已选模型、思考档位与权限模式；
   - **按模型真实能力的思考档位与 Orchestrator 三段式胶囊**：`/model`（`Alt+P`）按各模型实际能力精准显示 4 档（Neon / Hydrogen）、3 档（Carbon / Argon / Flash / Claude）或禁用（GPT-OSS / Orchestrator），并将编排变体合并为按 `google` 分类与图标展示的单个 `Orchestrator` 入口；切入 Orchestrator 后底部呈现具备多层极光呼吸与运行态强化动效的 `Orchestrator` + 天蓝色 `Plan`（受限 4 选 1）+ 薄荷绿色 `Exec`（受限 2 选 1）短名胶囊，支持独立点击循环思考强度与弹窗切换，并原子持久化至 `~/.gemini/antigravity-cli/settings.json`；
   - **实时思考流 `/thinking [on|off]` 与智能工具折叠**：对应 `agy` `settings.json` 的 `showThinking`，开启后实时输出完整思考过程并在思考完成后保持展开；支持 `All / Compact / Hidden` 工具显示模式（`Alt+O` / `Ctrl+Shift+O`）与 `Ctrl+O` 展开工具解耦；
-  - **一体化 Composer 与底部状态栏遥测**：常驻上下文进度条、语义着色权限模式（点击切换）、可点击 Git 分支与脏态（点击打开全屏 Git UI）、实时滑窗 + `transcript.jsonl` 校准的输出速率（`tok/s`）与累计 Token / 缓存命中率（点击查看 `/context`）；
+  - **一体化 Composer 与底部状态栏遥测**：常驻上下文进度条、语义着色权限模式（点击切换）、可点击 Git 分支与脏态（点击打开全屏 Git UI）、实时滑窗 + `transcript.jsonl` 校准的输出速率（`tok/s`）与累计 Token / 缓存命中率（点击查看 `/context`，并在 `/context` 与 `/model` 中展示 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 自动压缩阈值）；
   - **全屏 Git Diff & Commit 界面（点击底部 Git 状态或 `/git`）**：基于 `omp.app.git` 原生组件实现，支持 `Split / Inline / File` 视图、行折行（`Wrap`）、`Path / Tree` 目录树、Unstaged / Staged 折叠分组、双端点重命名预览、单文件或批量 Stage / Unstage、Amend 与提交，以及干净工作区下按第一父提交基准的 HEAD Commit 浏览；
   - **原生交互式问答卡片（`ask_question` / `elicitation/create`）**：在 `initialize` 握手中完整声明 `elicitation` 能力，自动合并 `agy acp` 的单选/多选 + `Other` 自由输入字段，支持鼠标点选与全键盘导航（`↑/↓`、`1–9`、`Tab`/`Shift+Tab`、`Enter`、`Esc`）；
   - **原版 `agy` 风格 Swarm Board 蜂群实时看板（含 Overview 概览）与像素小蜜蜂动效**：常驻轻量监听 `swarm.json` / `members.json` / `board.jsonl` / `plan.json`，在高度 ≥ 28 行的终端中于看板顶部实时展示集群目标、完成/阻塞进度与最多 6 个并行工作流状态，蜂群模式下按实际成员数动态环绕飞舞像素小蜜蜂；按 `Alt+S`、点击 `jobs` 左侧小蜜蜂或输入 `/swarm board` 打开；

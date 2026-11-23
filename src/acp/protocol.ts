@@ -58,6 +58,7 @@ export const JSON_RPC_ERROR = {
   INVALID_PARAMS: -32602,
   INTERNAL_ERROR: -32603,
   AUTH_REQUIRED: -32000,
+  RESOURCE_NOT_FOUND: -32002,
   REQUEST_CANCELLED: -32800,
 } as const;
 
@@ -86,6 +87,19 @@ export class AcpRpcError extends Error {
       lower.includes("unauthorized") ||
       lower.includes("not logged in") ||
       lower.includes("login required")
+    );
+  }
+
+  /** 判断是否为会话/资源不存在错误（agy 1.5.15+ 返回 -32002） */
+  isSessionNotFound(): boolean {
+    if (this.code === JSON_RPC_ERROR.RESOURCE_NOT_FOUND) {
+      return true;
+    }
+    const lower = this.message.toLowerCase();
+    return (
+      lower.includes("session not found") ||
+      lower.includes("conversation not found") ||
+      lower.includes("trajectory not found")
     );
   }
 }
@@ -1023,7 +1037,7 @@ export function extractToolOutputText(rawOutput: unknown): string | undefined {
     return undefined;
   }
   const rec = rawOutput as Record<string, unknown>;
-  if (typeof rec.output === "string") {
+  if (typeof rec.output === "string" && rec.output.length > 0) {
     return rec.output;
   }
   const parts: string[] = [];
@@ -1035,6 +1049,21 @@ export function extractToolOutputText(rawOutput: unknown): string | undefined {
   }
   if (parts.length > 0) {
     return parts.join("\n");
+  }
+  if (typeof rec.error === "string" && rec.error.trim().length > 0) {
+    return rec.error;
+  }
+  if (typeof rec.error === "object" && rec.error !== null) {
+    const errObj = rec.error as Record<string, unknown>;
+    if (typeof errObj.message === "string" && errObj.message.trim().length > 0) {
+      return errObj.message;
+    }
+  }
+  if (typeof rec.message === "string" && rec.message.trim().length > 0) {
+    return rec.message;
+  }
+  if (typeof rec.output === "string") {
+    return rec.output;
   }
   return undefined;
 }
