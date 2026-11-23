@@ -1472,6 +1472,7 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     // Provider inference
     expect(inferModelProvider('gemini-4-neon')).toBe('google');
     expect(inferModelProvider('gemini-pro-orchestrator-neon')).toBe('google');
+    expect(inferModelProvider('orchestrator')).toBe('google');
     expect(inferModelProvider('claude-4.5-opus')).toBe('anthropic');
     expect(inferModelProvider('gpt-5.2-codex')).toBe('openai');
     expect(inferModelProvider('o3-mini')).toBe('openai');

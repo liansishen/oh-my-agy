@@ -391,6 +391,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const modeLabel = controls.currentModeName || modeId;
   const showModeChip = modeId !== 'default';
   const isOrchestratorActive = isOrchestratorModelId(controls.currentModelId);
+  const isOrchestratorWorking = isOrchestratorActive && (state.isStreaming || isBackgroundBusy);
+  const orchestratorMark = isOrchestratorWorking ? 'working' : undefined;
   const effortLevel = normalizeEffortLevel(controls.currentThoughtLevel);
   const effortDisplay =
     controls.currentThoughtLevelName || controls.currentThoughtLevel || effortLevel;
@@ -666,6 +668,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
           <row
             key="model"
             role={isOrchestratorActive ? 'oma.composer.model.orchestrator' : 'omp.composer.model'}
+            mark={orchestratorMark}
             gap="xs"
             align="center"
             title="Switch model  ⌥P"
@@ -706,6 +709,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             <row
               key="planner"
               role="oma.composer.planner"
+              mark={orchestratorMark}
               gap="xs"
               align="center"
               tone="info"
@@ -745,6 +749,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             <row
               key="executor"
               role="oma.composer.executor"
+              mark={orchestratorMark}
               gap="xs"
               align="center"
               tone="success"

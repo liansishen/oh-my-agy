@@ -3,13 +3,30 @@ export const OMA_TODO_TOOL_NAME = 'todo';
 export const OMA_TODO_EXPOSED_TOOL_NAME = `mcp_${OMA_TODO_MCP_SERVER_NAME}_${OMA_TODO_TOOL_NAME}`;
 export const TODO_AUTO_CLEAR_DELAY_MS = 60_000;
 
+export const OMA_TODO_TOOL_DESCRIPTION = [
+  'Write or update the session todo list displayed live in the user HUD (ops: init, start, done, drop, append, rm, view).',
+  'NEVER spend a separate turn on this tool: emit it in the same parallel tool-call batch alongside your next real tool call (`init` beside your first read/search/command, `done`/`start` beside the next action or verification).',
+  'Before or as soon as work involves 3+ steps/tool calls, multi-file changes, build/test/deploy flows, multi-source investigation, or multi-item requests, call `init` (and `init` mid-turn whenever a task expands beyond 2 steps). List every requested item separately.',
+  'Reference tasks verbatim by exact task text, NEVER synthetic IDs (like task-1). Lost text: call `view`, never guess.',
+  'After each completed step, mark it `done` immediately alongside the next tool call. Auto-advance keeps one task `in_progress` in phase order.',
+].join('\n');
+
 export const OMA_TODO_SYSTEM_PROMPT_APPEND = [
-  `You have the session todo list tool \`${OMA_TODO_EXPOSED_TOOL_NAME}\`.`,
-  'Proactively call it on multi-step implementation, refactoring, debugging, or plan-execution tasks to show structured phases and live progress in the user HUD.',
-  'Skip it for single-step answers or quick read-only lookups.',
-  'Operations: init (list=[{phase,items}] or flat items=[...]), append, start (single task), done, drop, rm, view.',
-  'Always reference tasks verbatim by their exact task text (never synthetic task-N IDs).',
-  'Keep at most one task in_progress at a time, and mark remaining tasks done or drop before finishing.',
+  '<todo_tracking>',
+  `You have the mandatory session progress tracker \`${OMA_TODO_EXPOSED_TOOL_NAME}\`, which renders live phases and checklist status above the user HUD.`,
+  '',
+  'When to call:',
+  `- MUST call \`${OMA_TODO_EXPOSED_TOOL_NAME}\` with \`op="init"\` for any task expected to take 3+ steps or tool calls — including coding, refactoring, debugging, config/version updates, build/test/deployment, multi-source research, plan execution, or multi-item requests.`,
+  '- Mid-turn escalation: if a task starts as a quick check and expands beyond 2 tool calls, call `op="init"` alongside your next tool call.',
+  '- Follow-up turns: when the previous list is finished or empty and the user sends a new multi-step request, call `op="init"` to start a fresh list.',
+  '- Skip ONLY for single-turn answers, translations, or 1–2 step read-only lookups.',
+  '',
+  'How to call (zero extra turns):',
+  '- NEVER spend a turn calling only this tool. Batch `op="init"` in parallel alongside your first `read_file`/`run_command`/`search_web` call, and batch `op="done"`/`op="start"` alongside the next action or verification call.',
+  '- Use `list: [{ phase, items }]` (or flat `items: [...]`) for `init`; list every user-requested item separately.',
+  '- Always reference tasks verbatim by their exact task text (never synthetic IDs like `task-1`); if unsure, call `op="view"`.',
+  '- Keep at most one task `in_progress` at a time (`done` auto-advances to the next pending task), and mark all remaining tasks `done` or `drop` before finishing.',
+  '</todo_tracking>',
 ].join('\n');
 
 export const TODO_HELP_TEXT = [

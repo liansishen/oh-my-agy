@@ -146,6 +146,7 @@ export function inferModelProvider(modelId: string): ModelProviderId {
   if (
     prefix === 'google' ||
     bare === 'gemini' ||
+    (!prefix && bare === ORCHESTRATOR_PICKER_ID) ||
     bare.startsWith('gemini-') ||
     bare.startsWith('gemini_')
   ) {

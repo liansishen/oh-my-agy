@@ -4,6 +4,7 @@ import {
   applyTodoOperation,
   cloneTodoPhases,
   OMA_TODO_MCP_SERVER_NAME,
+  OMA_TODO_TOOL_DESCRIPTION,
   OMA_TODO_TOOL_NAME,
   type TodoCompletedDelta,
   type TodoOp,
@@ -27,8 +28,7 @@ export interface EmbeddedTodoMcpServerOptions {
 
 const TODO_TOOL_DECLARATION = {
   name: OMA_TODO_TOOL_NAME,
-  description:
-    'Write or update a structured multi-phase session todo list to track progress (ops: init, start, done, drop, append, rm, view).',
+  description: OMA_TODO_TOOL_DESCRIPTION,
   inputSchema: {
     type: 'object',
     properties: {

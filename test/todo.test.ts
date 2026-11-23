@@ -11,6 +11,8 @@ import {
   isOmaTodoToolName,
   mapTodoPhasesToChecklist,
   OMA_TODO_EXPOSED_TOOL_NAME,
+  OMA_TODO_SYSTEM_PROMPT_APPEND,
+  OMA_TODO_TOOL_DESCRIPTION,
   parseTodoMarkdown,
   type TodoPhase,
 } from '../src/state/todo';
@@ -248,6 +250,7 @@ describe('EmbeddedTodoMcpServer', () => {
       result: {
         tools: Array<{
           name: string;
+          description?: string;
           annotations?: { readOnlyHint?: boolean };
           _meta?: Record<string, unknown>;
         }>;
@@ -255,6 +258,15 @@ describe('EmbeddedTodoMcpServer', () => {
     };
     expect(listJson.result.tools).toHaveLength(1);
     expect(listJson.result.tools[0]?.name).toBe('todo');
+    expect(listJson.result.tools[0]?.description).toBe(OMA_TODO_TOOL_DESCRIPTION);
+    expect(OMA_TODO_TOOL_DESCRIPTION).toContain('parallel tool-call batch');
+    expect(OMA_TODO_TOOL_DESCRIPTION).toContain('3+ steps');
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND.startsWith('<todo_tracking>\n')).toBe(true);
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND.endsWith('\n</todo_tracking>')).toBe(true);
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('3+ steps');
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Mid-turn escalation');
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Follow-up turns');
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Batch `op="init"` in parallel');
     expect(listJson.result.tools[0]?.annotations?.readOnlyHint).toBe(true);
     expect(listJson.result.tools[0]?._meta?.['antigravity/alwaysLoad']).toBe(true);
 

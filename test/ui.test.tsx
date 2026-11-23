@@ -8653,6 +8653,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(neonData.items.filter(i => i.id.includes('orchestrator')).map(i => i.id)).toEqual([
       'orchestrator',
     ]);
+    expect(neonData.items.find(i => i.id === 'orchestrator')?.mark).toEqual({
+      text: 'GO',
+      seed: 'google',
+      icon: 'provider:google',
+    });
+    expect(neonData.scopes?.some(s => s.id === 'provider:antigravity')).toBe(false);
+    expect(neonData.scopes?.find(s => s.id === 'provider:google')?.count).toBe(6);
     expect(neonData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
     expect(neonData.level?.value).toBe('xhigh');
 
@@ -8683,10 +8690,13 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     // Highlight merged `orchestrator` & `gpt-oss-120b-medium`: disabled (0 steps)
     controller.store.setPickerSelected('orchestrator');
-    expect(
-      computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
-        .level?.disabled,
-    ).toBe('Configure effort in Plan / Exec pills');
+    const orchPickedData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(orchPickedData.level?.disabled).toBe('Configure effort in Plan / Exec pills');
+    expect(orchPickedData.level?.detail).toBe('Google');
     controller.store.setPickerSelected('gpt-oss-120b-medium');
     expect(
       computePickerData(controller.store.getState(), controller.store.getState().picker!, [])
@@ -8705,15 +8715,30 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     const orchNodes = replayNodes();
     expect(orchNodes.get('dock.composer.bar.model')?.p['role']).toBe('oma.composer.model.orchestrator');
+    expect(orchNodes.get('dock.composer.bar.model')?.p['mark']).toBe('working');
     expect(orchNodes.has('dock.composer.bar.model.effort')).toBe(false);
     expect(orchNodes.get('dock.composer.bar.planner')?.p['role']).toBe('oma.composer.planner');
+    expect(orchNodes.get('dock.composer.bar.planner')?.p['mark']).toBe('working');
     expect(orchNodes.get('dock.composer.bar.planner.tag')?.p['text']).toBe('Plan');
     expect(orchNodes.get('dock.composer.bar.planner.name')?.p['text']).toBe('Carbon');
     expect(orchNodes.get('dock.composer.bar.planner.effort')?.p['level']).toBe('high');
     expect(orchNodes.get('dock.composer.bar.executor')?.p['role']).toBe('oma.composer.executor');
+    expect(orchNodes.get('dock.composer.bar.executor')?.p['mark']).toBe('working');
     expect(orchNodes.get('dock.composer.bar.executor.tag')?.p['text']).toBe('Exec');
     expect(orchNodes.get('dock.composer.bar.executor.name')?.p['text']).toBe('Hydrogen');
     expect(orchNodes.get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Verify enhanced multi-layer Orchestrator animations stay within Tern CSS allowlist
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-glow');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-sheen');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-text');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-planner-pulse');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('@keyframes oma-orch-executor-pulse');
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-mark='working']");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('prefers-reduced-motion: reduce');
+    for (const disallowed of ['url(', 'position: fixed', '@font-face', '@import', 'text-shadow']) {
+      expect(WELCOME_LOGO_STYLESHEET).not.toContain(disallowed);
+    }
 
     // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
@@ -9058,6 +9083,74 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       { sessionId: 'sess-co-4', configId: 'model', value: 'gemini-pro-orchestrator-neon' },
       { sessionId: 'sess-co-4', configId: 'mode', value: 'plan' },
     ]);
+
+    // Idle Orchestrator session: `mark` stays unset; active streaming activates `mark="working"`, then clears
+    const replayNodesA = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of hostA.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') deleteSubtree(op[1]);
+        else if (op[0] === 'text') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            const prev = typeof e.p['text'] === 'string' ? e.p['text'] : '';
+            e.p['text'] = op[2] === 'append' ? prev + op[3] : op[3];
+          }
+        } else if (op[0] === 'set') {
+          const e = nodes.get(op[1]);
+          if (e) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete e.p[k];
+              else e.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+    expect(controllerA.store.isBusy).toBe(false);
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['role'] === 'oma.composer.model.orchestrator' &&
+        n.has('dock.composer.bar.planner') &&
+        n.has('dock.composer.bar.executor') &&
+        n.get('dock.composer.bar.model')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === undefined
+      );
+    });
+    controllerA.store.setStreaming(true);
+    controllerA.scheduler.renderNow();
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['mark'] === 'working' &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === 'working' &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === 'working'
+      );
+    });
+    controllerA.store.setStreaming(false);
+    controllerA.scheduler.renderNow();
+    await waitFor(() => {
+      const n = replayNodesA();
+      return (
+        n.get('dock.composer.bar.model')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.planner')?.p['mark'] === undefined &&
+        n.get('dock.composer.bar.executor')?.p['mark'] === undefined
+      );
+    });
 
     // 4. Rapid double `/new` while carry-over `set_config_option(model)` is still in flight
     await controllerA.submitInput('/model gemini-4-carbon');
