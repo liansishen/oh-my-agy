@@ -11178,4 +11178,907 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await controller.shutdown({ cleanExit: true });
     await runPromise;
   });
+
+  test('todo edge guards: unquoted append, non-oma todo approval, reminder separation/retry/replay, anchor persistence across /resume, disabled MCP, collapse re-arm, and edit error handling', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const sessId = 'sess-todo-guards';
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
+    const permissionResponses: unknown[] = [];
+    let failNextPrompt = false;
+    let replayReminderText = '';
+    let loadCount = 0;
+    let pendingExternalPromptId: number | string | undefined;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/list') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessions: [{ sessionId: sessId, cwd: tmp, title: 'Guard Session', updatedAt: '2026-11-23T14:20:00.000Z' }],
+          },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/load') {
+        loadCount += 1;
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sessId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              content: {
+                type: 'text',
+                text: replayReminderText
+                  ? `${replayReminderText}Hello resumed`
+                  : 'Hello resumed',
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sessId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'old-todo-1',
+              name: 'mcp_oma_todo_todo',
+              title: 'Run mcp_oma_todo_todo',
+              kind: 'other',
+              status: 'completed',
+              rawInput: { op: 'init', items: ['Old phantom task'] },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+
+      if (msg.method === 'session/prompt') {
+        const blocks = ((msg.params?.prompt as Array<{ type?: string; text?: string }>) ?? []).map(
+          b => ({ type: b.type, text: b.text }),
+        );
+        sentPrompts.push(blocks);
+
+        if (failNextPrompt) {
+          failNextPrompt = false;
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'transient prompt failure' },
+          });
+          return;
+        }
+
+        const joined = blocks.map(b => b.text ?? '').join('\n');
+        if (joined.includes('Retry succeeds')) {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sessId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'old-todo-1',
+                name: 'mcp_oma_todo_todo',
+                title: 'Run mcp_oma_todo_todo',
+                kind: 'other',
+                status: 'completed',
+                rawInput: { op: 'init', items: ['Old phantom task'] },
+              },
+            },
+          });
+        }
+        if (joined.includes('Ask external todo')) {
+          pendingExternalPromptId = msg.id;
+          h.send({
+            jsonrpc: '2.0',
+            id: 888,
+            method: 'session/request_permission',
+            params: {
+              sessionId: sessId,
+              toolCall: {
+                toolCallId: 'ext-todo-1',
+                name: 'todo',
+                title: 'Todo',
+              },
+              options: [{ optionId: 'allow-ext', name: 'Allow', kind: 'allow_once' }],
+            },
+          });
+          return;
+        }
+
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+
+      if (msg.id === 888) {
+        permissionResponses.push(msg.result);
+        if (pendingExternalPromptId !== undefined) {
+          const replyId = pendingExternalPromptId;
+          pendingExternalPromptId = undefined;
+          h.send({ jsonrpc: '2.0', id: replyId, result: { stopReason: 'end_turn' } });
+        }
+        return;
+      }
+
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      clipboard: {
+        isRemoteSshWithoutDisplay: () => false,
+        readImage: async () => null,
+        readText: async () => '',
+        writeText: async () => true,
+      },
+      editTodoExternal: async () => {
+        throw new Error('editor binary missing');
+      },
+      todoAutoClearDelayMs: 40,
+      installSignals: false,
+      throttleMs: 5,
+      replayDrainQuietMs: 5,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // 1. Unquoted multi-word `/todo append` must NOT create phase "Fix"
+    await controller.submitInput('/todo append Fix login bug');
+    expect(controller.store.transcript.todoPhases).toEqual([
+      { name: 'Todos', tasks: [{ content: 'Fix login bug', status: 'in_progress' }] },
+    ]);
+
+    // Existing phase fuzzy match still works without quotes
+    await controller.submitInput('/todo append todo Second check');
+    expect(controller.store.transcript.todoPhases[0]?.tasks).toHaveLength(2);
+
+    // `/todo edit` editor launch error is caught gracefully with toast
+    await controller.submitInput('/todo edit');
+    expect(controller.store.getState().toasts.some(t => t.text.includes('editor binary missing'))).toBe(true);
+
+    // `/todo expand` then `/todo collapse` after completing all tasks re-arms auto-clear
+    await controller.submitInput('/todo done');
+    await controller.submitInput('/todo expand');
+    expect(controller.store.transcript.plan?.phases?.[0]?.items.length).toBe(2);
+    const opsBeforeCollapse = host.allOps.length;
+    await controller.submitInput('/todo collapse');
+    await waitFor(() =>
+      host.allOps
+        .slice(opsBeforeCollapse)
+        .some(op => op[0] === 'del' && (op[1] === 'dock.activity.todo' || op[1] === 'dock.activity'))
+    );
+
+    // 2. Failed prompt preserves `<system-reminder>`, next prompt delivers it with `\n\n` separator
+    failNextPrompt = true;
+    await controller.submitInput('First attempt fails');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(sentPrompts).toHaveLength(1);
+    expect(sentPrompts[0]?.[0]?.text).toContain('<system-reminder>');
+    expect(sentPrompts[0]?.[0]?.text?.endsWith('\n\n')).toBe(true);
+
+    await controller.submitInput('Retry succeeds');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    expect(sentPrompts).toHaveLength(2);
+    expect(sentPrompts[1]?.[0]?.text).toContain('<system-reminder>');
+    replayReminderText = sentPrompts[1]![0]!.text!;
+
+    // 3. Bare external `name: 'todo'` must NOT be silently auto-allowed
+    await controller.submitInput('Ask external todo');
+    await waitFor(() => controller.store.approvals.hasPending());
+    expect(permissionResponses).toEqual([]);
+    expect(controller.store.transcript.getToolById('ext-todo-1')?.isOmaTodo).toBeUndefined();
+    const decided = controller.store.approvals.decide('allow');
+    expect(decided?.optionId).toBe('allow-ext');
+    await waitFor(() => !controller.store.getState().isStreaming && permissionResponses.length === 1);
+
+    // 4. `/todo rm` without subsequent prompt persists cleared state across `/resume`,
+    //    and replayed `<system-reminder>` is stripped from user bubble
+    await controller.submitInput('/todo rm');
+    expect(controller.store.transcript.todoPhases).toEqual([]);
+    let persistedTodo: Awaited<ReturnType<PreviewStore['load']>> = null;
+    for (let i = 0; i < 50; i++) {
+      persistedTodo = await previewStore.load(sessId);
+      if (
+        persistedTodo?.todoState?.toolCallCount === 1 &&
+        persistedTodo.todoState.phases.length === 0
+      ) {
+        break;
+      }
+      await Bun.sleep(10);
+    }
+    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1 });
+
+    await controller.submitInput('/resume');
+    await waitFor(
+      () =>
+        controller.store.getState().picker?.kind === 'resume' &&
+        !controller.store.getState().picker?.loading
+    );
+    host.input.emit('\r');
+    await waitFor(
+      () =>
+        loadCount === 1 &&
+        !controller.store.getState().isReplaying &&
+        controller.store.transcript.turns.length === 1
+    );
+    expect(controller.store.transcript.todoPhases).toEqual([]);
+    const replayedUserText = controller.store.transcript.turns[0]?.user?.text ?? '';
+    expect(replayedUserText).toBe('Hello resumed');
+    expect(replayedUserText).not.toContain('<system-reminder>');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+
+    // 5. Disabled MCP does not inject todo prompt append into session/new
+    const host2 = new FakeTernHost();
+    const session2 = await createConnectedSession(host2);
+    const acp2 = new MockAcpHarness();
+    let disabledNewParams: Record<string, unknown> | undefined;
+    acp2.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: 'agy', version: '1.5.14' } },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        disabledNewParams = msg.params;
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's-disabled', configOptions: DEFAULT_CONFIG_OPTIONS } });
+        return;
+      }
+      if (msg.id !== undefined) h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+    });
+    const controller2 = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session2,
+      output: host2.safeOutput,
+      acpSpawn: acp2.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions2') }),
+      configPath: join(tmp, 'config2.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      enableTodoMcp: false,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run2 = controller2.run();
+    await controller2.readyPromise;
+    expect(disabledNewParams?.mcpServers).toEqual([]);
+    expect(disabledNewParams?._meta).toBeUndefined();
+    await controller2.shutdown({ cleanExit: true });
+    await run2;
+  });
+
+  test('post-background wakeup holds OSC 7501 state=done across pre-tool progress text, planner tool calls, and error retries until authoritative planner_final in transcript.jsonl', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const sessionId = 'sess-bg-osc-authority';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+      if (msg.method === 'session/prompt') {
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'bg-osc-1',
+              name: 'run_command',
+              title: 'Run tests',
+              kind: 'execute',
+              status: 'in_progress',
+              rawInput: { CommandLine: 'bun test' },
+            },
+          },
+        });
+        // Scenario 1: agy already promoted task to RUNNING in transcript.jsonl before end_turn arrives
+        writeFileSync(
+          transcriptFile,
+          [
+            JSON.stringify({
+              type: 'USER_INPUT',
+              step_index: 1,
+              source: 'USER_EXPLICIT',
+              content: '<USER_REQUEST>Fix all</USER_REQUEST>',
+            }),
+            JSON.stringify({
+              type: 'GENERIC',
+              step_index: 2,
+              status: 'RUNNING',
+              created_at: '2026-11-23T14:40:00+08:00',
+              content: [
+                `Tool is running as a background task with task id: ${sessionId}/task-1`,
+                'Task Description: bun test',
+              ].join('\n'),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        return;
+      }
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 40,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const countOscDone = () => host.osc7501.filter(s => s.includes('state=done')).length;
+
+    await controller.submitInput('Fix all');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    // Must stay busy with 0 OSC done notifications right after end_turn
+    expect(controller.store.hasActiveBackgroundTasks()).toBe(true);
+    expect(countOscDone()).toBe(0);
+
+    // Scenario 2: background task finishes via SYSTEM_MESSAGE; model emits mid-turn progress text,
+    // enters silent pause longer than backgroundDoneGraceMs, invokes planner tool_call + hits empty retry
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'SYSTEM_MESSAGE',
+        source: 'SYSTEM',
+        status: 'DONE',
+        step_index: 3,
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-1" finished with result:\nok\n</SYSTEM_MESSAGE>`,
+      })}\n`,
+      'utf8',
+    );
+    await waitFor(() => !controller.store.hasActiveBackgroundTasks());
+    expect(countOscDone()).toBe(0);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Continuing edits now.' },
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 4,
+        status: 'DONE',
+        content: 'Continuing edits now.',
+        tool_calls: [{ name: 'edit_file' }],
+      }) + '\n',
+      'utf8',
+    );
+    await Bun.sleep(100);
+    expect(countOscDone()).toBe(0);
+
+    // Empty output error + retry step still holds OSC done
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({ type: 'GENERIC', status: 'DONE', step_index: 5, content: 'edited' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 6, status: 'DONE', thinking: 'thinking' }),
+        JSON.stringify({ type: 'ERROR_MESSAGE', step_index: 7, status: 'DONE', content: 'empty output' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await Bun.sleep(100);
+    expect(countOscDone()).toBe(0);
+
+    // Scenario 3: Authoritative final PLANNER_RESPONSE (no tool_calls + non-empty content) -> emits OSC done once
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'All done.' },
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 8,
+        status: 'DONE',
+        content: 'All done.',
+        input_tokens: 100,
+        output_tokens: 20,
+      })}\n`,
+      'utf8',
+    );
+
+    await waitFor(() => countOscDone() === 1);
+    await Bun.sleep(90);
+    expect(countOscDone()).toBe(1);
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('background schedule timers, cron max-iterations, manage_task kill/list, and same-poll unlabeled task completion decrement HUD jobs count to 0 and settle /jobs overlay', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const sessionId = '6af6570b-schedule-e2e';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    let activePromptId: string | number | undefined;
+    let promptSeq = 0;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+            agentInfo: { name: 'agy', version: '1.5.14' },
+          },
+        });
+        return;
+      }
+      if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+        return;
+      }
+      if (msg.method === 'session/prompt') {
+        activePromptId = msg.id;
+        promptSeq += 1;
+        return;
+      }
+      if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const replayCurrentWireNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSubtree(child);
+        }
+      };
+      const deleteSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const key of [...nodes.keys()]) {
+          if (key.startsWith(prefix)) nodes.delete(key);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          addSubtree(op[4]);
+        } else if (op[0] === 'del') {
+          deleteSubtree(op[1]);
+        } else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 40,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    const emitScheduleTool = (
+      toolCallId: string,
+      rawInput: Record<string, unknown>,
+      outputText: string,
+    ) => {
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            name: 'schedule',
+            title: 'schedule',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput,
+          },
+        },
+      });
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: 'completed',
+            content: [{ type: 'content', content: { type: 'text', text: outputText } }],
+          },
+        },
+      });
+    };
+
+    // Turn 1: launch one labeled one-shot timer (task-1) + one recurring cron (task-3)
+    await controller.submitInput('Start monitors');
+    await waitFor(() => promptSeq === 1 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-1',
+      { DurationSeconds: 20, Prompt: 'Check server d73d9d79 status' },
+      `Tool is running as a background task with task id: ${sessionId}/task-1\nTask Description: Timer: 20s, Prompt: Check server d73d9d79 status`,
+    );
+    emitScheduleTool(
+      'tc-sched-3',
+      { CronExpression: '*/2 * * * *', MaxIterations: 2, Prompt: 'Poll panel HTTP 200 and cancel when ready' },
+      `Tool is running as a background task with task id: ${sessionId}/task-3\nTask Description: Cron: */2 * * * *, Prompt: Poll panel HTTP 200 and cancel when ready`,
+    );
+    writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'USER_INPUT',
+          step_index: 1,
+          source: 'USER_EXPLICIT',
+          content: '<USER_REQUEST>Start monitors</USER_REQUEST>',
+        }),
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 2,
+          status: 'RUNNING',
+          created_at: '2026-11-23T06:00:00Z',
+          content: `Tool is running as a background task with task id: ${sessionId}/task-1\nTask Description: Timer: 20s, Prompt: Check server d73d9d79 status`,
+        }),
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 3,
+          status: 'RUNNING',
+          created_at: '2026-11-23T06:00:01Z',
+          content: `Tool is running as a background task with task id: ${sessionId}/task-3\nTask Description: Cron: */2 * * * *, Prompt: Poll panel HTTP 200 and cancel when ready`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const p1 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p1, result: { stopReason: 'end_turn' } });
+
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+    await waitFor(() =>
+      replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans'] !== undefined,
+    );
+    expect(replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([
+      { t: '2', s: 'num' },
+    ]);
+
+    // Timer task-1 fires -> completes; Cron task-3 ticks -> stays running (runningJobCount === 1)
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 4,
+          created_at: '2026-11-23T06:00:20Z',
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:00:20Z sender=${sessionId}/task-1 priority=MESSAGE_PRIORITY_HIGH content=Check server d73d9d79 status\n</SYSTEM_MESSAGE>`,
+        }),
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 5,
+          created_at: '2026-11-23T06:02:00Z',
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:02:00Z sender=${sessionId}/task-3 priority=MESSAGE_PRIORITY_HIGH content=Poll panel HTTP 200 and cancel when ready\n</SYSTEM_MESSAGE>`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 1);
+    await waitFor(() => {
+      const spans = replayCurrentWireNodes().get('dock.hud.running.jobs.count')?.p['spans'];
+      return Array.isArray(spans) && (spans[0] as { t?: string } | undefined)?.t === '1';
+    });
+
+    // Turn 2: unlabeled one-shot timer (no taskId in ACP tool output) starts & fires in the same transcript poll
+    await controller.submitInput('Unlabeled same-poll timer');
+    await waitFor(() => promptSeq === 2 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-unlabeled',
+      { DurationSeconds: 5, Prompt: 'Quick unlabeled check' },
+      'Timer scheduled in background.',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+
+    const p2 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p2, result: { stopReason: 'end_turn' } });
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    appendFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: 'GENERIC',
+          step_index: 6,
+          status: 'RUNNING',
+          created_at: new Date().toISOString(),
+          content: `Tool is running as a background task with task id: ${sessionId}/task-2\nTask Description: Timer: 5s, Prompt: Quick unlabeled check`,
+        }),
+        JSON.stringify({
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 7,
+          created_at: new Date().toISOString(),
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:02:10Z sender=${sessionId}/task-2 priority=MESSAGE_PRIORITY_HIGH content=Quick unlabeled check\n</SYSTEM_MESSAGE>`,
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    await waitFor(() => {
+      const snap = controller.store.transcript.getBackgroundJobsSnapshot();
+      return snap.runningJobCount === 1 && snap.recent.some((j) => j.toolCallId === 'tc-sched-unlabeled' && j.status === 'completed');
+    });
+
+    // Turn 3: launch two more timers (task-4 & task-5), then kill task-5 via manage_task, complete cron task-3, and sweep via manage_task list
+    await controller.submitInput('Two more timers and cleanup');
+    await waitFor(() => promptSeq === 3 && activePromptId !== undefined);
+    emitScheduleTool(
+      'tc-sched-4',
+      { DurationSeconds: 45, Prompt: 'Wait 45s for server' },
+      `Tool is running as a background task with task id: ${sessionId}/task-4\nTask Description: Timer: 45s, Prompt: Wait 45s for server`,
+    );
+    emitScheduleTool(
+      'tc-sched-5',
+      { DurationSeconds: 45, Prompt: 'dummy timer' },
+      `Tool is running as a background task with task id: ${sessionId}/task-5\nTask Description: Timer: 45s, Prompt: dummy timer`,
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 3);
+
+    // Kill task-5 via manage_task(Action="kill") -> runningJobCount decrements to 2
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-kill-5',
+          name: 'manage_task',
+          title: 'manage_task',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { Action: 'kill', TaskId: `${sessionId}/task-5` },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-kill-5',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: `Task "${sessionId}/task-5" cancelled.` } }],
+        },
+      },
+    });
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 2);
+    expect(
+      controller.store.transcript.getBackgroundJobsSnapshot().recent.find((j) => j.toolCallId === 'tc-sched-5')?.status,
+    ).toBe('cancelled');
+
+    // Cron task-3 reaches max iterations -> runningJobCount decrements to 1
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'SYSTEM_MESSAGE',
+        source: 'SYSTEM',
+        status: 'DONE',
+        step_index: 8,
+        created_at: new Date().toISOString(),
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T06:04:00Z sender=${sessionId}/task-3 priority=MESSAGE_PRIORITY_HIGH content=Cron schedule completed after reaching its maximum of 2 iterations.\n</SYSTEM_MESSAGE>`,
+      })}\n`,
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 1);
+
+    // manage_task(Action="list") reports "No background tasks are currently running." -> remaining task-4 settles and count hits 0
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-list-empty',
+          name: 'manage_task',
+          title: 'manage_task',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { Action: 'list' },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-list-empty',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'No background tasks are currently running.' } }],
+        },
+      },
+    });
+    appendFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 9,
+        status: 'DONE',
+        content: 'All scheduled monitors have finished.',
+      })}\n`,
+      'utf8',
+    );
+    const p3 = activePromptId!;
+    activePromptId = undefined;
+    acp.send({ jsonrpc: '2.0', id: p3, result: { stopReason: 'end_turn' } });
+
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => controller.store.transcript.getBackgroundJobsSnapshot().runningJobCount === 0);
+    await waitFor(() => replayCurrentWireNodes().get('dock.hud.running.jobs') === undefined);
+
+    const finalSnap = controller.store.transcript.getBackgroundJobsSnapshot();
+    expect(finalSnap.running).toEqual([]);
+    expect(finalSnap.runningJobCount).toBe(0);
+    expect(finalSnap.recent.length).toBe(7);
+    const settledSchedules = finalSnap.recent.filter((j) => j.type === 'schedule');
+    expect(settledSchedules.length).toBe(5);
+    expect(finalSnap.recent.every((j) => j.status !== 'running')).toBe(true);
+
+    // Open `/jobs` overlay and verify settled counts and list
+    await controller.submitInput('/jobs');
+    await waitFor(() => controller.store.getState().infoOverlay?.kind === 'jobs');
+    const nodes = replayCurrentWireNodes();
+    expect(nodes.get('layer.info')?.p['role']).toBe('omp.overlay.jobs');
+    expect(nodes.get('layer.info.body.actions.summary')?.p['text']).toBe('7 recent');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
 });

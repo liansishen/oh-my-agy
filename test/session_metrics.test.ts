@@ -1157,4 +1157,247 @@ describe('SessionMetricsTracker background task tracking & resume baseline', () 
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test('parses one-shot Timer, recurring Cron, manage_task kill/status/list outputs, and ignores run_command false matches', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-bg-sched-'));
+    try {
+      const sessionId = '6af6570b-c084-4eb5-8f9f-fedaeb495f58';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const runningStep = (step: number, taskId: string, desc: string, ts: string) =>
+        JSON.stringify({
+          step_index: step,
+          source: 'MODEL',
+          type: 'GENERIC',
+          status: 'RUNNING',
+          created_at: ts,
+          content: [
+            `Created At: ${ts}`,
+            `Tool is running as a background task with task id: ${taskId}`,
+            `Task Description: ${desc}`,
+            `Task logs are available at: file:///tmp/task-${step}.log`,
+          ].join('\n'),
+        });
+
+      const sysMsgStep = (step: number, sender: string, body: string, ts: string) =>
+        JSON.stringify({
+          step_index: step,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: ts,
+          content: [
+            '<SYSTEM_MESSAGE>',
+            `[Message] timestamp=${ts} sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=${body}`,
+            '</SYSTEM_MESSAGE>',
+          ].join('\n'),
+        });
+
+      await writeFile(
+        transcriptFile,
+        [
+          runningStep(80, `${sessionId}/task-80`, 'Timer: 20s, Prompt: Check server d73d9d79 status and logs', '2026-11-23T05:59:37Z'),
+          runningStep(146, `${sessionId}/task-146`, 'Cron: */2 * * * *, Prompt: Check if panel returns 200. When ready, cancel this schedule task via manage_task.', '2026-11-23T06:11:17Z'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const started = tracker.getTranscriptBackgroundTasks();
+      const timer80 = started.find((t) => t.taskId === `${sessionId}/task-80`);
+      const cron146 = started.find((t) => t.taskId === `${sessionId}/task-146`);
+      expect(timer80?.status).toBe('running');
+      expect(timer80?.scheduleKind).toBe('timer');
+      expect(cron146?.status).toBe('running');
+      expect(cron146?.scheduleKind).toBe('cron');
+
+      // Cron tick stays running; one-shot timer fire settles to completed
+      await appendFile(
+        transcriptFile,
+        [
+          sysMsgStep(82, `${sessionId}/task-80`, 'Check server d73d9d79 status and logs', '2026-11-23T05:59:57Z'),
+          sysMsgStep(149, `${sessionId}/task-146`, 'Check if panel returns 200. When ready, cancel this schedule task via manage_task.', '2026-11-23T06:12:35Z'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const afterTick = tracker.getTranscriptBackgroundTasks();
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-80`)?.status).toBe('completed');
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-80`)?.endedAt).toBe(Date.parse('2026-11-23T05:59:57Z'));
+      expect(afterTick.find((t) => t.taskId === `${sessionId}/task-146`)?.status).toBe('running');
+
+      // Cron terminal completion settles cron job to completed
+      await appendFile(
+        transcriptFile,
+        `${sysMsgStep(189, `${sessionId}/task-146`, 'Cron schedule completed after reaching its maximum of 10 iterations.', '2026-11-23T06:30:35Z')}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getTranscriptBackgroundTasks().find((t) => t.taskId === `${sessionId}/task-146`)?.status).toBe('completed');
+
+      // Concurrent timers + manage_task kill + manage_task status + run_command non-match + manage_task list sweep
+      await appendFile(
+        transcriptFile,
+        [
+          runningStep(256, `${sessionId}/task-256`, 'Timer: 45s, Prompt: Check running state', '2026-11-23T06:41:09Z'),
+          runningStep(259, `${sessionId}/task-259`, 'Timer: 45s, Prompt: dummy', '2026-11-23T06:41:18Z'),
+          runningStep(260, `${sessionId}/task-260`, 'sleep 60', '2026-11-23T06:41:19Z'),
+          JSON.stringify({
+            step_index: 261,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:21Z',
+            content: [
+              'Created At: 2026-11-23T14:41:21+08:00',
+              'Completed At: 2026-11-23T14:41:22+08:00',
+              'Created At: 2026-11-23T14:41:21+08:00',
+              'Completed At: 2026-11-23T14:41:22+08:00',
+              `Task "${sessionId}/task-259" cancelled.`,
+            ].join('\n'),
+          }),
+          JSON.stringify({
+            step_index: 262,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:23Z',
+            content: `Created At: 2026-11-23T14:41:23+08:00\nCompleted At: 2026-11-23T14:41:23+08:00\nTask: ${sessionId}/task-260 | Status: RUNNING | Log: file:///tmp/t260.log`,
+          }),
+          JSON.stringify({
+            step_index: 263,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:24Z',
+            content: 'Created At: 2026-11-23T14:41:24+08:00\nCompleted At: 2026-11-23T14:41:24+08:00\nCommand exited with code 0.\n\nCommand output:\nNo background tasks are currently running.',
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const mid = tracker.getTranscriptBackgroundTasks();
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-259`)?.status).toBe('cancelled');
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-256`)?.status).toBe('running');
+      expect(mid.find((t) => t.taskId === `${sessionId}/task-260`)?.status).toBe('running');
+
+      // Status FAILED settles task-260, and manage_task(list) empty output settles remaining running tasks without resetAll
+      await appendFile(
+        transcriptFile,
+        [
+          JSON.stringify({
+            step_index: 264,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:41:30Z',
+            content: `Created At: 2026-11-23T14:41:30+08:00\nCompleted At: 2026-11-23T14:41:30+08:00\nTask: ${sessionId}/task-260 | Status: FAILED | Log: file:///tmp/t260.log`,
+          }),
+          JSON.stringify({
+            step_index: 292,
+            source: 'MODEL',
+            type: 'GENERIC',
+            status: 'DONE',
+            created_at: '2026-11-23T06:44:54Z',
+            content: [
+              'Created At: 2026-11-23T14:44:54+08:00',
+              'Completed At: 2026-11-23T14:44:55+08:00',
+              'Created At: 2026-11-23T14:44:54+08:00',
+              'Completed At: 2026-11-23T14:44:55+08:00',
+              'No background tasks are currently running.',
+            ].join('\n'),
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const finalTasks = tracker.getTranscriptBackgroundTasks();
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-259`)?.status).toBe('cancelled');
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-260`)?.status).toBe('failed');
+      expect(finalTasks.find((t) => t.taskId === `${sessionId}/task-256`)?.status).toBe('completed');
+      expect(tracker.getLatestTurnActivity()?.resetAll).toBeUndefined();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('tracks hasTranscriptData and latest turn step activity across planner tool calls, empty/error thoughts, final replies, and truncation/reset', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-turn-act-'));
+    try {
+      const sessionId = 'sess-turn-act-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      expect(tracker.hasTranscriptData).toBe(false);
+      expect(tracker.getLatestTurnActivity()).toBeNull();
+
+      await writeFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'USER_INPUT', step_index: 1, content: '<USER_REQUEST>Fix</USER_REQUEST>' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.hasTranscriptData).toBe(true);
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 1, latestKind: 'user_input' });
+
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'GENERIC', status: 'RUNNING', step_index: 2, content: 'Tool is running as a background task with task id: s/t-1' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 2, latestKind: 'tool_running' });
+
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'SYSTEM_MESSAGE', step_index: 3, content: '<SYSTEM_MESSAGE>Task id "s/t-1" finished</SYSTEM_MESSAGE>' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 3, latestKind: 'system_message' });
+
+      // Planner progress update WITH pending tool_calls must NOT classify as planner_final
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 4, status: 'DONE', content: 'Checking...', tool_calls: [{ name: 'read_file' }] })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 4, latestKind: 'planner_tool_call' });
+
+      // Empty thinking / empty output before retry error must NOT classify as planner_final
+      await appendFile(
+        transcriptFile,
+        [
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 5, status: 'DONE', thinking: 'hmm' }),
+          JSON.stringify({ type: 'ERROR_MESSAGE', step_index: 6, content: 'empty output' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 6, latestKind: 'system_message' });
+
+      // Final assistant response with non-empty content and no tool_calls -> planner_final
+      await appendFile(
+        transcriptFile,
+        `${JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 7, status: 'DONE', content: 'All done.' })}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(tracker.getLatestTurnActivity()).toEqual({ latestStepSeq: 7, latestKind: 'planner_final' });
+
+      tracker.reset();
+      expect(tracker.hasTranscriptData).toBe(false);
+      expect(tracker.getLatestTurnActivity()).toBeNull();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

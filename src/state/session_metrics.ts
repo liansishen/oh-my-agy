@@ -69,14 +69,34 @@ export interface TranscriptCompactionCheckpoint {
   readonly summaryTokens?: number;
 }
 
+export type TranscriptScheduleKind = 'timer' | 'cron';
+
 export interface TranscriptBackgroundTaskRecord {
   readonly taskId: string;
   readonly stepIndex: number;
   readonly description?: string;
   readonly logPath?: string;
+  readonly scheduleKind?: TranscriptScheduleKind;
   readonly startedAt?: number;
   readonly status: 'running' | 'completed' | 'failed' | 'cancelled';
   readonly endedAt?: number;
+}
+
+export type TranscriptStepKind =
+  | 'user_input'
+  | 'planner_final'
+  | 'planner_tool_call'
+  | 'planner_empty'
+  | 'tool_running'
+  | 'tool_done'
+  | 'system_message'
+  | 'checkpoint'
+  | 'other';
+
+export interface TranscriptTurnActivity {
+  readonly latestStepSeq: number;
+  readonly latestKind: TranscriptStepKind;
+  readonly resetAll?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +273,7 @@ interface ParsedTranscriptLine {
     readonly stepIndex?: number;
     readonly description?: string;
     readonly logPath?: string;
+    readonly scheduleKind?: TranscriptScheduleKind;
     readonly startedAt?: number;
   };
   readonly backgroundTaskTerminals?: readonly {
@@ -260,11 +281,21 @@ interface ParsedTranscriptLine {
     readonly status: 'completed' | 'failed' | 'cancelled';
     readonly endedAt?: number;
   }[];
+  readonly backgroundTaskMessageSenders?: readonly {
+    readonly taskId: string;
+    readonly endedAt?: number;
+  }[];
+  readonly backgroundTasksNoneRunning?: {
+    readonly endedAt?: number;
+  };
   readonly backgroundTasksResetAll?: {
     readonly endedAt?: number;
   };
   readonly isToolStep?: boolean;
   readonly isAssistantResponseStep?: boolean;
+  readonly stepActivity?: {
+    readonly kind: TranscriptStepKind;
+  };
 }
 
 const TRANSCRIPT_BG_RUNNING_ID_RE =
@@ -276,6 +307,54 @@ const TRANSCRIPT_BG_TERMINAL_RE =
   /\bTask\s+id\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(finished|completed|exited|killed|cancelled|canceled|failed|stopped|terminated|aborted|errored|timed\s+out)\b/gi;
 const TRANSCRIPT_BG_SERVER_RESET_RE =
   /\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i;
+const TRANSCRIPT_SYSTEM_MESSAGE_BLOCK_RE =
+  /\[Message\]\s+[^\r\n]*?\bsender=([^\s\]]+)[^\r\n]*?\bcontent=([\s\S]*?)(?=(?:\r?\n\[Message\]\s|\r?\n<\/SYSTEM_MESSAGE>|$))/gi;
+const TRANSCRIPT_BG_SCHEDULE_TERMINAL_RE =
+  /^\s*(?:Cron(?:\s+schedule)?|Timer|Schedule)\s+(?:(?:was|has|is)\s+)?(completed|finished|expired|ended|cancelled|canceled|stopped|killed|terminated|aborted|failed|errored)\b/i;
+const TRANSCRIPT_GENERIC_HEADER_LINE_RE = /^(?:Created|Completed)\s+At:[^\r\n]*$/i;
+const TRANSCRIPT_GENERIC_TASK_TERMINAL_RE =
+  /^Task\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(cancelled|canceled|killed|stopped|terminated|aborted|completed|finished|failed)\.?\s*$/i;
+const TRANSCRIPT_GENERIC_NO_BG_TASKS_RE =
+  /^No\s+(?:(?:running|active|background)\s+)*tasks?(?:\s+are)?\s+(?:currently\s+)?running\.?\s*$/i;
+const TRANSCRIPT_GENERIC_TASK_STATUS_LINE_RE =
+  /^Task:\s*([A-Za-z0-9._:/-]+)\s*\|\s*Status:\s*([A-Z_]+)\b/i;
+const TRANSCRIPT_TERMINAL_STATUS_TOKENS = new Set([
+  'COMPLETED',
+  'FINISHED',
+  'DONE',
+  'EXITED',
+  'FAILED',
+  'ERROR',
+  'ERRORED',
+  'TIMED_OUT',
+  'CANCELLED',
+  'CANCELED',
+  'KILLED',
+  'STOPPED',
+  'TERMINATED',
+  'ABORTED',
+]);
+
+function inferScheduleKindFromDescription(description?: string): TranscriptScheduleKind | undefined {
+  if (!description) return undefined;
+  if (/^Timer\s*:/i.test(description)) return 'timer';
+  if (/^Cron\s*:/i.test(description)) return 'cron';
+  return undefined;
+}
+
+function stripLeadingTranscriptTimestamps(content: string): string {
+  const lines = content.split(/\r?\n/);
+  let idx = 0;
+  while (idx < lines.length) {
+    const trimmed = lines[idx]!.trim();
+    if (trimmed.length === 0 || TRANSCRIPT_GENERIC_HEADER_LINE_RE.test(trimmed)) {
+      idx += 1;
+      continue;
+    }
+    break;
+  }
+  return lines.slice(idx).join('\n').trim();
+}
 
 function parseTranscriptTimestampMs(raw: Record<string, unknown>): number | undefined {
   const iso =
@@ -290,8 +369,10 @@ function parseTranscriptTimestampMs(raw: Record<string, unknown>): number | unde
 }
 
 function mapTranscriptTerminalVerb(verb: string): 'completed' | 'failed' | 'cancelled' {
-  const lower = verb.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (lower === 'failed' || lower === 'errored' || lower === 'timed out') return 'failed';
+  const lower = verb.toLowerCase().replace(/[\s_]+/g, ' ').trim();
+  if (lower === 'failed' || lower === 'error' || lower === 'errored' || lower === 'timed out') {
+    return 'failed';
+  }
   if (
     lower === 'killed' ||
     lower === 'cancelled' ||
@@ -458,6 +539,7 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
       const taskId = idMatch[1].replace(/[.,;)]+$/, '');
       const descMatch = TRANSCRIPT_BG_TASK_DESC_RE.exec(header);
       const description = descMatch?.[1]?.trim();
+      const scheduleKind = inferScheduleKindFromDescription(description);
       const logMatch = TRANSCRIPT_BG_TASK_LOG_RE.exec(header);
       const logPath = logMatch?.[1]?.trim();
       const stepIndex = asNonNegativeFiniteNumber(raw.step_index ?? raw.stepIndex);
@@ -467,6 +549,7 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
         ...(stepIndex !== undefined ? { stepIndex } : {}),
         ...(description ? { description } : {}),
         ...(logPath ? { logPath } : {}),
+        ...(scheduleKind ? { scheduleKind } : {}),
         ...(startedAt !== undefined ? { startedAt } : {}),
       };
     }
@@ -477,6 +560,11 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     readonly status: 'completed' | 'failed' | 'cancelled';
     readonly endedAt?: number;
   }> | undefined;
+  let backgroundTaskMessageSenders: Array<{
+    readonly taskId: string;
+    readonly endedAt?: number;
+  }> | undefined;
+  let backgroundTasksNoneRunning: ParsedTranscriptLine['backgroundTasksNoneRunning'];
   let backgroundTasksResetAll: ParsedTranscriptLine['backgroundTasksResetAll'];
   if ((recordType === 'SYSTEM_MESSAGE' || rawSource === 'SYSTEM') && typeof raw.content === 'string') {
     TRANSCRIPT_BG_TERMINAL_RE.lastIndex = 0;
@@ -495,8 +583,78 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
         ...(endedAt !== undefined ? { endedAt } : {}),
       });
     }
+    TRANSCRIPT_SYSTEM_MESSAGE_BLOCK_RE.lastIndex = 0;
+    let msgMatch: RegExpExecArray | null;
+    while ((msgMatch = TRANSCRIPT_SYSTEM_MESSAGE_BLOCK_RE.exec(raw.content)) !== null) {
+      const senderId = msgMatch[1]?.replace(/[.,;)]+$/, '');
+      const body = msgMatch[2] ?? '';
+      if (!senderId || senderId.toLowerCase() === 'system') continue;
+      const schedTerm = TRANSCRIPT_BG_SCHEDULE_TERMINAL_RE.exec(body);
+      if (schedTerm?.[1]) {
+        if (!backgroundTaskTerminals) {
+          backgroundTaskTerminals = [];
+        }
+        backgroundTaskTerminals.push({
+          taskId: senderId,
+          status: mapTranscriptTerminalVerb(schedTerm[1]),
+          ...(endedAt !== undefined ? { endedAt } : {}),
+        });
+      }
+      if (!backgroundTaskMessageSenders) {
+        backgroundTaskMessageSenders = [];
+      }
+      backgroundTaskMessageSenders.push({
+        taskId: senderId,
+        ...(endedAt !== undefined ? { endedAt } : {}),
+      });
+    }
     if (TRANSCRIPT_BG_SERVER_RESET_RE.test(raw.content)) {
       backgroundTasksResetAll = endedAt !== undefined ? { endedAt } : {};
+    }
+  }
+
+  if (recordType === 'GENERIC' && rawStatus === 'DONE' && typeof raw.content === 'string') {
+    const body = stripLeadingTranscriptTimestamps(raw.content);
+    if (body.length > 0 && !/^Command\s+exited\s+with\s+code\b/i.test(body)) {
+      const endedAt = parseTranscriptTimestampMs(raw);
+      const termMatch = TRANSCRIPT_GENERIC_TASK_TERMINAL_RE.exec(body);
+      if (termMatch?.[1] && termMatch[2]) {
+        if (!backgroundTaskTerminals) {
+          backgroundTaskTerminals = [];
+        }
+        backgroundTaskTerminals.push({
+          taskId: termMatch[1].replace(/[.,;)]+$/, ''),
+          status: mapTranscriptTerminalVerb(termMatch[2]),
+          ...(endedAt !== undefined ? { endedAt } : {}),
+        });
+      } else if (TRANSCRIPT_GENERIC_NO_BG_TASKS_RE.test(body)) {
+        backgroundTasksNoneRunning = endedAt !== undefined ? { endedAt } : {};
+      } else {
+        const bodyLines = body
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+        if (
+          bodyLines.length > 0 &&
+          bodyLines.every((line) => TRANSCRIPT_GENERIC_TASK_STATUS_LINE_RE.test(line))
+        ) {
+          for (const line of bodyLines) {
+            const statusMatch = TRANSCRIPT_GENERIC_TASK_STATUS_LINE_RE.exec(line);
+            const taskId = statusMatch?.[1]?.replace(/[.,;)]+$/, '');
+            const statusToken = statusMatch?.[2]?.toUpperCase();
+            if (!taskId || !statusToken) continue;
+            if (!TRANSCRIPT_TERMINAL_STATUS_TOKENS.has(statusToken)) continue;
+            if (!backgroundTaskTerminals) {
+              backgroundTaskTerminals = [];
+            }
+            backgroundTaskTerminals.push({
+              taskId,
+              status: mapTranscriptTerminalVerb(statusToken),
+              ...(endedAt !== undefined ? { endedAt } : {}),
+            });
+          }
+        }
+      }
     }
   }
 
@@ -506,15 +664,46 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     typeof raw.content === 'string' &&
     raw.content.trim().length > 0;
 
+  let stepActivity: ParsedTranscriptLine['stepActivity'];
+  if (recordType.length > 0) {
+    let kind: TranscriptStepKind = 'other';
+    if (recordType === 'USER_INPUT') {
+      kind = 'user_input';
+    } else if (recordType === 'CHECKPOINT') {
+      kind = 'checkpoint';
+    } else if (recordType === 'SYSTEM_MESSAGE' || recordType === 'ERROR_MESSAGE') {
+      kind = 'system_message';
+    } else if (recordType === 'GENERIC') {
+      kind = rawStatus === 'RUNNING' ? 'tool_running' : 'tool_done';
+    } else if (recordType === 'PLANNER_RESPONSE') {
+      const rawToolCalls = Array.isArray(raw.tool_calls)
+        ? raw.tool_calls
+        : Array.isArray(raw.toolCalls)
+          ? raw.toolCalls
+          : [];
+      const hasText = typeof raw.content === 'string' && raw.content.trim().length > 0;
+      kind =
+        rawToolCalls.length > 0
+          ? 'planner_tool_call'
+          : hasText
+            ? 'planner_final'
+            : 'planner_empty';
+    }
+    stepActivity = { kind };
+  }
+
   if (
     !tokens &&
     !explicitUserInput &&
     !checkpoint &&
     !backgroundTaskStarted &&
     (!backgroundTaskTerminals || backgroundTaskTerminals.length === 0) &&
+    (!backgroundTaskMessageSenders || backgroundTaskMessageSenders.length === 0) &&
+    !backgroundTasksNoneRunning &&
     !backgroundTasksResetAll &&
     !isToolStep &&
-    !isAssistantResponseStep
+    !isAssistantResponseStep &&
+    !stepActivity
   ) {
     return null;
   }
@@ -527,9 +716,14 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     ...(backgroundTaskTerminals && backgroundTaskTerminals.length > 0
       ? { backgroundTaskTerminals }
       : {}),
+    ...(backgroundTaskMessageSenders && backgroundTaskMessageSenders.length > 0
+      ? { backgroundTaskMessageSenders }
+      : {}),
+    ...(backgroundTasksNoneRunning ? { backgroundTasksNoneRunning } : {}),
     ...(backgroundTasksResetAll ? { backgroundTasksResetAll } : {}),
     ...(isToolStep ? { isToolStep } : {}),
     ...(isAssistantResponseStep ? { isAssistantResponseStep } : {}),
+    ...(stepActivity ? { stepActivity } : {}),
   };
 }
 
@@ -575,10 +769,13 @@ export class SessionMetricsTracker {
   private _checkpointSeq = 0;
   private _latestCheckpoint: TranscriptCompactionCheckpoint | null = null;
 
-  // Incremental background task tracking from transcript.jsonl
+  // Incremental background task & step activity tracking from transcript.jsonl
   private _bgTaskSeq = 0;
   private readonly _transcriptBgTasks = new Map<string, TranscriptBackgroundTaskRecord>();
   private _bgBaselineMaxStepIndex: number | null = null;
+  private _hasTranscriptData = false;
+  private _activityStepSeq = 0;
+  private _latestTurnActivity: TranscriptTurnActivity | null = null;
 
   // Streaming sliding window & post-turn calibration
   private _streaming = false;
@@ -675,6 +872,9 @@ export class SessionMetricsTracker {
     this._bgTaskSeq = 0;
     this._transcriptBgTasks.clear();
     this._bgBaselineMaxStepIndex = null;
+    this._hasTranscriptData = false;
+    this._activityStepSeq = 0;
+    this._latestTurnActivity = null;
 
     this._streaming = false;
     this._implicitStream = false;
@@ -694,8 +894,16 @@ export class SessionMetricsTracker {
     return this._streaming;
   }
 
+  get hasTranscriptData(): boolean {
+    return this._hasTranscriptData;
+  }
+
   getLatestCheckpoint(): TranscriptCompactionCheckpoint | null {
     return this._latestCheckpoint;
+  }
+
+  getLatestTurnActivity(): TranscriptTurnActivity | null {
+    return this._latestTurnActivity;
   }
 
   /**
@@ -983,6 +1191,9 @@ export class SessionMetricsTracker {
       this._bgTaskSeq = 0;
       this._transcriptBgTasks.clear();
       this._bgBaselineMaxStepIndex = null;
+      this._hasTranscriptData = false;
+      this._activityStepSeq = 0;
+      this._latestTurnActivity = null;
       this._pendingCalibration = null;
     }
 
@@ -1080,6 +1291,7 @@ export class SessionMetricsTracker {
     for (const line of lines) {
       const parsed = parseTranscriptLine(line);
       if (!parsed) continue;
+      this._hasTranscriptData = true;
       if (parsed.tokens) {
         this._totalUncachedInputTokens += parsed.tokens.uncachedInputTokens;
         this._totalCacheReadTokens += parsed.tokens.cacheReadTokens;
@@ -1134,6 +1346,7 @@ export class SessionMetricsTracker {
         const existing = this._transcriptBgTasks.get(started.taskId);
         // Never resurrect a task already observed in terminal state
         if (!existing || existing.status === 'running') {
+          const scheduleKind = started.scheduleKind ?? existing?.scheduleKind;
           this._transcriptBgTasks.set(started.taskId, {
             taskId: started.taskId,
             stepIndex,
@@ -1147,6 +1360,7 @@ export class SessionMetricsTracker {
               : existing?.logPath !== undefined
                 ? { logPath: existing.logPath }
                 : {}),
+            ...(scheduleKind !== undefined ? { scheduleKind } : {}),
             ...(started.startedAt !== undefined
               ? { startedAt: started.startedAt }
               : existing?.startedAt !== undefined
@@ -1180,6 +1394,35 @@ export class SessionMetricsTracker {
           }
         }
       }
+      if (parsed.backgroundTaskMessageSenders) {
+        for (const msg of parsed.backgroundTaskMessageSenders) {
+          const existing = this._transcriptBgTasks.get(msg.taskId);
+          if (!existing || existing.status !== 'running' || existing.scheduleKind !== 'timer') {
+            continue;
+          }
+          this._transcriptBgTasks.set(msg.taskId, {
+            ...existing,
+            status: 'completed',
+            ...(msg.endedAt !== undefined
+              ? { endedAt: msg.endedAt }
+              : existing.endedAt !== undefined
+                ? { endedAt: existing.endedAt }
+                : {}),
+          });
+        }
+      }
+      if (parsed.backgroundTasksNoneRunning) {
+        const sweepEndedAt = parsed.backgroundTasksNoneRunning.endedAt;
+        for (const [taskId, rec] of this._transcriptBgTasks.entries()) {
+          if (rec.status !== 'running') continue;
+          const nextEndedAt = sweepEndedAt ?? rec.endedAt;
+          this._transcriptBgTasks.set(taskId, {
+            ...rec,
+            status: 'completed',
+            ...(nextEndedAt !== undefined ? { endedAt: nextEndedAt } : {}),
+          });
+        }
+      }
       if (parsed.backgroundTasksResetAll) {
         const resetEndedAt = parsed.backgroundTasksResetAll.endedAt;
         for (const [taskId, rec] of this._transcriptBgTasks.entries()) {
@@ -1191,6 +1434,14 @@ export class SessionMetricsTracker {
             ...(nextEndedAt !== undefined ? { endedAt: nextEndedAt } : {}),
           });
         }
+      }
+      if (parsed.stepActivity) {
+        this._activityStepSeq += 1;
+        this._latestTurnActivity = {
+          latestStepSeq: this._activityStepSeq,
+          latestKind: parsed.stepActivity.kind,
+          ...(parsed.backgroundTasksResetAll ? { resetAll: true } : {}),
+        };
       }
     }
 

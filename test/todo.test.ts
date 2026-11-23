@@ -3,6 +3,7 @@ import { EmbeddedTodoMcpServer, type TodoServerUpdateEvent } from '../src/mcp/to
 import {
   applyTodoOperation,
   areAllTodosFinished,
+  extractUserTodoSyncReminderFromText,
   findTodoPhaseFuzzy,
   findTodoTaskFuzzy,
   formatTodoMarkdown,
@@ -15,12 +16,14 @@ import {
 } from '../src/state/todo';
 
 describe('todo state machine', () => {
-  test('recognizes embedded todo tool name variants', () => {
+  test('recognizes embedded todo tool name variants strictly without bare todo collision', () => {
     expect(isOmaTodoToolName(OMA_TODO_EXPOSED_TOOL_NAME)).toBe(true);
     expect(isOmaTodoToolName('oma_todo:todo')).toBe(true);
     expect(isOmaTodoToolName('oma_todo/todo')).toBe(true);
-    expect(isOmaTodoToolName('todo')).toBe(true);
+    expect(isOmaTodoToolName('oma_todo__todo')).toBe(true);
     expect(isOmaTodoToolName(undefined, 'Run mcp_oma_todo_todo')).toBe(true);
+    expect(isOmaTodoToolName('todo')).toBe(false);
+    expect(isOmaTodoToolName(undefined, 'Todo')).toBe(false);
     expect(isOmaTodoToolName('run_command', 'Run echo todo')).toBe(false);
   });
 
@@ -96,9 +99,20 @@ describe('todo state machine', () => {
 
     const badOp = applyTodoOperation(init.phases, { op: 'bogus' });
     expect(badOp.isError).toBe(true);
+
+    // done / drop support `items` alias and phase completion skips already-finished entries
+    const doneViaItems = applyTodoOperation(init.phases, { op: 'done', items: ['Step 1'] });
+    expect(doneViaItems.isError).toBe(false);
+    expect(doneViaItems.phases[0]?.tasks[0]?.status).toBe('completed');
+
+    const droppedPre = applyTodoOperation(init.phases, { op: 'drop', task: 'Step 1' });
+    const phaseDone = applyTodoOperation(droppedPre.phases, { op: 'done', phase: 'Todos' });
+    expect(phaseDone.isError).toBe(false);
+    expect(phaseDone.phases[0]?.tasks[0]?.status).toBe('abandoned');
+    expect(phaseDone.phases[0]?.tasks[1]?.status).toBe('completed');
   });
 
-  test('round-trips Markdown, fuzzy matchers, checklist mapping, and user reminder formatting', () => {
+  test('round-trips Markdown, rejects duplicate Markdown tasks, strips reminders, and numbers non-empty checklist phases only', () => {
     const sample: TodoPhase[] = [
       {
         name: 'Setup',
@@ -130,6 +144,10 @@ describe('todo state machine', () => {
     expect(parsed.phases[1]?.tasks[0]?.status).toBe('in_progress');
     expect(parsed.phases[1]?.tasks[1]?.status).toBe('pending');
 
+    const dupParsed = parseTodoMarkdown('# P1\n- [ ] Dup task\n# P2\n- [ ] Dup task\n');
+    expect(dupParsed.errors.length).toBeGreaterThan(0);
+    expect(dupParsed.errors[0]).toContain('duplicate task');
+
     expect(findTodoPhaseFuzzy(sample, 'bui')?.name).toBe('Build');
     expect(findTodoTaskFuzzy(sample, 'server')?.task.content).toBe('Implement server');
 
@@ -140,12 +158,32 @@ describe('todo state machine', () => {
     expect(collapsed[1]?.items[0]?.status).toBe('active');
     expect(collapsed[1]?.items[0]?.note).toBe('http');
 
+    const withEmptyPhase = mapTodoPhasesToChecklist([
+      { name: 'Empty', tasks: [] },
+      { name: 'Only', tasks: [{ content: 'Do work', status: 'pending' }] },
+    ]);
+    expect(withEmptyPhase).toHaveLength(1);
+    expect(withEmptyPhase[0]?.title).toBe('Only');
+
     const expanded = mapTodoPhasesToChecklist(sample, { expanded: true });
     expect(expanded[0]?.collapsed).toBeUndefined();
 
-    const reminder = formatUserTodoSyncReminder('/todo rm (all)', [], true);
-    expect(reminder).toContain('<system-reminder>');
-    expect(reminder).toContain('intentionally cleared the todo list');
+    const clearedReminder = formatUserTodoSyncReminder('/todo rm (all)', [], true);
+    expect(clearedReminder).toContain('<system-reminder>');
+    expect(clearedReminder).toContain('cleared the previous todo list');
+    expect(clearedReminder).toContain('only create a new todo list if starting a new multi-step task');
+
+    const extractedCleared = extractUserTodoSyncReminderFromText(
+      `${clearedReminder}\n\nContinue task`
+    );
+    expect(extractedCleared.hasReminder).toBe(true);
+    expect(extractedCleared.strippedText).toBe('Continue task');
+    expect(extractedCleared.phases).toEqual([]);
+
+    const unrelated = '<system-reminder>\nOther note\n</system-reminder>\nUser prompt';
+    const extractedOther = extractUserTodoSyncReminderFromText(unrelated);
+    expect(extractedOther.hasReminder).toBe(false);
+    expect(extractedOther.strippedText).toBe(unrelated);
   });
 });
 
@@ -251,5 +289,43 @@ describe('EmbeddedTodoMcpServer', () => {
 
     server.clearSession('sess-a');
     expect(server.getPhases('sess-a')).toHaveLength(0);
+
+    // Subagent calls carrying a distinct conversation_id must stay isolated from root_conversation_id
+    await fetch(cfg.url!, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: {
+          _meta: {
+            'antigravity.google/root_conversation_id': 'sess-root',
+            'antigravity.google/conversation_id': 'sess-root',
+          },
+          name: 'todo',
+          arguments: { op: 'init', items: ['Root task'] },
+        },
+      }),
+    });
+    await fetch(cfg.url!, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: {
+          _meta: {
+            'antigravity.google/root_conversation_id': 'sess-root',
+            'antigravity.google/conversation_id': 'sess-sub-1',
+          },
+          name: 'todo',
+          arguments: { op: 'init', items: ['Subagent task'] },
+        },
+      }),
+    });
+    expect(server.getPhases('sess-root')[0]?.tasks[0]?.content).toBe('Root task');
+    expect(server.getPhases('sess-sub-1')[0]?.tasks[0]?.content).toBe('Subagent task');
   });
 });

@@ -48,6 +48,7 @@ import type {
 import {
   applyTodoOperation,
   cloneTodoPhases,
+  extractUserTodoSyncReminderFromText,
   isOmaTodoToolName,
   isTodoTaskFinished,
   mapTodoPhasesToChecklist,
@@ -56,6 +57,7 @@ import {
 } from './todo';
 
 export const LONG_RUNNING_TOOL_THRESHOLD_MS = 10_000;
+const MAX_PENDING_TODO_SNAPSHOTS = 32;
 
 // ---------------------------------------------------------------------------
 // Data Models
@@ -148,6 +150,8 @@ export interface ToolCallItem {
   backgroundTaskId?: string;
   /** True while actively tracked as a running background task. */
   backgroundRunning?: boolean;
+  /** True when the tool call targets oma's embedded `oma_todo` MCP tool. */
+  isOmaTodo?: boolean;
   /** Authoritative structured snapshot captured from oma's embedded `todo` MCP tool. */
   todoSnapshot?: {
     readonly phases: readonly TodoPhase[];
@@ -361,6 +365,7 @@ export interface DetachedBackgroundTask {
   readonly taskId?: string;
   readonly conversationId?: string;
   readonly type: BackgroundJobType;
+  readonly scheduleKind?: 'timer' | 'cron';
   readonly label: string;
   readonly command?: string;
   readonly title?: string;
@@ -1003,9 +1008,27 @@ function detectDetachedBackgroundTask(
       hasTimerSpec ||
       Boolean(taskId) ||
       /\b(?:scheduled|timer|cron|running\s+as\s+a\s+background)\b/i.test(outText);
-    if (!hasScheduleCue || /\b(?:cancelled|canceled|removed|deleted|stopped|failed)\b/i.test(outText)) {
+    if (
+      !hasScheduleCue ||
+      (!hasAuthoritativeBgHeader &&
+        /\b(?:cancelled|canceled|removed|deleted|stopped|failed)\b/i.test(headerText))
+    ) {
       return null;
     }
+    const hasCronSpec =
+      typeof inputRec?.CronExpression === 'string' ||
+      typeof inputRec?.cronExpression === 'string' ||
+      /\bTask\s+Description:\s*Cron\s*:/i.test(outText);
+    const hasOneShotTimerSpec =
+      !hasCronSpec &&
+      (inputRec?.DurationSeconds !== undefined ||
+        inputRec?.durationSeconds !== undefined ||
+        /\bTask\s+Description:\s*Timer\s*:/i.test(outText));
+    const scheduleKind: 'timer' | 'cron' | undefined = hasCronSpec
+      ? 'cron'
+      : hasOneShotTimerSpec
+        ? 'timer'
+        : undefined;
     const command = firstStringField(inputRec, ['CronExpression', 'cronExpression']);
     const desc =
       firstStringField(inputRec, ['Prompt', 'prompt', 'Description', 'description']) ?? tool.title;
@@ -1014,6 +1037,7 @@ function detectDetachedBackgroundTask(
       toolCallId: tool.toolCallId,
       ...(taskId ? { taskId } : {}),
       type: 'schedule',
+      ...(scheduleKind ? { scheduleKind } : {}),
       label: collapseSingleLine(desc || 'schedule', 88),
       ...(command ? { command } : {}),
       ...(desc ? { title: desc } : {}),
@@ -1589,6 +1613,9 @@ export class TranscriptStore {
   private _plan: PlanState | null = null;
   private _todoPhases: TodoPhase[] = [];
   private _replayedTodoPhases: TodoPhase[] = [];
+  private _todoToolCallCount = 0;
+  private readonly _countedTodoToolIds = new Set<string>();
+  private _hasUserTodoOverride = false;
   private readonly _pendingTodoSnapshots: Array<{
     readonly phases: TodoPhase[];
     readonly op: TodoOp;
@@ -1624,10 +1651,25 @@ export class TranscriptStore {
     return this._todoPhases;
   }
 
+  get todoToolCallCount(): number {
+    return this._todoToolCallCount;
+  }
+
+  get hasPersistedTodoState(): boolean {
+    return (
+      this._todoPhases.length > 0 ||
+      this._todoToolCallCount > 0 ||
+      this._hasUserTodoOverride
+    );
+  }
+
   setTodoPhases(
     phases: readonly TodoPhase[],
-    _options: { readonly source?: 'todo_tool' | 'user' } = {},
+    options: { readonly source?: 'todo_tool' | 'user' } = {},
   ): void {
+    if (options.source === 'user') {
+      this._hasUserTodoOverride = true;
+    }
     const cloned = cloneTodoPhases(phases).filter((phase) => phase.tasks.length > 0);
     this._todoPhases = cloned;
     if (cloned.length === 0) {
@@ -1670,7 +1712,7 @@ export class TranscriptStore {
       const turn = this._turns[i]!;
       for (let j = turn.toolCalls.length - 1; j >= 0; j--) {
         const tool = turn.toolCalls[j]!;
-        if (isOmaTodoToolName(tool.rawName, tool.title) && !tool.todoSnapshot) {
+        if ((tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title)) && !tool.todoSnapshot) {
           matchedTool = { turn, tool };
           break;
         }
@@ -1684,6 +1726,9 @@ export class TranscriptStore {
 
     const argRec = asRecord(event.rawArgs);
     const rawOp = typeof argRec?.op === 'string' ? argRec.op.trim().toLowerCase() : undefined;
+    if (this._pendingTodoSnapshots.length >= MAX_PENDING_TODO_SNAPSHOTS) {
+      this._pendingTodoSnapshots.shift();
+    }
     this._pendingTodoSnapshots.push({ ...snapshot, rawOp });
   }
 
@@ -2220,7 +2265,9 @@ export class TranscriptStore {
           }
           this.syncSubagentsForTool(turn, tool);
         }
-        if (isOmaTodoToolName(tool.rawName, tool.title)) {
+        if (tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title)) {
+          this.recordTodoToolCall(tool.toolCallId);
+          tool.isOmaTodo = true;
           tool.displayName = 'todo';
           tool.targetKind = 'text';
           tool.title = 'Todo';
@@ -2287,6 +2334,17 @@ export class TranscriptStore {
               timeLabel: formatTimeLabel(now),
               attachments: [],
             };
+          }
+          const activeUser = this.activeTurn?.user;
+          if (activeUser && activeUser.text.includes('</system-reminder>')) {
+            const extracted = extractUserTodoSyncReminderFromText(activeUser.text);
+            if (extracted.hasReminder) {
+              activeUser.text = extracted.strippedText;
+              if (extracted.phases !== undefined) {
+                this._replayedTodoPhases = cloneTodoPhases(extracted.phases);
+                this.setTodoPhases(extracted.phases, { source: 'user' });
+              }
+            }
           }
         } else if (!current) {
           this.reconcileBackgroundCompletionFromText(chunkText);
@@ -2962,11 +3020,12 @@ export class TranscriptStore {
   completeBackgroundTask(
     idOrTaskId: string,
     status: 'completed' | 'failed' | 'cancelled' = 'completed',
+    endedAt?: number,
   ): boolean {
     const target = idOrTaskId.trim();
     if (!target) return false;
     this._settledTranscriptTaskIds.add(target);
-    const now = this._now();
+    const endTs = endedAt ?? this._now();
     let updated = false;
     for (const task of this._detachedBgTasks.values()) {
       if (task.status !== 'running') continue;
@@ -2977,11 +3036,11 @@ export class TranscriptStore {
         task.conversationId === target
       ) {
         task.status = status;
-        task.endedAt = now;
+        task.endedAt = endTs;
         if (task.taskId) {
           this._settledTranscriptTaskIds.add(task.taskId);
         }
-        this.syncToolBackgroundState(task.toolCallId, false, task.taskId);
+        this.syncToolBackgroundState(task.toolCallId, false, task.taskId, status);
         updated = true;
       }
     }
@@ -3002,11 +3061,59 @@ export class TranscriptStore {
         if (task.taskId) {
           this._settledTranscriptTaskIds.add(task.taskId);
         }
-        this.syncToolBackgroundState(task.toolCallId, false, task.taskId);
+        this.syncToolBackgroundState(task.toolCallId, false, task.taskId, status);
         count += 1;
       }
     }
     return count;
+  }
+
+  private findMatchingUnlabeledRunningTask(
+    rec: TranscriptBackgroundTaskRecord,
+    requireTimeAndTypeForTerminal = false,
+  ): DetachedBackgroundTask | undefined {
+    const unlabeledRunning = [...this._detachedBgTasks.values()].filter(
+      (t) =>
+        t.status === 'running' &&
+        !t.taskId &&
+        t.agentKind !== 'subagent' &&
+        !t.id.startsWith('transcript:'),
+    );
+    if (unlabeledRunning.length === 0) return undefined;
+
+    const preferred = rec.scheduleKind
+      ? unlabeledRunning.filter((t) => t.type === 'schedule')
+      : unlabeledRunning;
+    const pool =
+      preferred.length > 0
+        ? preferred
+        : requireTimeAndTypeForTerminal && rec.scheduleKind
+          ? []
+          : unlabeledRunning;
+    if (pool.length === 0) return undefined;
+
+    if (rec.description) {
+      const normDesc = rec.description.replace(/\s+/g, ' ').trim().toLowerCase();
+      const descMatch = pool.find((t) => {
+        const fields = [t.command, t.title, t.label]
+          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => v.replace(/\s+/g, ' ').trim().toLowerCase());
+        return fields.some((f) => f === normDesc || f.includes(normDesc) || normDesc.includes(f));
+      });
+      if (descMatch) return descMatch;
+    }
+
+    if (pool.length === 1) {
+      const sole = pool[0]!;
+      if (
+        !requireTimeAndTypeForTerminal ||
+        rec.startedAt === undefined ||
+        Math.abs(sole.startedAt - rec.startedAt) <= 60_000
+      ) {
+        return sole;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -3021,7 +3128,25 @@ export class TranscriptStore {
     for (const rec of records) {
       if (rec.status !== 'running') {
         this._settledTranscriptTaskIds.add(rec.taskId);
-        if (this.completeBackgroundTask(rec.taskId, rec.status)) {
+        if (this.completeBackgroundTask(rec.taskId, rec.status, rec.endedAt)) {
+          changed = true;
+          continue;
+        }
+        const matchedUnlabeled = this.findMatchingUnlabeledRunningTask(rec, true);
+        if (matchedUnlabeled) {
+          this._detachedBgTasks.set(matchedUnlabeled.id, {
+            ...matchedUnlabeled,
+            taskId: rec.taskId,
+            ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
+            status: rec.status,
+            endedAt: rec.endedAt ?? this._now(),
+          });
+          this.syncToolBackgroundState(
+            matchedUnlabeled.toolCallId,
+            false,
+            rec.taskId,
+            rec.status,
+          );
           changed = true;
         }
       }
@@ -3046,7 +3171,9 @@ export class TranscriptStore {
         if (existing && existing.status !== 'running') {
           continue;
         }
-        const jobType = classifyNonAgentJobType(matched.tool) ?? 'bash';
+        const jobType = rec.scheduleKind
+          ? 'schedule'
+          : (classifyNonAgentJobType(matched.tool) ?? 'bash');
         const inputRec = asRecord(matched.tool.args) ?? asRecord(matched.tool.rawInput);
         const command =
           rec.description ||
@@ -3059,6 +3186,7 @@ export class TranscriptStore {
           toolCallId: matched.tool.toolCallId,
           taskId: rec.taskId,
           type: jobType,
+          ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
           label,
           ...(command ? { command } : {}),
           ...(matched.tool.title && matched.tool.title !== command ? { title: matched.tool.title } : {}),
@@ -3072,39 +3200,17 @@ export class TranscriptStore {
         changed = true;
       } else {
         // 1. Bind rec.taskId to an unlabeled running non-subagent detached task if present
-        const unlabeledRunning = [...this._detachedBgTasks.values()].filter(
-          (t) =>
-            t.status === 'running' &&
-            !t.taskId &&
-            t.agentKind !== 'subagent' &&
-            !t.id.startsWith('transcript:'),
-        );
-        let boundExisting = false;
-        if (unlabeledRunning.length > 0) {
-          let targetTask: DetachedBackgroundTask | undefined;
-          if (rec.description) {
-            const normDesc = rec.description.replace(/\s+/g, ' ').trim().toLowerCase();
-            targetTask = unlabeledRunning.find((t) => {
-              const fields = [t.command, t.title, t.label]
-                .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-                .map((v) => v.replace(/\s+/g, ' ').trim().toLowerCase());
-              return fields.some((f) => f === normDesc || f.includes(normDesc) || normDesc.includes(f));
-            });
-          }
-          if (!targetTask && unlabeledRunning.length === 1) {
-            targetTask = unlabeledRunning[0];
-          }
-          if (targetTask) {
-            this._detachedBgTasks.set(targetTask.id, {
-              ...targetTask,
-              taskId: rec.taskId,
-            });
-            this.syncToolBackgroundState(targetTask.toolCallId, true, rec.taskId);
-            changed = true;
-            boundExisting = true;
-          }
+        const targetTask = this.findMatchingUnlabeledRunningTask(rec, false);
+        if (targetTask) {
+          this._detachedBgTasks.set(targetTask.id, {
+            ...targetTask,
+            taskId: rec.taskId,
+            ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
+          });
+          this.syncToolBackgroundState(targetTask.toolCallId, true, rec.taskId);
+          changed = true;
+          continue;
         }
-        if (boundExisting) continue;
 
         // 2. Skip spawning a synthetic entry if the active/latest turn already completed a matching tool call
         const candidateTurns: TranscriptTurn[] = [];
@@ -3142,7 +3248,8 @@ export class TranscriptStore {
           id: syntheticId,
           toolCallId: syntheticId,
           taskId: rec.taskId,
-          type: 'bash',
+          type: rec.scheduleKind ? 'schedule' : 'bash',
+          ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
           label,
           ...(rec.description ? { command: rec.description } : {}),
           startedAt: rec.startedAt ?? this._now(),
@@ -3398,6 +3505,9 @@ export class TranscriptStore {
     this._plan = null;
     this._todoPhases = [];
     this._replayedTodoPhases = [];
+    this._todoToolCallCount = 0;
+    this._countedTodoToolIds.clear();
+    this._hasUserTodoOverride = false;
     this._pendingTodoSnapshots.length = 0;
     this._activeTurnIndex = null;
     this._toolIndex.clear();
@@ -3706,6 +3816,13 @@ export class TranscriptStore {
     return tool;
   }
 
+  private recordTodoToolCall(toolCallId: string): void {
+    if (!this._countedTodoToolIds.has(toolCallId)) {
+      this._countedTodoToolIds.add(toolCallId);
+      this._todoToolCallCount += 1;
+    }
+  }
+
   private assignTodoSnapshotToTool(
     turn: TranscriptTurn,
     tool: ToolCallItem,
@@ -3716,6 +3833,8 @@ export class TranscriptStore {
       readonly text: string;
     },
   ): void {
+    this.recordTodoToolCall(tool.toolCallId);
+    tool.isOmaTodo = true;
     tool.displayName = 'todo';
     tool.targetKind = 'text';
     tool.title = 'Todo';
@@ -3756,7 +3875,9 @@ export class TranscriptStore {
     tool: ToolCallItem,
     isReplaying: boolean,
   ): void {
-    if (!isOmaTodoToolName(tool.rawName, tool.title)) return;
+    if (!tool.isOmaTodo && !isOmaTodoToolName(tool.rawName, tool.title)) return;
+    this.recordTodoToolCall(tool.toolCallId);
+    tool.isOmaTodo = true;
     tool.displayName = 'todo';
     tool.targetKind = 'text';
     tool.title = 'Todo';
@@ -3824,16 +3945,39 @@ export class TranscriptStore {
       titleLower === 'command_status' ||
       titleLower.includes('command_status');
 
+    const NO_RUNNING_BG_TASKS_RE =
+      /\b(?:no\s+(?:running|active)\s+tasks?|no\s+background\s+tasks?(?:\s+are)?\s+(?:currently\s+)?running|no\s+tasks?\s+(?:are\s+)?(?:currently\s+)?running|0\s+running|none\s+running)\b/i;
+
     // 1. Handle `manage_task` / `command_status` settling existing detached background tasks
     if (
       (isManageTaskByNameOrTitle || isManageTaskByInputShape) &&
       (tool.status === 'done' || tool.status === 'error')
     ) {
       const outText = tool.outputText || '';
+      const effectiveTaskId =
+        targetTaskId ??
+        /\bTask(?:\s+id)?\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(?:cancelled|canceled|killed|stopped|terminated|aborted|completed|finished|failed)\b/i.exec(
+          outText,
+        )?.[1] ??
+        /\bTask:\s*([A-Za-z0-9._:/-]+)\b/i.exec(outText)?.[1];
+
+      const settleAllRunningNonSubagent = (status: 'completed' | 'cancelled') => {
+        const now = this._now();
+        for (const task of this._detachedBgTasks.values()) {
+          if (task.status === 'running' && task.agentKind !== 'subagent') {
+            task.status = status;
+            task.endedAt = now;
+            if (task.taskId) {
+              this._settledTranscriptTaskIds.add(task.taskId);
+            }
+            this.syncToolBackgroundState(task.toolCallId, false, task.taskId, status);
+          }
+        }
+      };
 
       if (action === 'kill' || action === 'cancel' || action === 'stop') {
-        if (targetTaskId) {
-          this.completeBackgroundTask(targetTaskId, 'cancelled');
+        if (effectiveTaskId) {
+          this.completeBackgroundTask(effectiveTaskId, 'cancelled');
         } else {
           // If no explicit TaskId, cancel sole running non-subagent detached task
           const runningNonSub = [...this._detachedBgTasks.values()].filter(
@@ -3846,7 +3990,7 @@ export class TranscriptStore {
             if (sole.taskId) {
               this._settledTranscriptTaskIds.add(sole.taskId);
             }
-            this.syncToolBackgroundState(sole.toolCallId, false, sole.taskId);
+            this.syncToolBackgroundState(sole.toolCallId, false, sole.taskId, 'cancelled');
           }
         }
         return;
@@ -3854,27 +3998,28 @@ export class TranscriptStore {
 
       if (action === 'status' || isCommandStatus) {
         const terminal = inferTerminalBgStatusFromText(outText);
-        if (terminal && targetTaskId) {
-          this.completeBackgroundTask(targetTaskId, terminal);
+        if (terminal && effectiveTaskId) {
+          this.completeBackgroundTask(effectiveTaskId, terminal);
         }
         return;
       }
 
       if (action === 'list') {
-        if (/\b(?:no\s+(?:running|active)\s+tasks?|0\s+running|none\s+running)\b/i.test(outText)) {
-          const now = this._now();
-          for (const task of this._detachedBgTasks.values()) {
-            if (task.status === 'running' && task.agentKind !== 'subagent') {
-              task.status = 'completed';
-              task.endedAt = now;
-              if (task.taskId) {
-                this._settledTranscriptTaskIds.add(task.taskId);
-              }
-              this.syncToolBackgroundState(task.toolCallId, false, task.taskId);
-            }
-          }
+        if (NO_RUNNING_BG_TASKS_RE.test(outText)) {
+          settleAllRunningNonSubagent('completed');
         }
         return;
+      }
+
+      if (action === '') {
+        if (NO_RUNNING_BG_TASKS_RE.test(outText)) {
+          settleAllRunningNonSubagent('completed');
+        } else if (effectiveTaskId) {
+          const terminal = inferTerminalBgStatusFromText(outText);
+          if (terminal) {
+            this.completeBackgroundTask(effectiveTaskId, terminal);
+          }
+        }
       }
       return;
     }
@@ -3967,8 +4112,16 @@ export class TranscriptStore {
     const normDesc = description.replace(/\s+/g, ' ').trim().toLowerCase();
     if (normDesc.length === 0) return false;
     const inputRec = asRecord(tool.args) ?? asRecord(tool.rawInput);
-    const cmd = firstStringField(inputRec, ['CommandLine', 'command', 'cmd', 'script']);
-    const fields = [tool.target, cmd, tool.title]
+    const cmd = firstStringField(inputRec, [
+      'CommandLine',
+      'command',
+      'cmd',
+      'script',
+      'CronExpression',
+      'cronExpression',
+    ]);
+    const prompt = firstStringField(inputRec, ['Prompt', 'prompt', 'Description', 'description']);
+    const fields = [tool.target, cmd, prompt, tool.title]
       .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
       .map((v) => v.replace(/\s+/g, ' ').trim().toLowerCase());
     return fields.some((f) => f === normDesc || f.includes(normDesc) || normDesc.includes(f));
@@ -4009,19 +4162,59 @@ export class TranscriptStore {
     return Math.max(0, this._now() - tool.startedAt) >= LONG_RUNNING_TOOL_THRESHOLD_MS;
   }
 
-  private syncToolBackgroundState(toolCallId: string, running: boolean, taskId?: string): boolean {
+  private syncToolBackgroundState(
+    toolCallId: string,
+    running: boolean,
+    taskId?: string,
+    terminalStatus?: 'completed' | 'failed' | 'cancelled',
+  ): boolean {
     const entry = this._toolIndex.get(toolCallId);
     if (!entry) return false;
     const { tool, turnIndex } = entry;
     const nextTaskId = taskId ?? tool.backgroundTaskId;
-    if (Boolean(tool.backgroundRunning) === running && tool.backgroundTaskId === nextTaskId) {
+    let changed = false;
+
+    if (Boolean(tool.backgroundRunning) !== running) {
+      tool.backgroundRunning = running;
+      changed = true;
+    }
+    if (nextTaskId !== undefined && tool.backgroundTaskId !== nextTaskId) {
+      tool.backgroundTaskId = nextTaskId;
+      changed = true;
+    }
+
+    const turn = this._turns[turnIndex];
+    if (
+      !running &&
+      terminalStatus !== undefined &&
+      (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') &&
+      tool.endedAt === undefined
+    ) {
+      const now = this._now();
+      tool.awaitingPermission = false;
+      tool.permissionRequestId = undefined;
+      if (terminalStatus === 'cancelled') {
+        tool.cancelled = true;
+        tool.status = 'cancelled';
+      } else if (terminalStatus === 'failed') {
+        tool.status = 'error';
+      } else {
+        tool.status = 'done';
+      }
+      tool.endedAt = now;
+      if (!tool.replayed) {
+        tool.tookMs = tool.tookMs ?? Math.max(0, now - tool.startedAt);
+      }
+      if (turn) {
+        this.syncSubagentsForTool(turn, tool);
+      }
+      changed = true;
+    }
+
+    if (!changed) {
       return false;
     }
-    tool.backgroundRunning = running;
-    if (nextTaskId !== undefined) {
-      tool.backgroundTaskId = nextTaskId;
-    }
-    this.bumpTurn(this._turns[turnIndex]);
+    this.bumpTurn(turn);
     return true;
   }
 
@@ -4130,6 +4323,40 @@ export class TranscriptStore {
       this.completeBackgroundTask(id, status);
     }
 
+    const msgBlockRe =
+      /\[Message\]\s+[^\r\n]*?\bsender=([^\s\]]+)[^\r\n]*?\bcontent=([\s\S]*?)(?=(?:\r?\n\[Message\]\s|\r?\n<\/SYSTEM_MESSAGE>|$))/gi;
+    const schedTerminalRe =
+      /^\s*(?:Cron(?:\s+schedule)?|Timer|Schedule)\s+(?:(?:was|has|is)\s+)?(completed|finished|expired|ended|cancelled|canceled|stopped|killed|terminated|aborted|failed|errored)\b/i;
+    let msgMatch: RegExpExecArray | null;
+    while ((msgMatch = msgBlockRe.exec(text)) !== null) {
+      const senderId = msgMatch[1]?.replace(/[.,;)]+$/, '');
+      const body = msgMatch[2] ?? '';
+      if (!senderId || senderId.toLowerCase() === 'system') continue;
+      const schedTerm = schedTerminalRe.exec(body);
+      if (schedTerm?.[1]) {
+        const lower = schedTerm[1].toLowerCase().replace(/[\s_]+/g, ' ').trim();
+        const status: 'completed' | 'failed' | 'cancelled' =
+          lower === 'failed' || lower === 'error' || lower === 'errored' || lower === 'timed out'
+            ? 'failed'
+            : lower === 'killed' ||
+                lower === 'cancelled' ||
+                lower === 'canceled' ||
+                lower === 'stopped' ||
+                lower === 'terminated' ||
+                lower === 'aborted'
+              ? 'cancelled'
+              : 'completed';
+        this.completeBackgroundTask(senderId, status);
+        continue;
+      }
+      for (const task of this._detachedBgTasks.values()) {
+        if (task.status === 'running' && task.taskId === senderId && task.scheduleKind === 'timer') {
+          this.completeBackgroundTask(senderId, 'completed');
+          break;
+        }
+      }
+    }
+
     // Match any running detached task's taskId / conversationId when accompanied by a terminal cue
     const terminal = inferTerminalBgStatusFromText(text);
     if (!terminal) return;
@@ -4142,7 +4369,7 @@ export class TranscriptStore {
         if (task.taskId) {
           this._settledTranscriptTaskIds.add(task.taskId);
         }
-        this.syncToolBackgroundState(task.toolCallId, false, task.taskId);
+        this.syncToolBackgroundState(task.toolCallId, false, task.taskId, terminal);
       }
     }
   }

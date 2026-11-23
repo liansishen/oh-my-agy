@@ -63,7 +63,7 @@ const TODO_TOOL_DECLARATION = {
       items: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Task list for flat init, append, or rm.',
+        description: 'Task list for flat init, append, done, drop, or rm.',
       },
       note: {
         type: 'string',
@@ -85,13 +85,13 @@ function extractConversationSessionId(
   meta: Record<string, unknown> | undefined,
   fallbackSessionId: string | null,
 ): string {
-  const rootId = meta?.['antigravity.google/root_conversation_id'];
-  if (typeof rootId === 'string' && rootId.trim().length > 0) {
-    return rootId.trim();
-  }
   const convId = meta?.['antigravity.google/conversation_id'];
   if (typeof convId === 'string' && convId.trim().length > 0) {
     return convId.trim();
+  }
+  const rootId = meta?.['antigravity.google/root_conversation_id'];
+  if (typeof rootId === 'string' && rootId.trim().length > 0) {
+    return rootId.trim();
   }
   return fallbackSessionId?.trim() || 'default';
 }

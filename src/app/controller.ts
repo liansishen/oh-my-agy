@@ -39,6 +39,7 @@ import {
 import { normalizeDisplayPath, sameDir, toFileUri } from '../acp/path';
 import {
   AcpRpcError,
+  extractNoticeText,
   extractSessionTier,
   isElicitationCreateRequest,
   isRequestPermissionRequest,
@@ -186,6 +187,7 @@ const MAX_EMBEDDED_FILE_BYTES = 256 * 1024;
 const DONE_TO_IDLE_DELAY_MS = 1500;
 const DEFAULT_BACKGROUND_DONE_GRACE_MS = 2000;
 const DEFAULT_BACKGROUND_WAKEUP_GRACE_MS = 10_000;
+const DEFAULT_BACKGROUND_TRANSCRIPT_STALL_MS = 180_000;
 const DEFAULT_REPLAY_DRAIN_INITIAL_QUIET_MS = 120;
 const DEFAULT_REPLAY_DRAIN_ACTIVE_QUIET_MS = 250;
 const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
@@ -363,33 +365,73 @@ function guessMimeType(filePath: string): string {
   }
 }
 
-function splitTodoShellArgs(raw: string): string[] {
-  const tokens: string[] = [];
+interface TodoShellToken {
+  readonly value: string;
+  readonly quoted: boolean;
+}
+
+function tokenizeTodoShellArgs(raw: string): TodoShellToken[] {
+  const tokens: TodoShellToken[] = [];
   let cur = '';
-  let inQuotes = false;
+  let quote: '"' | "'" | null = null;
+  let hadQuotes = false;
+
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i]!;
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '\\' && i + 1 < raw.length) {
+        const next = raw[i + 1]!;
+        if (next === '"' || next === '\\') {
+          cur += next;
+          i++;
+          continue;
+        }
+      }
+      if (ch === '"') {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+
     if (ch === '\\' && i + 1 < raw.length) {
       cur += raw[++i]!;
       continue;
     }
-    if (ch === '"') {
-      inQuotes = !inQuotes;
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hadQuotes = true;
       continue;
     }
-    if (!inQuotes && /\s/.test(ch)) {
-      if (cur.length > 0) {
-        tokens.push(cur);
+    if (/\s/.test(ch)) {
+      if (cur.length > 0 || hadQuotes) {
+        if (cur.length > 0) {
+          tokens.push({ value: cur, quoted: hadQuotes });
+        }
         cur = '';
+        hadQuotes = false;
       }
       continue;
     }
     cur += ch;
   }
   if (cur.length > 0) {
-    tokens.push(cur);
+    tokens.push({ value: cur, quoted: hadQuotes });
   }
   return tokens;
+}
+
+function splitTodoShellArgs(raw: string): string[] {
+  return tokenizeTodoShellArgs(raw).map(t => t.value);
 }
 
 function looksBinary(bytes: Uint8Array): boolean {
@@ -488,6 +530,8 @@ export class AppController {
   #workingStartedAt: number | undefined = undefined;
   #pendingBackgroundDone = false;
   #awaitingPostToolWakeup = false;
+  #backgroundResumeAnchorStepSeq = 0;
+  #backgroundWaitLastProgressAt = 0;
   #awaitingSwarmCoordinatorReply = false;
   #swarmCoordinatorReplied = false;
   #deferredSettleTurnIndex: number | null = null;
@@ -1018,6 +1062,8 @@ export class AppController {
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
     this.#awaitingPostToolWakeup = false;
+    this.#backgroundResumeAnchorStepSeq = 0;
+    this.#backgroundWaitLastProgressAt = 0;
     this.#awaitingSwarmCoordinatorReply = false;
     this.#swarmCoordinatorReplied = false;
     this.#deferredSettleTurnIndex = null;
@@ -1375,6 +1421,25 @@ export class AppController {
       }
 
       this.store.transcript.finalizeReplayedTurns();
+      const storedTodoAnchor = await this.#previewStore.load(loaded.sessionId).catch(() => null);
+      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
+        return false;
+      }
+      if (
+        storedTodoAnchor?.todoState &&
+        storedTodoAnchor.todoState.toolCallCount >= this.store.transcript.todoToolCallCount &&
+        JSON.stringify(storedTodoAnchor.todoState.phases) !==
+          JSON.stringify(this.store.transcript.todoPhases)
+      ) {
+        this.store.transcript.setTodoPhases(storedTodoAnchor.todoState.phases, {
+          source: 'user',
+        });
+        this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
+          'resumed session todo state',
+          storedTodoAnchor.todoState.phases,
+          storedTodoAnchor.todoState.phases.length === 0
+        );
+      }
       this.#todoServer?.setActiveSessionId(loaded.sessionId);
       this.#todoServer?.seedSession(loaded.sessionId, this.store.transcript.todoPhases);
       this.#scheduleTodoAutoClearIfDone();
@@ -1712,6 +1777,26 @@ export class AppController {
         }
         this.#syncToolWatchTimer();
       } else if (update.sessionUpdate === 'notice') {
+        const noticeText = extractNoticeText(update);
+        if (
+          /\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i.test(
+            noticeText
+          ) &&
+          !this.store.getState().isStreaming &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply
+        ) {
+          this.#pendingBackgroundDone = false;
+          this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
+          this.#clearBackgroundDoneTimer();
+          if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+            this.osc.setStatusIdle();
+          }
+        }
         this.#syncToolWatchTimer();
       }
 
@@ -1761,6 +1846,11 @@ export class AppController {
         // The last background tool just finished; give the model a generous wakeup
         // window (TTFT) before emitting OSC 7501 `state=done`.
         this.#awaitingPostToolWakeup = true;
+        this.#backgroundResumeAnchorStepSeq = Math.max(
+          this.#backgroundResumeAnchorStepSeq,
+          this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0
+        );
+        this.#backgroundWaitLastProgressAt = this.#now();
       }
 
       this.#reconcileBackgroundActivity(prevBusy);
@@ -1774,10 +1864,14 @@ export class AppController {
         isThoughtChunk || isMessageChunk || isToolRunningUpdate || isUsageAfterReply;
 
       if (this.#pendingBackgroundDone && isLiveActivityUpdate) {
-        if (isMessageChunk) {
+        this.#backgroundWaitLastProgressAt = this.#now();
+        if (isMessageChunk && !this.#metricsTracker.hasTranscriptData) {
           this.#awaitingPostToolWakeup = false;
         } else if (isThoughtChunk) {
           this.#awaitingPostToolWakeup = true;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          this.#syncToolWatchTimer();
         }
         const stateAfter = this.store.getState();
         this.#clearDoneIdleTimer();
@@ -1938,6 +2032,8 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
     this.#awaitingPostToolWakeup = false;
+    this.#backgroundResumeAnchorStepSeq = 0;
+    this.#backgroundWaitLastProgressAt = 0;
     this.#awaitingSwarmCoordinatorReply = false;
     this.#swarmCoordinatorReplied = false;
     this.#deferredSettleTurnIndex = null;
@@ -3574,16 +3670,17 @@ export class AppController {
 
           const reminderToSend = !isCompactPrompt ? this.#pendingTodoSyncReminder : null;
           const outboundPrompt = reminderToSend
-            ? [{ type: 'text' as const, text: reminderToSend }, ...promptBlocks]
+            ? [{ type: 'text' as const, text: `${reminderToSend}\n\n` }, ...promptBlocks]
             : promptBlocks;
-          if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
-            this.#pendingTodoSyncReminder = null;
-          }
 
           const result = await client.prompt({
             sessionId,
             prompt: outboundPrompt,
           });
+
+          if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
+            this.#pendingTodoSyncReminder = null;
+          }
 
         if (
           this.#shuttingDown ||
@@ -3604,8 +3701,8 @@ export class AppController {
         );
         this.store.setStreaming(false);
 
-        if (isCompactPrompt && result.stopReason === 'end_turn') {
-          await this.#syncSessionMetricsFromTranscript();
+        if (result.stopReason === 'end_turn') {
+          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
           if (
             this.#shuttingDown ||
             promptEpoch !== this.#sessionEpoch ||
@@ -3613,7 +3710,7 @@ export class AppController {
           ) {
             return;
           }
-          if (finishedTurn && !finishedTurn.notices.some(n => n.kind === 'compaction')) {
+          if (isCompactPrompt && finishedTurn && !finishedTurn.notices.some(n => n.kind === 'compaction')) {
             this.store.transcript.markCompactionCompleted(finishedTurn.index);
           }
         }
@@ -3645,6 +3742,8 @@ export class AppController {
           this.#applySessionMetricsSnapshot(endedSnap);
           this.#pendingBackgroundDone = false;
           this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
           this.#awaitingSwarmCoordinatorReply = false;
           this.#swarmCoordinatorReplied = false;
           this.#deferredSettleTurnIndex = null;
@@ -3661,6 +3760,11 @@ export class AppController {
           this.#pendingBackgroundDone =
             hasBgTools || (!needSwarmReply && this.#swarmCoordinatorReplied);
           this.#awaitingPostToolWakeup = false;
+          if (this.#pendingBackgroundDone) {
+            this.#backgroundResumeAnchorStepSeq =
+              this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
+            this.#backgroundWaitLastProgressAt = this.#now();
+          }
           if (finishedTurn) {
             this.#deferredSettleTurnIndex = finishedTurn.index;
           }
@@ -3708,6 +3812,8 @@ export class AppController {
         if (!this.store.isBusy) {
           this.#pendingBackgroundDone = false;
           this.#awaitingPostToolWakeup = false;
+          this.#backgroundResumeAnchorStepSeq = 0;
+          this.#backgroundWaitLastProgressAt = 0;
           this.#deferredSettleTurnIndex = null;
           this.#workingStartedAt = undefined;
           this.#clearBackgroundDoneTimer();
@@ -3890,6 +3996,8 @@ export class AppController {
       } else {
         this.#pendingBackgroundDone = false;
         this.#awaitingPostToolWakeup = false;
+        this.#backgroundResumeAnchorStepSeq = 0;
+        this.#backgroundWaitLastProgressAt = 0;
         this.#awaitingSwarmCoordinatorReply = false;
         this.#deferredSettleTurnIndex = null;
         this.#workingStartedAt = undefined;
@@ -3913,6 +4021,8 @@ export class AppController {
     } else if (cancelledBg > 0) {
       this.#pendingBackgroundDone = false;
       this.#awaitingPostToolWakeup = false;
+      this.#backgroundResumeAnchorStepSeq = 0;
+      this.#backgroundWaitLastProgressAt = 0;
       this.#awaitingSwarmCoordinatorReply = false;
       this.#deferredSettleTurnIndex = null;
       this.#workingStartedAt = undefined;
@@ -6088,11 +6198,14 @@ export class AppController {
 
   #buildSessionBootstrapOptions(): {
     mcpServers: McpServerConfig[];
-    _meta: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } {
     const server = this.#ensureTodoServer();
+    if (!server) {
+      return { mcpServers: [] };
+    }
     return {
-      mcpServers: server ? [server.getMcpServerConfig()] : [],
+      mcpServers: [server.getMcpServerConfig()],
       _meta: {
         antigravity: {
           systemPrompt: {
@@ -6170,6 +6283,7 @@ export class AppController {
       options.removed === true
     );
     this.scheduler.renderNow();
+    void this.#persistSessionAnchorAndOsc().catch(() => {});
   }
 
   async #editTodoInExternalEditor(editorCmd: string, initialMd: string): Promise<string | null> {
@@ -6196,7 +6310,7 @@ export class AppController {
       return edited === initialMd ? null : edited;
     } finally {
       if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
-        process.stdin.setRawMode(wasRaw || true);
+        process.stdin.setRawMode(wasRaw);
       }
       this.surface.resume();
       this.osc.setTitleAndHideCursor('oma · Antigravity');
@@ -6225,6 +6339,11 @@ export class AppController {
 
     switch (verb) {
       case 'expand': {
+        if (current.length === 0) {
+          this.store.pushToast('No todos to expand.', 'info');
+          this.scheduler.renderNow();
+          return;
+        }
         this.#todoExpanded = true;
         this.#todoHudDismissed = false;
         this.#clearTodoAutoClearTimer();
@@ -6234,6 +6353,7 @@ export class AppController {
       }
       case 'collapse': {
         this.#todoExpanded = false;
+        this.#scheduleTodoAutoClearIfDone();
         this.scheduler.renderNow();
         return;
       }
@@ -6308,19 +6428,28 @@ export class AppController {
             ? formatTodoMarkdown(current)
             : '# Todos\n- [ ] (replace this with your tasks)\n';
         let editedMd: string | null = null;
-        if (this.#editTodoExternal) {
-          editedMd = await this.#editTodoExternal(initialMd);
-        } else {
-          const editorCmd = (process.env.VISUAL || process.env.EDITOR || '').trim();
-          if (!editorCmd) {
-            this.store.pushToast(
-              'No editor configured. Set $VISUAL or $EDITOR environment variable.',
-              'warning'
-            );
-            this.scheduler.renderNow();
-            return;
+        try {
+          if (this.#editTodoExternal) {
+            editedMd = await this.#editTodoExternal(initialMd);
+          } else {
+            const editorCmd = (process.env.VISUAL || process.env.EDITOR || '').trim();
+            if (!editorCmd) {
+              this.store.pushToast(
+                'No editor configured. Set $VISUAL or $EDITOR environment variable.',
+                'warning'
+              );
+              this.scheduler.renderNow();
+              return;
+            }
+            editedMd = await this.#editTodoInExternalEditor(editorCmd, initialMd);
           }
-          editedMd = await this.#editTodoInExternalEditor(editorCmd, initialMd);
+        } catch (err) {
+          this.store.pushToast(
+            `Failed to open editor: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+          this.scheduler.renderNow();
+          return;
         }
         if (editedMd === null) {
           this.store.pushToast('Editor exited without saving; todos unchanged.', 'info');
@@ -6339,28 +6468,45 @@ export class AppController {
         return;
       }
       case 'append': {
-        const tokens = splitTodoShellArgs(rest);
+        const tokens = tokenizeTodoShellArgs(rest);
         if (tokens.length === 0) {
           this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
           this.scheduler.renderNow();
           return;
         }
-        const phaseQuery = tokens.length === 1 ? undefined : tokens[0]!;
-        const taskText = (tokens.length === 1 ? tokens[0]! : tokens.slice(1).join(' ')).trim();
         let targetPhase: TodoPhase | undefined;
-        if (phaseQuery) {
-          targetPhase = findTodoPhaseFuzzy(current, phaseQuery);
-          if (!targetPhase) {
-            targetPhase = { name: formatPhaseDisplayTitle(phaseQuery), tasks: [] };
-            current.push(targetPhase);
-          }
-        } else if (current.length > 0) {
+        let taskText = '';
+        if (tokens.length === 1) {
+          taskText = tokens[0]!.value.trim();
           targetPhase = current[current.length - 1];
         } else {
+          const first = tokens[0]!;
+          const matchedPhase = findTodoPhaseFuzzy(current, first.value);
+          if (matchedPhase) {
+            targetPhase = matchedPhase;
+            taskText = tokens
+              .slice(1)
+              .map(t => t.value)
+              .join(' ')
+              .trim();
+          } else if (first.quoted) {
+            targetPhase = { name: formatPhaseDisplayTitle(first.value), tasks: [] };
+            current.push(targetPhase);
+            taskText = tokens
+              .slice(1)
+              .map(t => t.value)
+              .join(' ')
+              .trim();
+          } else {
+            taskText = tokens.map(t => t.value).join(' ').trim();
+            targetPhase = current[current.length - 1];
+          }
+        }
+        if (!targetPhase) {
           targetPhase = { name: 'Todos', tasks: [] };
           current.push(targetPhase);
         }
-        if (!targetPhase || !taskText) {
+        if (!taskText) {
           this.store.pushToast('Usage: /todo append [<phase>] <task...>', 'warning');
           this.scheduler.renderNow();
           return;
@@ -6636,6 +6782,14 @@ export class AppController {
         ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
         turnCount: this.store.transcript.turns.length,
         preview: this.store.transcript.getPreviewMessages(3, 400),
+        ...(this.store.transcript.hasPersistedTodoState
+          ? {
+              todoState: {
+                phases: cloneTodoPhases(this.store.transcript.todoPhases),
+                toolCallCount: this.store.transcript.todoToolCallCount,
+              },
+            }
+          : {}),
       });
       if (
         this.#shuttingDown ||
@@ -6695,45 +6849,84 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     if (this.#shuttingDown) return;
     const waitMs = delayMs ?? this.#backgroundDoneGraceMs;
+    const expectedEpoch = this.#sessionEpoch;
     this.#backgroundDoneTimer = setTimeout(() => {
       this.#backgroundDoneTimer = undefined;
-      if (this.#shuttingDown || !this.#pendingBackgroundDone) return;
-      const state = this.store.getState();
-      if (
-        state.isStreaming ||
-        state.hasActiveBackgroundTasks ||
-        state.isSwarmWorking ||
-        this.#isSwarmCoordinatorWorking() ||
-        this.#awaitingSwarmCoordinatorReply
-      ) {
-        return;
-      }
-      this.#pendingBackgroundDone = false;
-      this.#awaitingPostToolWakeup = false;
-      this.#awaitingSwarmCoordinatorReply = false;
-      this.#workingStartedAt = undefined;
-      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
-        autoCollapseThought: this.store.autoCollapseThought,
-        expandAllTools: state.expandAllTools,
-      });
-      if (this.#metricsTracker.isStreaming) {
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
-      }
-      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
-      this.#deferredSettleTurnIndex = null;
-      // Ensure any late chunks or tool updates are flushed to the screen before notifying done
-      this.scheduler.renderNow();
-      if (settleIdx !== null) {
-        this.scheduler.settleTurn(settleIdx);
-        this.osc.reassertCursorHidden();
-      }
-      if (!this.store.approvals.hasPending() && !state.activeQuestion) {
-        this.osc.setStatusDone();
-        this.#scheduleDoneToIdle();
-      }
-      void this.#syncSessionMetricsFromTranscript();
-      void this.#persistSessionAnchorAndOsc();
+      void (async () => {
+        if (
+          this.#shuttingDown ||
+          expectedEpoch !== this.#sessionEpoch ||
+          !this.#pendingBackgroundDone
+        ) {
+          return;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
+          if (
+            this.#shuttingDown ||
+            expectedEpoch !== this.#sessionEpoch ||
+            !this.#pendingBackgroundDone
+          ) {
+            return;
+          }
+        }
+        const state = this.store.getState();
+        if (
+          state.isStreaming ||
+          state.hasActiveBackgroundTasks ||
+          state.isSwarmWorking ||
+          this.#isSwarmCoordinatorWorking() ||
+          this.#awaitingSwarmCoordinatorReply
+        ) {
+          return;
+        }
+        if (this.#metricsTracker.hasTranscriptData) {
+          const activity = this.#metricsTracker.getLatestTurnActivity();
+          const transcriptAuthoritativelyFinal =
+            !activity ||
+            activity.resetAll === true ||
+            (activity.latestKind === 'planner_final' &&
+              activity.latestStepSeq > this.#backgroundResumeAnchorStepSeq);
+          const stalledTooLong =
+            this.#backgroundWaitLastProgressAt > 0 &&
+            this.#now() - this.#backgroundWaitLastProgressAt >=
+              DEFAULT_BACKGROUND_TRANSCRIPT_STALL_MS;
+          if (!transcriptAuthoritativelyFinal && !stalledTooLong) {
+            const recheckMs = Math.min(this.#backgroundDoneGraceMs, this.#toolWatchIntervalMs);
+            this.#scheduleBackgroundDone(recheckMs);
+            return;
+          }
+        }
+        this.#pendingBackgroundDone = false;
+        this.#awaitingPostToolWakeup = false;
+        this.#backgroundResumeAnchorStepSeq = 0;
+        this.#backgroundWaitLastProgressAt = 0;
+        this.#awaitingSwarmCoordinatorReply = false;
+        this.#workingStartedAt = undefined;
+        const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: state.expandAllTools,
+        });
+        if (this.#metricsTracker.isStreaming) {
+          const endedSnap = this.#metricsTracker.endStreamTurn();
+          this.#applySessionMetricsSnapshot(endedSnap);
+        }
+        const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+        this.#deferredSettleTurnIndex = null;
+        // Ensure any late chunks or tool updates are flushed to the screen before notifying done
+        this.scheduler.renderNow();
+        if (settleIdx !== null) {
+          this.scheduler.settleTurn(settleIdx);
+          this.osc.reassertCursorHidden();
+        }
+        if (!this.store.approvals.hasPending() && !state.activeQuestion) {
+          this.osc.setStatusDone();
+          this.#scheduleDoneToIdle();
+        }
+        this.#syncToolWatchTimer();
+        void this.#syncSessionMetricsFromTranscript();
+        void this.#persistSessionAnchorAndOsc();
+      })();
     }, waitMs);
   }
 
@@ -6748,7 +6941,9 @@ export class AppController {
     const shouldWatch =
       !this.#shuttingDown &&
       !this.store.getState().isReplaying &&
-      (this.store.transcript.hasInFlightToolCall() || this.store.hasActiveBackgroundTasks());
+      (this.store.transcript.hasInFlightToolCall() ||
+        this.store.hasActiveBackgroundTasks() ||
+        this.#pendingBackgroundDone);
     if (!shouldWatch) {
       this.#clearToolWatchTimer();
       return;
@@ -6762,7 +6957,9 @@ export class AppController {
       if (
         this.#shuttingDown ||
         this.store.getState().isReplaying ||
-        (!this.store.transcript.hasInFlightToolCall() && !this.store.hasActiveBackgroundTasks())
+        (!this.store.transcript.hasInFlightToolCall() &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.#pendingBackgroundDone)
       ) {
         this.#clearToolWatchTimer();
         return;
@@ -6807,12 +7004,19 @@ export class AppController {
     return true;
   }
 
-  async #syncSessionMetricsFromTranscript(): Promise<void> {
+  async #syncSessionMetricsFromTranscript(
+    options: { readonly reconcileBackground?: boolean } = {}
+  ): Promise<void> {
     if (this.#shuttingDown) return;
     const expectedSessionId = this.#metricsTracker.sessionId;
     if (!expectedSessionId) return;
+    const prevActivitySeq = this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
     const snap = await this.#metricsTracker.syncFromTranscript();
     if (this.#shuttingDown || this.#metricsTracker.sessionId !== expectedSessionId) return;
+    const nextActivity = this.#metricsTracker.getLatestTurnActivity();
+    if (nextActivity && nextActivity.latestStepSeq > prevActivitySeq) {
+      this.#backgroundWaitLastProgressAt = this.#now();
+    }
     let dirty = this.#applySessionMetricsSnapshot(snap);
     const checkpoint = this.#metricsTracker.getLatestCheckpoint();
     if (checkpoint && this.store.transcript.applyTranscriptCompactionCheckpoint(checkpoint)) {
@@ -6821,11 +7025,64 @@ export class AppController {
     if (!this.store.getState().isReplaying) {
       const prevBusy = this.store.isBusy;
       const bgRecords = this.#metricsTracker.getTranscriptBackgroundTasks();
-      if (bgRecords.length > 0 && this.store.transcript.syncTranscriptBackgroundTasks(bgRecords)) {
+      const bgSynced =
+        bgRecords.length > 0 && this.store.transcript.syncTranscriptBackgroundTasks(bgRecords);
+      if (bgSynced) {
         dirty = true;
         this.#lastWatchedRunningJobs =
           this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
-        this.#reconcileBackgroundActivity(prevBusy);
+      }
+      if (options.reconcileBackground !== false) {
+        const shouldWakeupAfterTranscriptTerminal =
+          bgSynced &&
+          prevBusy &&
+          !this.store.getState().isStreaming &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply;
+
+        if (shouldWakeupAfterTranscriptTerminal) {
+          if (nextActivity?.resetAll === true) {
+            this.#pendingBackgroundDone = false;
+            this.#awaitingPostToolWakeup = false;
+            this.#backgroundResumeAnchorStepSeq = 0;
+            this.#backgroundWaitLastProgressAt = 0;
+            this.#clearBackgroundDoneTimer();
+            if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+              this.osc.setStatusIdle();
+            }
+            this.#syncToolWatchTimer();
+          } else {
+            this.#awaitingPostToolWakeup = true;
+            this.#backgroundResumeAnchorStepSeq = Math.max(
+              this.#backgroundResumeAnchorStepSeq,
+              nextActivity?.latestKind === 'planner_final'
+                ? prevActivitySeq
+                : (nextActivity?.latestStepSeq ?? 0)
+            );
+            this.#backgroundWaitLastProgressAt = this.#now();
+            this.#reconcileBackgroundActivity(prevBusy);
+          }
+        } else if (bgSynced) {
+          this.#reconcileBackgroundActivity(prevBusy);
+        }
+
+        if (
+          this.#pendingBackgroundDone &&
+          !this.store.getState().isStreaming &&
+          nextActivity &&
+          nextActivity.latestStepSeq > prevActivitySeq &&
+          nextActivity.latestKind === 'planner_final' &&
+          nextActivity.latestStepSeq > this.#backgroundResumeAnchorStepSeq &&
+          !this.store.hasActiveBackgroundTasks() &&
+          !this.store.isSwarmWorking &&
+          !this.#isSwarmCoordinatorWorking() &&
+          !this.#awaitingSwarmCoordinatorReply
+        ) {
+          this.#awaitingPostToolWakeup = false;
+          this.#scheduleBackgroundDone(this.#backgroundDoneGraceMs);
+        }
       }
     }
     if (dirty) {

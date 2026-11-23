@@ -672,7 +672,7 @@ function renderToolItem(
     );
   }
 
-  if (tool.displayName === 'todo') {
+  if (tool.isOmaTodo) {
     const snap = tool.todoSnapshot;
     const status = snap?.isError ? 'error' : isToolRunning ? 'running' : effectiveStatus;
 

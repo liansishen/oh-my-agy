@@ -5,8 +5,8 @@ export const TODO_AUTO_CLEAR_DELAY_MS = 60_000;
 
 export const OMA_TODO_SYSTEM_PROMPT_APPEND = [
   `You have the session todo list tool \`${OMA_TODO_EXPOSED_TOOL_NAME}\`.`,
-  'Use it on multi-step, non-trivial tasks to track structured phases and live progress for the user.',
-  'Skip it for single-step answers or quick lookups.',
+  'Proactively call it on multi-step implementation, refactoring, debugging, or plan-execution tasks to show structured phases and live progress in the user HUD.',
+  'Skip it for single-step answers or quick read-only lookups.',
   'Operations: init (list=[{phase,items}] or flat items=[...]), append, start (single task), done, drop, rm, view.',
   'Always reference tasks verbatim by their exact task text (never synthetic task-N IDs).',
   'Keep at most one task in_progress at a time, and mark remaining tasks done or drop before finishing.',
@@ -21,7 +21,7 @@ export const TODO_HELP_TEXT = [
   '  /todo collapse                     Restore the collapsed completed-phase HUD view',
   '  /todo export [<path>]              Write todos to file (default: TODO.md)',
   '  /todo import [<path>]              Replace todos from file (default: TODO.md)',
-  '  /todo append [<phase>] <task...>   Append a task; phase fuzzy-matched or auto-created',
+  '  /todo append [<phase>] <task...>   Append a task (quote a new phase: /todo append "Phase" task)',
   '  /todo start  <task>                Mark task in_progress (fuzzy content match)',
   '  /todo done   [<task|phase>]        Mark task/phase/all completed',
   '  /todo drop   [<task|phase>]        Mark task/phase/all abandoned',
@@ -104,13 +104,13 @@ function parseStringOrArray(value: unknown): { readonly values: string[]; readon
 
 /**
  * Recognizes tool calls targeting `oma`'s embedded `todo` MCP tool regardless of ACP
- * transport formatting (`mcp_oma_todo_todo`, `oma_todo:todo`, `todo`, or `"Run mcp_oma_todo_todo"`).
+ * transport formatting (`mcp_oma_todo_todo`, `oma_todo:todo`, or `"Run mcp_oma_todo_todo"`).
+ * Bare `'todo'` is excluded so external third-party MCP tools keep normal permission & rendering flow.
  */
 export function isOmaTodoToolName(rawName?: string, title?: string): boolean {
   const n = rawName?.trim().toLowerCase() ?? '';
   if (
     n === OMA_TODO_EXPOSED_TOOL_NAME ||
-    n === OMA_TODO_TOOL_NAME ||
     n === `${OMA_TODO_MCP_SERVER_NAME}:${OMA_TODO_TOOL_NAME}` ||
     n === `${OMA_TODO_MCP_SERVER_NAME}/${OMA_TODO_TOOL_NAME}` ||
     n === `${OMA_TODO_MCP_SERVER_NAME}__${OMA_TODO_TOOL_NAME}`
@@ -121,7 +121,9 @@ export function isOmaTodoToolName(rawName?: string, title?: string): boolean {
   return (
     t === OMA_TODO_EXPOSED_TOOL_NAME ||
     t === `run ${OMA_TODO_EXPOSED_TOOL_NAME}` ||
-    t === OMA_TODO_TOOL_NAME
+    t === `${OMA_TODO_MCP_SERVER_NAME}:${OMA_TODO_TOOL_NAME}` ||
+    t === `${OMA_TODO_MCP_SERVER_NAME}/${OMA_TODO_TOOL_NAME}` ||
+    t === `${OMA_TODO_MCP_SERVER_NAME}__${OMA_TODO_TOOL_NAME}`
   );
 }
 
@@ -493,7 +495,8 @@ export function applyTodoOperation(
     }
   } else if (op === 'done' || op === 'drop') {
     const nextStatus: TodoTaskStatus = op === 'done' ? 'completed' : 'abandoned';
-    const taskParsed = parseStringOrArray(rawArgs.task);
+    const targetsRaw = rawArgs.task !== undefined ? rawArgs.task : rawArgs.items;
+    const taskParsed = parseStringOrArray(targetsRaw);
     const phaseArg = nonEmptyString(rawArgs.phase);
     if (taskParsed.invalid) {
       return buildErrorResult(op, baseline, [`${op} received invalid task target`]);
@@ -517,6 +520,7 @@ export function applyTodoOperation(
         errors.push(`Phase "${phaseArg}" not found.`);
       } else {
         for (const item of targetPhase.tasks) {
+          if (isTodoTaskFinished(item)) continue;
           item.status = nextStatus;
           if (note !== undefined) {
             item.note = note;
@@ -614,6 +618,7 @@ export function formatTodoMarkdown(phases: readonly TodoPhase[]): string {
 export function parseTodoMarkdown(markdown: string): { phases: TodoPhase[]; errors: string[] } {
   const errors: string[] = [];
   const phases: TodoPhase[] = [];
+  const seenTasks = new Set<string>();
   let currentPhase: TodoPhase | undefined;
 
   const lines = markdown.split(/\r?\n/);
@@ -640,8 +645,14 @@ export function parseTodoMarkdown(markdown: string): { phases: TodoPhase[]; erro
         errors.push(`Line ${i + 1}: unknown status marker "[${marker}]" (use [ ], [x], [/], [-])`);
         continue;
       }
+      const content = itemMatch[2]!.trim();
+      if (seenTasks.has(content)) {
+        errors.push(`Line ${i + 1}: duplicate task "${content}"`);
+        continue;
+      }
+      seenTasks.add(content);
       currentPhase.tasks.push({
-        content: itemMatch[2]!.trim(),
+        content,
         status,
       });
       continue;
@@ -725,12 +736,55 @@ export function formatUserTodoSyncReminder(
   if (removed) {
     lines.push(
       phases.length === 0
-        ? 'The user intentionally cleared the todo list. Do NOT recreate or re-populate it unless the user explicitly asks; continue the current request without a todo list.'
-        : 'The user intentionally removed the entries no longer shown below. Do NOT re-add them unless the user explicitly asks.',
+        ? 'The user cleared the previous todo list. Do NOT re-add those old cleared items; for the current turn, only create a new todo list if starting a new multi-step task or the user asks.'
+        : 'The user intentionally removed the entries no longer shown below. Do NOT re-add those removed items unless the user explicitly asks.',
     );
   }
   lines.push('Current todo list:', '', rendered, '</system-reminder>');
   return lines.join('\n');
+}
+
+export interface ExtractedUserTodoSyncReminder {
+  readonly strippedText: string;
+  readonly hasReminder: boolean;
+  readonly phases?: TodoPhase[];
+}
+
+const LEADING_OMA_TODO_REMINDER_RE =
+  /^\s*<system-reminder>\r?\nThe user manually modified the todo list \([^\r\n]*\)\.\r?\n[\s\S]*?Current todo list:\r?\n\r?\n([\s\S]*?)\r?\n<\/system-reminder>[ \t]*(?:\r?\n)*/;
+
+/**
+ * Strip leading `oma`-injected `<system-reminder>` todo-sync blocks from replayed
+ * `user_message_chunk` text and recover their embedded Markdown todo snapshot.
+ */
+export function extractUserTodoSyncReminderFromText(
+  text: string,
+): ExtractedUserTodoSyncReminder {
+  let remaining = text;
+  let hasReminder = false;
+  let latestPhases: TodoPhase[] | undefined;
+
+  while (true) {
+    const match = LEADING_OMA_TODO_REMINDER_RE.exec(remaining);
+    if (!match) break;
+    hasReminder = true;
+    const body = (match[1] ?? '').trim();
+    if (body === '(empty)') {
+      latestPhases = [];
+    } else {
+      const parsed = parseTodoMarkdown(body);
+      if (parsed.errors.length === 0) {
+        latestPhases = parsed.phases;
+      }
+    }
+    remaining = remaining.slice(match[0].length);
+  }
+
+  return {
+    strippedText: remaining,
+    hasReminder,
+    ...(latestPhases !== undefined ? { phases: latestPhases } : {}),
+  };
 }
 
 export function mapTodoStatusToChecklist(status: TodoTaskStatus): TodoChecklistStatus {
@@ -752,17 +806,16 @@ export function mapTodoPhasesToChecklist(
   options: { readonly expanded?: boolean } = {},
 ): TodoChecklistPhase[] {
   const expanded = options.expanded === true;
-  return phases
-    .filter((phase) => phase.tasks.length > 0)
-    .map((phase, pIdx) => ({
-      id: `p${pIdx}`,
-      title: phases.length > 1 ? `${pIdx + 1}. ${phase.name}` : phase.name,
-      ...(expanded || !phase.tasks.every(isTodoTaskFinished) ? {} : { collapsed: true }),
-      items: phase.tasks.map((task, tIdx) => ({
-        id: `p${pIdx}.${tIdx}`,
-        text: task.content,
-        ...(task.note !== undefined ? { note: task.note } : {}),
-        status: mapTodoStatusToChecklist(task.status),
-      })),
-    }));
+  const nonEmpty = phases.filter((phase) => phase.tasks.length > 0);
+  return nonEmpty.map((phase, pIdx) => ({
+    id: `p${pIdx}`,
+    title: nonEmpty.length > 1 ? `${pIdx + 1}. ${phase.name}` : phase.name,
+    ...(expanded || !phase.tasks.every(isTodoTaskFinished) ? {} : { collapsed: true }),
+    items: phase.tasks.map((task, tIdx) => ({
+      id: `p${pIdx}.${tIdx}`,
+      text: task.content,
+      ...(task.note !== undefined ? { note: task.note } : {}),
+      status: mapTodoStatusToChecklist(task.status),
+    })),
+  }));
 }
