@@ -48,6 +48,7 @@ import {
   buildQuestionCardFromElicitation,
   formatFullLocalTime,
   formatTurnTime,
+  LONG_RUNNING_TOOL_THRESHOLD_MS,
   TranscriptStore,
 } from '../src/state/transcript';
 import {
@@ -2304,5 +2305,365 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
 
     safeOut.close();
     expect(safeOut.reassertCursorHidden({ force: true })).toBe(false);
+  });
+
+  test('detects >10s background handoff despite log keywords / exit_code=0, classifies MCP commands, and promotes slow generic tools >= 10s', () => {
+    let clock = 500_000;
+    const store = new TranscriptStore({ now: () => clock });
+    store.beginUserTurn('Test background task edge cases');
+
+    // 1. Handed-off `run_command` whose Task Description & Log output contain `completed`/`finished`/`cancelled`
+    // AND whose rawOutput includes default `exit_code: 0` MUST NOT be dropped!
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-log-words',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'echo step completed && sleep 13',
+      args: { CommandLine: 'echo step completed && sleep 13', WaitMsBeforeAsync: 10000 },
+      rawOutput: {
+        exit_code: 0,
+        output: [
+          'Created At: 2026-11-23T11:35:28+08:00',
+          'Tool is running as a background task with task id: sess-1/task-log-words',
+          'Task Description: echo step completed && sleep 13',
+          'Task logs are available at: file:///tmp/task-log-words.log',
+          'Log output:',
+          'step completed',
+          'previous sub-step finished and cancelled old cache',
+        ].join('\n'),
+      },
+    });
+    expect(store.hasActiveBackgroundTasks()).toBe(true);
+    expect(store.getToolById('tc-log-words')?.backgroundRunning).toBe(true);
+    expect(store.getToolById('tc-log-words')?.backgroundTaskId).toBe('sess-1/task-log-words');
+    expect(store.getBackgroundJobsSnapshot().detachedTaskCount).toBe(1);
+    expect(store.completeBackgroundTask('sess-1/task-log-words', 'completed')).toBe(true);
+    expect(store.getToolById('tc-log-words')?.backgroundRunning).toBe(false);
+
+    // 2. Non-bash generic tool handoff (`kind: 'other'`) + MCP command tools + non-command read/edit guard
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-mcp-1',
+      name: 'onessh:exec',
+      kind: 'other',
+      status: 'in_progress',
+      title: 'onessh:exec',
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-mcp-2',
+      name: 'mcp__onessh__exec_many',
+      kind: 'other',
+      status: 'in_progress',
+      title: 'mcp__onessh__exec_many',
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-mcp-3',
+      name: 'call_mcp_tool',
+      kind: 'other',
+      status: 'in_progress',
+      title: 'call_mcp_tool',
+      rawInput: { ServerName: 'onessh', ToolName: 'job_start' },
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-cmd-field',
+      kind: 'other',
+      status: 'in_progress',
+      title: 'custom command wrapper',
+      rawInput: { CommandLine: 'cargo test --all', WaitMsBeforeAsync: 10000 },
+    });
+    // Non-command file tools mentioning `bash`/`shell` in path must stay excluded
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-read-bash',
+      name: 'read_file',
+      kind: 'read',
+      status: 'in_progress',
+      title: 'read_file /tmp/bash',
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-edit-shell',
+      name: 'edit_file',
+      kind: 'edit',
+      status: 'in_progress',
+      title: 'Edit src/shell.ts',
+    });
+
+    const mcpSnap = store.getBackgroundJobsSnapshot();
+    expect(mcpSnap.runningJobCount).toBe(4);
+    expect(mcpSnap.running.some(j => j.id === 'tc-mcp-1' && j.type === 'bash')).toBe(true);
+    expect(mcpSnap.running.some(j => j.id === 'tc-mcp-2' && j.type === 'bash')).toBe(true);
+    expect(mcpSnap.running.some(j => j.id === 'tc-mcp-3' && j.type === 'task')).toBe(true);
+    expect(mcpSnap.running.some(j => j.id === 'tc-cmd-field' && j.type === 'bash')).toBe(true);
+    expect(mcpSnap.running.some(j => j.id === 'tc-read-bash' || j.id === 'tc-edit-shell')).toBe(false);
+
+    // Finish MCP/command/file tools cleanly
+    for (const id of ['tc-mcp-1', 'tc-mcp-2', 'tc-mcp-3', 'tc-cmd-field', 'tc-read-bash', 'tc-edit-shell']) {
+      store.applySessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: id, status: 'completed' });
+    }
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // 3. Unclassified slow tool (`search_web` with `kind: 'search'`) stays hidden at <10s and promotes at >=10s
+    const slowStart = clock;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-slow-search',
+      name: 'search_web',
+      kind: 'search',
+      status: 'in_progress',
+      title: 'Long search query',
+    });
+    clock = slowStart + LONG_RUNNING_TOOL_THRESHOLD_MS - 1;
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    clock = slowStart + LONG_RUNNING_TOOL_THRESHOLD_MS;
+    const promoted = store.getBackgroundJobsSnapshot();
+    expect(promoted.runningJobCount).toBe(1);
+    expect(promoted.running[0]?.id).toBe('tc-slow-search');
+    expect(promoted.running[0]?.type).toBe('task');
+
+    // Also survives end_turn while >=10s and settles cleanly on completion
+    store.finishActiveTurn('end_turn', undefined, undefined, { preserveInFlightBackgroundTools: true });
+    expect(store.hasActiveBackgroundTasks()).toBe(true);
+    expect(store.getToolById('tc-slow-search')?.backgroundRunning).toBe(true);
+
+    store.applySessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'tc-slow-search', status: 'completed' });
+    expect(store.hasActiveBackgroundTasks()).toBe(false);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+    expect(store.getToolById('tc-slow-search')?.backgroundRunning).toBe(false);
+
+    // 4. Generic fallback handoff when an unclassified tool returns authoritative background output
+    store.beginUserTurn('Generic background handoff');
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-generic-bg',
+      name: 'custom_runner',
+      kind: 'other',
+      status: 'completed',
+      title: 'Custom long runner',
+      rawOutput: {
+        exit_code: 0,
+        output: 'Tool is running as a background task with task id: sess-1/task-gen-1\nLog output:\nstep completed',
+      },
+    });
+    expect(store.hasActiveBackgroundTasks()).toBe(true);
+    expect(store.getBackgroundJobsSnapshot().detachedTaskCount).toBe(1);
+    expect(store.getToolById('tc-generic-bg')?.backgroundRunning).toBe(true);
+  });
+
+  test('guards against zombie background tasks from stdout keywords, ACP/transcript races, and synchronous tools', () => {
+    let clock = 800_000;
+    const store = new TranscriptStore({ now: () => clock });
+    store.beginUserTurn('Verify zombie task prevention');
+
+    // 1. Completed run_command whose Command output contains background phrasing (with or without exit_code)
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-stdout-fp-1',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'rg background task src/',
+      rawOutput: {
+        exit_code: 0,
+        output: [
+          'Command exited with code 0.',
+          '',
+          'Command output:',
+          'Tool is running as a background task with task id: fake/task-1',
+        ].join('\n'),
+      },
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-stdout-fp-2',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'cat probe.log',
+      rawOutput: {
+        output: [
+          'Command exited with code 0.',
+          '',
+          'Command output:',
+          'Tool is running as a background task with task id: fake/task-2',
+        ].join('\n'),
+      },
+    });
+    // Completed read_file & MCP onessh:exec mentioning background task / job_id in body
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-read-fp',
+      name: 'read_file',
+      kind: 'read',
+      status: 'completed',
+      title: 'read_file transcript.ts',
+      rawOutput: {
+        output: [
+          'Created At: 2026-11-23T11:30:00+08:00',
+          'Completed At: 2026-11-23T11:30:01+08:00',
+          'Tool is running as a background task with task id: fake/task-3',
+        ].join('\n'),
+      },
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-mcp-fp',
+      name: 'onessh:exec',
+      kind: 'other',
+      status: 'completed',
+      title: 'onessh:exec',
+      rawOutput: {
+        output: 'systemctl status ok; background process healthy; job_id: 99',
+      },
+    });
+    expect(store.getBackgroundJobsSnapshot().detachedTaskCount).toBe(0);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // 2a. ACP tool_call_update(completed) finishes BEFORE transcript RUNNING record syncs -> no phantom synthetic entry
+    const fastStart = clock;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-race-fast',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'bun test fast',
+      args: { CommandLine: 'bun test fast', WaitMsBeforeAsync: 10000 },
+    });
+    clock = fastStart + 10_500;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-race-fast',
+      status: 'completed',
+      rawOutput: { output: 'Command exited with code 0.\n', exit_code: 0 },
+    });
+    expect(
+      store.syncTranscriptBackgroundTasks([
+        {
+          taskId: 'sess-race/task-1',
+          stepIndex: 10,
+          description: 'bun test fast',
+          startedAt: fastStart + 10_000,
+          status: 'running',
+        },
+      ]),
+    ).toBe(false);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // 2b. Synthetic `transcript:<taskId>` settles when matching ACP tool resolves late
+    const lateStart = clock;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-race-late',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'bun run build',
+      args: { CommandLine: 'bun run build', WaitMsBeforeAsync: 10000 },
+    });
+    // Temporarily settle end_turn without preserveInFlight or imagine synthetic existed on another turn
+    store.beginUserTurn('Separate turn while transcript task runs');
+    expect(
+      store.syncTranscriptBackgroundTasks([
+        {
+          taskId: 'sess-race/task-2',
+          stepIndex: 11,
+          description: 'bun run build-late',
+          startedAt: lateStart + 20_000,
+          status: 'running',
+        },
+      ]),
+    ).toBe(true);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(1);
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-late-acp',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'bun run build-late',
+      args: { CommandLine: 'bun run build-late' },
+      rawOutput: { output: 'Command exited with code 0.\n', exit_code: 0 },
+    });
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // 2c. Unlabeled running detached task binds rec.taskId instead of creating duplicate synthetic task
+    store.beginUserTurn('Unlabeled detached task test');
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-unlabeled',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'sleep 25',
+      args: { CommandLine: 'sleep 25', WaitMsBeforeAsync: 10000 },
+    });
+    store.finishActiveTurn('end_turn', undefined, undefined, { preserveInFlightBackgroundTools: true });
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(1);
+    store.syncTranscriptBackgroundTasks([
+      {
+        taskId: 'sess-race/task-3',
+        stepIndex: 12,
+        description: 'sleep 25',
+        status: 'running',
+      },
+    ]);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(1);
+    expect(store.getToolById('tc-unlabeled')?.backgroundTaskId).toBe('sess-race/task-3');
+    store.completeBackgroundTask('sess-race/task-3', 'cancelled');
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // 3. Synchronous tools (>=10s) close cleanly at end_turn; speculative task without taskId closes on next beginUserTurn
+    const syncStart = clock;
+    store.beginUserTurn('Synchronous slow tools');
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-sync-manage',
+      name: 'manage_task',
+      status: 'in_progress',
+      title: 'manage_task',
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-sync-edit',
+      name: 'edit_file',
+      kind: 'edit',
+      status: 'in_progress',
+      title: 'edit_file',
+    });
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-sync-plan',
+      name: 'exit_plan_mode',
+      status: 'in_progress',
+      title: 'exit_plan_mode',
+    });
+    clock = syncStart + LONG_RUNNING_TOOL_THRESHOLD_MS + 5_000;
+    store.finishActiveTurn('end_turn', undefined, undefined, { preserveInFlightBackgroundTools: true });
+    expect(store.hasActiveBackgroundTasks()).toBe(false);
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+
+    // Speculative `awaitingToolCompletion` entry without taskId/conversationId closes when next turn begins
+    store.beginUserTurn('Interrupted bash turn');
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-speculative',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      title: 'echo hanging',
+      args: { CommandLine: 'echo hanging' },
+    });
+    store.finishActiveTurn('end_turn', undefined, undefined, { preserveInFlightBackgroundTools: true });
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(1);
+    store.beginUserTurn('Next interactive turn');
+    expect(store.getBackgroundJobsSnapshot().runningJobCount).toBe(0);
+    expect(store.getToolById('tc-speculative')?.backgroundRunning).toBe(false);
   });
 });

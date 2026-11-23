@@ -886,6 +886,8 @@ describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore
         stepIndex: 6,
         userInputsBefore: 3,
         precededByCompactCommand: true,
+        toolCallsBeforeInTurn: 0,
+        assistantResponsesBeforeInTurn: 0,
         summaryText: '## Summary\nKept key architecture decisions.',
         createdAt: '2026-11-23T10:00:06Z',
         tokensBefore: 15400,
@@ -913,6 +915,8 @@ describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore
         stepIndex: 9,
         userInputsBefore: 4,
         precededByCompactCommand: false,
+        toolCallsBeforeInTurn: 0,
+        assistantResponsesBeforeInTurn: 0,
         summaryText: 'Plain fallback compaction summary',
         createdAt: '2026-11-23T10:00:09Z',
         tokensBefore: 8200,
@@ -947,6 +951,55 @@ describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore
       expect(store.getVisibleTranscriptSlice(false).turns.map(t => t.index)).toEqual([0, 1, 2, 3]);
       expect(store.getVisibleTranscriptSlice(false).hasCompactedHistory).toBe(false);
 
+      // Mid-turn auto-compaction places notice strictly after pre-checkpoint tool #2 and before post-checkpoint tools/reply
+      await writeFile(
+        transcriptFile,
+        [
+          userLine(0, 'Old turn'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, content: 'Old reply', input_tokens: 100, output_tokens: 10 }),
+          userLine(2, 'Long investigative turn'),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, content: 'Initial plan', input_tokens: 120, output_tokens: 15 }),
+          JSON.stringify({ type: 'GENERIC', step_index: 4, status: 'DONE', content: 'Tool 1 out' }),
+          JSON.stringify({ type: 'GENERIC', step_index: 5, status: 'DONE', content: 'Tool 2 out' }),
+          checkpointLine(6, { content: '<summary>Mid-turn compacted</summary>', inTok: 500, cacheTok: 1000, outTok: 90 }),
+          JSON.stringify({ type: 'GENERIC', step_index: 7, status: 'DONE', content: 'Tool 3 out' }),
+          JSON.stringify({ type: 'GENERIC', step_index: 8, status: 'DONE', content: 'Tool 4 out' }),
+          JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 9, content: 'Final answer after compaction', input_tokens: 300, output_tokens: 40 }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      const midCp = tracker.getLatestCheckpoint();
+      expect(midCp).toBeDefined();
+      expect(midCp?.toolCallsBeforeInTurn).toBe(2);
+      expect(midCp?.assistantResponsesBeforeInTurn).toBe(1);
+
+      const midStore = new TranscriptStore({ now: () => 1_700_000_100_000 });
+      midStore.beginUserTurn('Old turn', [], { isReplaying: true });
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Old reply' } }, { isReplaying: true });
+      midStore.beginUserTurn('Long investigative turn', [], { isReplaying: true });
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Initial plan' } }, { isReplaying: true });
+      for (let i = 1; i <= 4; i++) {
+        midStore.applySessionUpdate(
+          { sessionUpdate: 'tool_call', toolCallId: `mid-tc-${i}`, name: 'run_command', kind: 'execute', status: 'completed', title: `cmd ${i}` },
+          { isReplaying: true },
+        );
+      }
+      midStore.applySessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Final answer after compaction' } }, { isReplaying: true });
+      midStore.finalizeReplayedTurns();
+
+      expect(midStore.applyTranscriptCompactionCheckpoint(midCp!)).toBe(true);
+      const targetMidTurn = midStore.turns[1]!;
+      expect(targetMidTurn.timeline.map(r => `${r.kind}:${r.id}`)).toEqual([
+        `assistant:${targetMidTurn.assistantSegments[0]!.id}`,
+        'tool:mid-tc-1',
+        'tool:mid-tc-2',
+        `notice:${targetMidTurn.notices[0]!.id}`,
+        'tool:mid-tc-3',
+        'tool:mid-tc-4',
+        `assistant:${targetMidTurn.assistantSegments[1]!.id}`,
+      ]);
+
       // File truncation resets checkpoint state cleanly
       await writeFile(
         transcriptFile,
@@ -968,6 +1021,138 @@ describe('SessionMetricsTracker compaction CHECKPOINT tracking & TranscriptStore
       expect(tracker.getLatestCheckpoint()).toBeNull();
       tracker.setSession(null);
       expect(tracker.getLatestCheckpoint()).toBeNull();
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('SessionMetricsTracker background task tracking & resume baseline', () => {
+  test('parses RUNNING background tasks & SYSTEM_MESSAGE completions, honors resume baseline, and resets on truncation', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'oma-bg-metrics-'));
+    try {
+      const sessionId = 'sess-bg-metrics-1';
+      const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: tmpDir });
+      await mkdir(path.dirname(transcriptFile), { recursive: true });
+
+      const runningLine = (step: number, taskId: string, desc: string, logTail = 'step completed\r\n') =>
+        JSON.stringify({
+          step_index: step,
+          source: 'MODEL',
+          type: 'GENERIC',
+          status: 'RUNNING',
+          created_at: `2026-11-23T11:35:0${Math.min(9, step)}Z`,
+          content: [
+            `Created At: 2026-11-23T11:35:0${Math.min(9, step)}+08:00`,
+            `Tool is running as a background task with task id: ${taskId}`,
+            `Task Description: ${desc}`,
+            `Task logs are available at: file:///tmp/${taskId.replace('/', '_')}.log`,
+            'Log output:',
+            logTail,
+          ].join('\n'),
+        });
+
+      const sysDoneLine = (step: number, taskId: string, verb = 'finished', extra = '') =>
+        JSON.stringify({
+          step_index: step,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          created_at: `2026-11-23T11:36:0${Math.min(9, step)}Z`,
+          content: `<SYSTEM_MESSAGE>\nTask id "${taskId}" ${verb}${extra}\n</SYSTEM_MESSAGE>`,
+        });
+
+      await writeFile(
+        transcriptFile,
+        [
+          runningLine(1, `${sessionId}/task-1`, 'historical orphaned server'),
+          runningLine(2, `${sessionId}/task-2`, 'historical finished build'),
+          sysDoneLine(3, `${sessionId}/task-2`, 'finished', ' with result:\nCommand exited with code 0.'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+
+      const tracker = new SessionMetricsTracker({ baseBrainDir: tmpDir, sessionId });
+      await tracker.syncFromTranscript();
+
+      const beforeBaseline = tracker.getTranscriptBackgroundTasks();
+      expect(beforeBaseline.find(t => t.taskId === `${sessionId}/task-1`)?.status).toBe('running');
+      expect(beforeBaseline.find(t => t.taskId === `${sessionId}/task-2`)?.status).toBe('completed');
+
+      // Pin baseline on /resume so historical orphaned RUNNING tasks do not light up the live HUD
+      tracker.markTranscriptBackgroundBaseline();
+      const afterBaseline = tracker.getTranscriptBackgroundTasks();
+      expect(afterBaseline.some(t => t.taskId === `${sessionId}/task-1`)).toBe(false);
+      expect(afterBaseline.find(t => t.taskId === `${sessionId}/task-2`)?.status).toBe('completed');
+
+      // New RUNNING tasks with terminal words inside CommandLine / Log output must still parse cleanly
+      await appendFile(
+        transcriptFile,
+        [
+          runningLine(5, `${sessionId}/task-5`, 'echo step completed && sleep 13', 'build finished step 1\ncancelled warning ignored'),
+          runningLine(6, `${sessionId}/task-6`, 'sleep 20 && echo fail-test'),
+          runningLine(7, `${sessionId}/task-7`, 'sleep 30'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const live = tracker.getTranscriptBackgroundTasks();
+      const t5 = live.find(t => t.taskId === `${sessionId}/task-5`);
+      expect(t5?.status).toBe('running');
+      expect(t5?.description).toBe('echo step completed && sleep 13');
+      expect(t5?.logPath).toBe(`file:///tmp/${sessionId}_task-5.log`);
+      expect(t5?.startedAt).toBe(Date.parse('2026-11-23T11:35:05Z'));
+
+      // Terminal transitions: finished -> completed, failed -> failed, killed -> cancelled; duplicate RUNNING never resurrects
+      await appendFile(
+        transcriptFile,
+        [
+          sysDoneLine(8, `${sessionId}/task-5`, 'finished', ' with result: ok'),
+          sysDoneLine(8, `${sessionId}/task-6`, 'failed', ' with error'),
+          sysDoneLine(8, `${sessionId}/task-7`, 'killed'),
+          runningLine(9, `${sessionId}/task-5`, 'duplicate stale line'),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const settled = tracker.getTranscriptBackgroundTasks();
+      expect(settled.find(t => t.taskId === `${sessionId}/task-5`)?.status).toBe('completed');
+      expect(settled.find(t => t.taskId === `${sessionId}/task-6`)?.status).toBe('failed');
+      expect(settled.find(t => t.taskId === `${sessionId}/task-7`)?.status).toBe('cancelled');
+
+      // Real agy `was canceled with result:`, `timed out`, and server-restart bulk stop notices
+      await appendFile(
+        transcriptFile,
+        [
+          runningLine(10, `${sessionId}/task-10`, 'sleep 100 && echo canceled'),
+          runningLine(11, `${sessionId}/task-11`, 'sleep 200 && echo timeout'),
+          runningLine(12, `${sessionId}/task-12`, 'sleep 300 && echo restart'),
+          sysDoneLine(13, `${sessionId}/task-10`, 'was canceled', ' with result:\nTool execution was canceled'),
+          sysDoneLine(14, `${sessionId}/task-11`, 'timed out', ' after 120s'),
+          JSON.stringify({
+            step_index: 15,
+            source: 'SYSTEM',
+            type: 'SYSTEM_MESSAGE',
+            status: 'DONE',
+            created_at: '2026-11-23T11:37:00Z',
+            content: '<SYSTEM_MESSAGE>\n[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>',
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+
+      const realVariants = tracker.getTranscriptBackgroundTasks();
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-10`)?.status).toBe('cancelled');
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-11`)?.status).toBe('failed');
+      expect(realVariants.find(t => t.taskId === `${sessionId}/task-12`)?.status).toBe('cancelled');
+
+      // Truncation clears background task tracker and baseline cleanly
+      await writeFile(transcriptFile, JSON.stringify({ type: 'USER_INPUT', step_index: 0, content: 'hi' }) + '\n', 'utf8');
+      await tracker.syncFromTranscript();
+      expect(tracker.getTranscriptBackgroundTasks()).toEqual([]);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

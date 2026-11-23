@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   blobId,
   connect,
@@ -36,6 +36,7 @@ import {
   getSwarmBeeAssets,
   SWARM_BEE_EFFECT_CSS,
   WELCOME_LOGO_HEIGHT,
+  WELCOME_LOGO_STYLESHEET,
   WELCOME_LOGO_WIDTH,
 } from '../src/ui/assets';
 import { computePickerData } from '../src/ui/PickerView';
@@ -10026,5 +10027,655 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     await ctrl3.shutdown({ cleanExit: true });
     await run3;
+
+    // -----------------------------------------------------------------------
+    // Part 4: `/resume` / `oma -c` with mid-turn auto-compaction renders `omp.compaction`
+    //         at chronological position (before post-compaction tool & final reply)
+    //         and installs pre-compaction blur neutralization rules
+    // -----------------------------------------------------------------------
+    expect(WELCOME_LOGO_STYLESHEET).toContain('omp.compaction.hidden');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('filter: none;');
+
+    const sidMid = 'sess-resume-midturn-compacted';
+    const transcriptMid = getTranscriptPath(sidMid, { baseBrainDir: brainDir });
+    mkdirSync(join(transcriptMid, '..'), { recursive: true });
+    writeFileSync(
+      transcriptMid,
+      [
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 0, content: '<USER_REQUEST>\nFirst topic\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 1, content: 'First answer', input_tokens: 100, output_tokens: 10 }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 2, content: '<USER_REQUEST>\nSecond topic\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, content: 'Second answer', input_tokens: 100, output_tokens: 10 }),
+        JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 4, content: '<USER_REQUEST>\nInvestigate bug\n</USER_REQUEST>' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 5, content: 'Initial plan before compaction', input_tokens: 150, output_tokens: 20 }),
+        JSON.stringify({ type: 'GENERIC', step_index: 6, status: 'DONE', content: 'Tool 1 out' }),
+        JSON.stringify({ type: 'GENERIC', step_index: 7, status: 'DONE', content: 'Tool 2 out' }),
+        JSON.stringify({
+          type: 'CHECKPOINT',
+          source: 'SYSTEM',
+          status: 'DONE',
+          step_index: 8,
+          content: '<summary>\nMid-turn resumed compaction\n</summary>',
+        }),
+        JSON.stringify({ type: 'GENERIC', step_index: 9, status: 'DONE', content: 'Post-compaction tool out' }),
+        JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 10, content: 'Final answer after compaction', input_tokens: 220, output_tokens: 30 }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const host4 = new FakeTernHost();
+    const session4 = await createConnectedSession(host4);
+    const acp4 = new MockAcpHarness();
+
+    acp4.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (msg.method === 'session/load') {
+        const sid = msg.params?.['sessionId'] as string;
+        const sendChunk = (sessionUpdate: string, text: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: { sessionId: sid, update: { sessionUpdate, content: { type: 'text', text } } },
+          });
+        };
+        const sendTool = (toolCallId: string, title: string) => {
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title,
+              },
+            },
+          });
+        };
+        sendChunk('user_message_chunk', 'First topic');
+        sendChunk('agent_message_chunk', 'First answer');
+        sendChunk('user_message_chunk', 'Second topic');
+        sendChunk('agent_message_chunk', 'Second answer');
+        sendChunk('user_message_chunk', 'Investigate bug');
+        sendChunk('agent_message_chunk', 'Initial plan before compaction');
+        sendTool('mid-resume-t1', 'cmd 1');
+        sendTool('mid-resume-t2', 'cmd 2');
+        sendTool('mid-resume-t3', 'post-compact cmd');
+        sendChunk('agent_message_chunk', 'Final answer after compaction');
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId: sid, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayMainChildOrder = (host: FakeTernHost): string[] => {
+      let order: string[] = [];
+      const insertBefore = (id: string, before: string | null): void => {
+        if (before === null) {
+          order.push(id);
+          return;
+        }
+        const idx = order.indexOf(before);
+        if (idx >= 0) order.splice(idx, 0, id);
+        else order.push(id);
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') {
+          const parent = op[2];
+          if (op[4].id === 'main') {
+            order = (op[4].c ?? []).map(c => c.id);
+          } else if (parent === 'main') {
+            insertBefore(op[4].id, op[3]);
+          }
+        } else if (op[0] === 'del') {
+          order = order.filter(id => id !== op[1]);
+        } else if (op[0] === 'move' && op[2] === 'main') {
+          order = order.filter(id => id !== op[1]);
+          insertBefore(op[1], op[3]);
+        }
+      }
+      return order;
+    };
+
+    const ctrl4 = new AppController({
+      cli: parseCliArgs(['--resume', sidMid]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session: session4,
+      output: host4.safeOutput,
+      acpSpawn: acp4.createSpawnFn(),
+      previewStore,
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config-resume-mid.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      replayDrainQuietMs: 15,
+      installSignals: false,
+      throttleMs: 5,
+    });
+    const run4 = ctrl4.run();
+    await ctrl4.readyPromise;
+    await waitFor(() => ctrl4.store.transcript.turns.length === 3 && !ctrl4.store.getState().isReplaying);
+
+    const midResumedLive = replayLiveNodes(host4);
+    expect(midResumedLive.has('main.compacted-history')).toBe(true);
+    expect(midResumedLive.has('main.t0-user')).toBe(false);
+    expect(midResumedLive.has('main.t1-user')).toBe(false);
+    expect(midResumedLive.has('main.t2-user')).toBe(true);
+
+    const compactNodeEntry = [...midResumedLive.entries()].find(
+      ([, v]) => v.k === 'section' && v.p['role'] === 'omp.compaction',
+    );
+    expect(compactNodeEntry).toBeDefined();
+    const compactNodeId = compactNodeEntry![0];
+    const mainOrder = replayMainChildOrder(host4);
+    const compactIdx = mainOrder.indexOf(compactNodeId);
+    const preToolIdx = mainOrder.indexOf('main.t2-mid-resume-t2');
+    const postToolIdx = mainOrder.indexOf('main.t2-mid-resume-t3');
+    const finalReplyId = mainOrder.find(id => id.startsWith('main.t2-assistant-') && mainOrder.indexOf(id) > postToolIdx);
+
+    expect(compactIdx).toBeGreaterThan(preToolIdx);
+    expect(postToolIdx).toBeGreaterThan(compactIdx);
+    expect(finalReplyId).toBeDefined();
+    expect(mainOrder[mainOrder.length - 1]).not.toBe(compactNodeId);
+
+    await ctrl4.shutdown({ cleanExit: true });
+    await run4;
+  });
+
+  test('detects real agy 1.5.14 silent >10s transcript RUNNING tasks, MCP commands, >=10s unclassified tool promotion, and hidden-mode background cards', async () => {
+    const tmp = makeTempDir();
+    const brainDir = join(tmp, 'brain');
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    let clock = 2_000_000;
+    const sessionId = 'sess-bg-live-e2e';
+    const transcriptFile = getTranscriptPath(sessionId, { baseBrainDir: brainDir });
+    mkdirSync(dirname(transcriptFile), { recursive: true });
+    writeFileSync(transcriptFile, '', 'utf8');
+
+    const promptResolvers: Array<(res: { stopReason: string }) => void> = [];
+    let promptNum = 0;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { sessionId, configOptions: DEFAULT_CONFIG_OPTIONS },
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptNum += 1;
+        if (promptNum === 1) {
+          // Scenario 1: Real agy 1.5.14 acp pattern - starts `run_command` in_progress and waits silently
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-agy-bg',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'echo step completed && sleep 13',
+                args: {
+                  CommandLine: 'echo step completed && sleep 13',
+                  WaitMsBeforeAsync: 10000,
+                },
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 2) {
+          // Scenario 2: MCP command (`onessh:exec` with kind: 'other') -> immediate jobs HUD
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-mcp-exec',
+                name: 'onessh:exec',
+                kind: 'other',
+                status: 'in_progress',
+                title: 'onessh:exec',
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 3) {
+          // Scenario 3: Unclassified slow tool (`search_web` with kind: 'search') -> promotes >= 10s
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-slow-web',
+                name: 'search_web',
+                kind: 'search',
+                status: 'in_progress',
+                title: 'Deep search',
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 4) {
+          // Scenario 4: Detached handoff in `hidden` toolDisplayMode must stay visible as background
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-handoff-hidden',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'bun run watch',
+                args: { CommandLine: 'bun run watch', WaitMsBeforeAsync: 500 },
+                rawOutput: {
+                  exit_code: 0,
+                  output: [
+                    'Created At: 2026-11-23T11:35:28+08:00',
+                    'Tool is running as a background task with task id: sess-bg-live-e2e/task-91',
+                    'Task Description: bun run watch',
+                    'Log output:',
+                    'step completed cleanly',
+                  ].join('\n'),
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 5) {
+          // Scenario 5: Completed run_command printing background text in stdout must NOT light jobs
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-stdout-fp-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'rg background task src/',
+                args: { CommandLine: 'rg background task src/' },
+                rawOutput: {
+                  exit_code: 0,
+                  output: [
+                    'Command exited with code 0.',
+                    '',
+                    'Command output:',
+                    'Tool is running as a background task with task id: fake/task-999',
+                  ].join('\n'),
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 6) {
+          // Scenario 6: Detached bash settles via `was canceled` transcript SYSTEM_MESSAGE
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-cancel-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'in_progress',
+                title: 'sleep 99',
+                args: { CommandLine: 'sleep 99', WaitMsBeforeAsync: 10000 },
+              },
+            },
+          });
+          promptResolvers.push(res => h.send({ jsonrpc: '2.0', id: msg.id, result: res }));
+        } else if (promptNum === 7) {
+          // Scenario 7: Detached bash settles via server-restart SYSTEM_MESSAGE
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-restart-e2e',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'completed',
+                title: 'tail -f app.log',
+                args: { CommandLine: 'tail -f app.log', WaitMsBeforeAsync: 500 },
+                rawOutput: {
+                  output: 'Tool is running as a background task with task id: sess-bg-live-e2e/task-702',
+                },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        } else if (promptNum === 8) {
+          // Scenario 8: Detached invoke_subagent lights up agents WITHOUT lighting up jobs
+          h.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'call-subagent-only-e2e',
+                name: 'invoke_subagent',
+                status: 'completed',
+                title: 'invoke_subagent',
+                args: { name: 'explorer', task: 'Scan repo' },
+                rawOutput: { conversationId: 'sub-conv-88', status: 'running' },
+              },
+            },
+          });
+          h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+        }
+      } else if (msg.method === 'session/cancel') {
+        const resolve = promptResolvers.shift();
+        resolve?.({ stopReason: 'cancelled' });
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const replayNodes = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSubtree = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) for (const c of n.c) addSubtree(c);
+      };
+      const delSubtree = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSubtree(op[4]);
+        else if (op[0] === 'del') delSubtree(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      baseBrainDir: brainDir,
+      configPath: join(tmp, 'config.toml'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+      toolWatchIntervalMs: 15,
+      backgroundDoneGraceMs: 25,
+      now: () => clock,
+    });
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+
+    // --- 1. Real agy 1.5.14 acp silent >10s transcript RUNNING task ---
+    const p1 = controller.submitInput('Run slow build');
+    await waitFor(() => controller.store.transcript.getToolById('call-agy-bg') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+
+    // agy writes RUNNING entry into transcript.jsonl after 10s without emitting ACP tool_call_update
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: '2026-11-23T11:35:28+08:00',
+        content: [
+          'Created At: 2026-11-23T11:35:28+08:00',
+          `Tool is running as a background task with task id: ${sessionId}/task-2`,
+          'Task Description: echo step completed && sleep 13',
+          'Task logs are available at: file:///tmp/task-2.log',
+          'Log output:',
+          'step completed',
+        ].join('\n'),
+      }) + '\n',
+      'utf8',
+    );
+
+    await waitFor(() => controller.store.transcript.getToolById('call-agy-bg')?.backgroundRunning === true);
+    expect(controller.store.transcript.getToolById('call-agy-bg')?.backgroundTaskId).toBe(
+      `${sessionId}/task-2`,
+    );
+    await waitFor(() => {
+      const m = replayNodes();
+      const toolNode = m.get('main.t0-call-agy-bg');
+      const stateNode = m.get('main.t0-call-agy-bg.run.foot.state');
+      return (
+        JSON.stringify(toolNode?.p['meta'] ?? []).includes('background · task-2') &&
+        JSON.stringify(stateNode?.p['spans'] ?? []).includes('background')
+      );
+    });
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    // Command completes via ACP tool_call_update + transcript SYSTEM_MESSAGE -> clears HUD & must not resurrect
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-23T11:35:43+08:00',
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-2" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>`,
+      }) + '\n',
+      'utf8',
+    );
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-agy-bg',
+          status: 'completed',
+          rawOutput: { output: 'Command exited with code 0.\n', exit_code: 0 },
+        },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p1;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    await new Promise(r => setTimeout(r, 45));
+    expect(controller.store.transcript.getToolById('call-agy-bg')?.backgroundRunning).toBe(false);
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    // --- 2. MCP command tool (`onessh:exec`) lights up HUD jobs immediately ---
+    const p2 = controller.submitInput('Run remote command');
+    await waitFor(() => controller.store.transcript.getToolById('call-mcp-exec') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-mcp-exec', status: 'completed' },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p2;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 3. Unclassified slow tool (`search_web`) promotes at >= 10s via watch timer ---
+    const p3 = controller.submitInput('Run deep search');
+    await waitFor(() => controller.store.transcript.getToolById('call-slow-web') !== undefined);
+    clock += 2000;
+    await new Promise(r => setTimeout(r, 40));
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    clock += 9000;
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(replayNodes().get('dock.hud.running.jobs.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-slow-web', status: 'completed' },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p3;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 4. Detached handoff stays visible as background in `hidden` mode with HUD jobs lit ---
+    controller.store.setToolDisplayMode('hidden');
+    await controller.submitInput('Start hidden watch');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    const hiddenNodes = replayNodes();
+    expect(hiddenNodes.has('main.t3-call-handoff-hidden')).toBe(true);
+    expect(hiddenNodes.get('main.t3-call-handoff-hidden')?.p['status']).toBe('running');
+    expect(JSON.stringify(hiddenNodes.get('main.t3-call-handoff-hidden')?.p['meta'] ?? [])).toContain(
+      'background · task-91',
+    );
+
+    await controller.cancelPendingAndTurn();
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+
+    // --- 5. Completed `run_command` with stdout fake background text must NOT trigger HUD jobs ---
+    await controller.submitInput('Search background string');
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await new Promise(r => setTimeout(r, 35));
+    expect(replayNodes().has('dock.hud.running.jobs')).toBe(false);
+
+    // --- 6. `was canceled with result` transcript SYSTEM_MESSAGE clears HUD jobs & backgroundRunning ---
+    const p6 = controller.submitInput('Run cancellable command');
+    await waitFor(() => controller.store.transcript.getToolById('call-cancel-e2e') !== undefined);
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 20,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        created_at: '2026-11-23T11:40:00+08:00',
+        content: [
+          'Created At: 2026-11-23T11:40:00+08:00',
+          `Tool is running as a background task with task id: ${sessionId}/task-601`,
+          'Task Description: sleep 99',
+        ].join('\n'),
+      }) + '\n',
+      'utf8',
+    );
+    await waitFor(() => controller.store.transcript.getToolById('call-cancel-e2e')?.backgroundRunning === true);
+    appendFileSync(
+      transcriptFile,
+      JSON.stringify({
+        step_index: 21,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-23T11:40:05+08:00',
+        content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-601" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>`,
+      }) + '\n',
+      'utf8',
+    );
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-cancel-e2e',
+          status: 'failed',
+          rawOutput: { output: 'Tool execution was canceled' },
+        },
+      },
+    });
+    promptResolvers.shift()?.({ stopReason: 'end_turn' });
+    await p6;
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-cancel-e2e')?.backgroundRunning).toBe(false);
+
+    // --- 7. Server-restart notice clears detached task from HUD jobs ---
+    await controller.submitInput('Start tail log');
+    await waitFor(() => replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-restart-e2e')?.backgroundRunning).toBe(true);
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'notice',
+          level: 'warning',
+          message: '[Notice] All your subagents and background tasks have been stopped due to server restart.',
+        },
+      },
+    });
+    await waitFor(() => !replayNodes().has('dock.hud.running.jobs'));
+    expect(controller.store.transcript.getToolById('call-restart-e2e')?.backgroundRunning).toBe(false);
+
+    // --- 8. Detached `invoke_subagent` lights up `agents` WITHOUT lighting up `jobs` ---
+    await controller.submitInput('Launch background explorer');
+    await waitFor(() => replayNodes().has('dock.hud.running.agents'));
+    const subOnlyNodes = replayNodes();
+    expect(subOnlyNodes.get('dock.hud.running.agents.count')?.p['spans']).toEqual([{ t: '1', s: 'num' }]);
+    expect(subOnlyNodes.has('dock.hud.running.jobs')).toBe(false);
+
+    await controller.cancelPendingAndTurn();
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
   });
 });

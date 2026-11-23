@@ -235,6 +235,8 @@ export interface AppControllerOptions {
   readonly baseBrainDir?: string;
   /** Optional polling interval override (ms) for `watchSwarmBoard`. */
   readonly swarmPollIntervalMs?: number;
+  /** Optional polling interval override (ms) for in-flight tool background promotion & transcript sync. Default: 1000. */
+  readonly toolWatchIntervalMs?: number;
   /** Optional subprocess runner injected into `src/ecosystem/cli.ts` for offline deterministic tests. */
   readonly ecosystemRunner?: ExecCommandFn;
   /** Optional override path to `oma` `config.toml` (for offline deterministic tests). */
@@ -394,6 +396,7 @@ export class AppController {
   readonly #swarmDir?: string;
   readonly #baseBrainDir?: string;
   readonly #swarmPollIntervalMs?: number;
+  readonly #toolWatchIntervalMs: number;
   readonly #ecosystemRunner?: ExecCommandFn;
   readonly #configPath: string;
   readonly #agySettingsPath: string;
@@ -452,6 +455,8 @@ export class AppController {
   #memberBeeBlobCache: Record<string, BeeMemberBlobPair> = {};
   #doneIdleTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #backgroundDoneTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #toolWatchTimer: ReturnType<typeof setInterval> | undefined = undefined;
+  #lastWatchedRunningJobs = -1;
   #replayDrainActive = false;
   #replayDrainResolve: (() => void) | null = null;
   #replayDrainReject: ((err: Error) => void) | null = null;
@@ -477,6 +482,7 @@ export class AppController {
     this.#swarmDir = options.swarmDir;
     this.#baseBrainDir = options.baseBrainDir;
     this.#swarmPollIntervalMs = options.swarmPollIntervalMs;
+    this.#toolWatchIntervalMs = Math.max(10, options.toolWatchIntervalMs ?? 1000);
     this.#ecosystemRunner = options.ecosystemRunner;
     this.#configPath = options.configPath ?? getConfigPath();
     this.#configWriteBlockedReason = options.configParseError ?? null;
@@ -779,6 +785,7 @@ export class AppController {
     }
     this.#clearDoneIdleTimer();
     this.#clearBackgroundDoneTimer();
+    this.#clearToolWatchTimer();
     this.#cancelReplayDrain();
     this.#stopSwarmWatcher();
     this.#gitProbePendingForce = false;
@@ -928,6 +935,7 @@ export class AppController {
     this.#cancelReplayDrain(new Error('Superseded by session switch'));
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
+    this.#clearToolWatchTimer();
     this.#clearDoneIdleTimer();
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
@@ -1301,6 +1309,13 @@ export class AppController {
 
       this.#bindSessionMetrics(loaded.sessionId, false);
       await this.#syncSessionMetricsFromTranscript();
+      this.#metricsTracker.markTranscriptBackgroundBaseline();
+      const terminalBgRecords = this.#metricsTracker
+        .getTranscriptBackgroundTasks()
+        .filter(rec => rec.status !== 'running');
+      if (terminalBgRecords.length > 0) {
+        this.store.transcript.syncTranscriptBackgroundTasks(terminalBgRecords);
+      }
       if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
       if (!this.#isAcpClientLive(client)) {
         throw new Error('ACP connection closed during session restore');
@@ -1611,6 +1626,9 @@ export class AppController {
         } else {
           this.#metricsTracker.resumeAfterTools();
         }
+        this.#syncToolWatchTimer();
+      } else if (update.sessionUpdate === 'notice') {
+        this.#syncToolWatchTimer();
       }
 
       const isThoughtChunk = update.sessionUpdate === 'agent_thought_chunk';
@@ -3556,6 +3574,7 @@ export class AppController {
         }
 
         // Authoritatively calibrate post-turn TPS + cumulative tokens from transcript.jsonl and refresh git
+        this.#syncToolWatchTimer();
         void this.#syncSessionMetricsFromTranscript();
         void this.#refreshGitStatus();
         void this.#persistSessionAnchorAndOsc().catch(() => {});
@@ -3575,6 +3594,7 @@ export class AppController {
         const endedSnap = this.#metricsTracker.endStreamTurn();
         this.#applySessionMetricsSnapshot(endedSnap);
         this.store.setStreaming(false);
+        this.#syncToolWatchTimer();
         if (!this.store.isBusy) {
           this.#pendingBackgroundDone = false;
           this.#awaitingPostToolWakeup = false;
@@ -3805,6 +3825,7 @@ export class AppController {
       this.#restoreOscAfterBlock();
     }
 
+    this.#clearToolWatchTimer();
     this.scheduler.renderNow();
     this.syncFocus();
   }
@@ -3876,6 +3897,11 @@ export class AppController {
 
   #reconcileBackgroundActivity(prevBusy: boolean): void {
     if (this.#shuttingDown) return;
+    this.#reconcileBackgroundActivityCore(prevBusy);
+    this.#syncToolWatchTimer();
+  }
+
+  #reconcileBackgroundActivityCore(prevBusy: boolean): void {
     const state = this.store.getState();
 
     if (state.isStreaming) {
@@ -6176,6 +6202,47 @@ export class AppController {
     }
   }
 
+  #syncToolWatchTimer(): void {
+    const shouldWatch =
+      !this.#shuttingDown &&
+      !this.store.getState().isReplaying &&
+      (this.store.transcript.hasInFlightToolCall() || this.store.hasActiveBackgroundTasks());
+    if (!shouldWatch) {
+      this.#clearToolWatchTimer();
+      return;
+    }
+    if (this.#toolWatchTimer !== undefined) {
+      return;
+    }
+    this.#lastWatchedRunningJobs =
+      this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+    this.#toolWatchTimer = setInterval(() => {
+      if (
+        this.#shuttingDown ||
+        this.store.getState().isReplaying ||
+        (!this.store.transcript.hasInFlightToolCall() && !this.store.hasActiveBackgroundTasks())
+      ) {
+        this.#clearToolWatchTimer();
+        return;
+      }
+      void this.#syncSessionMetricsFromTranscript();
+      const runningJobs =
+        this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+      if (runningJobs !== this.#lastWatchedRunningJobs) {
+        this.#lastWatchedRunningJobs = runningJobs;
+        this.scheduler.markDirty();
+      }
+    }, this.#toolWatchIntervalMs);
+  }
+
+  #clearToolWatchTimer(): void {
+    if (this.#toolWatchTimer !== undefined) {
+      clearInterval(this.#toolWatchTimer);
+      this.#toolWatchTimer = undefined;
+    }
+    this.#lastWatchedRunningJobs = -1;
+  }
+
   #bindSessionMetrics(sessionId: string | null, autoSync = true): void {
     this.#metricsTracker.setSession(sessionId);
     this.#lastTpsStoreFlushAt = 0;
@@ -6208,6 +6275,16 @@ export class AppController {
     const checkpoint = this.#metricsTracker.getLatestCheckpoint();
     if (checkpoint && this.store.transcript.applyTranscriptCompactionCheckpoint(checkpoint)) {
       dirty = true;
+    }
+    if (!this.store.getState().isReplaying) {
+      const prevBusy = this.store.isBusy;
+      const bgRecords = this.#metricsTracker.getTranscriptBackgroundTasks();
+      if (bgRecords.length > 0 && this.store.transcript.syncTranscriptBackgroundTasks(bgRecords)) {
+        dirty = true;
+        this.#lastWatchedRunningJobs =
+          this.store.transcript.getBackgroundJobsSnapshot().runningJobCount;
+        this.#reconcileBackgroundActivity(prevBusy);
+      }
     }
     if (dirty) {
       this.scheduler.markDirty();

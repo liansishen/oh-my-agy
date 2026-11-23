@@ -470,6 +470,20 @@ export const WELCOME_LOGO_STYLESHEET = [
   "[data-role='omp.hud'] {",
   '  margin-bottom: 4px;',
   '}',
+  // Keep oma's compaction banner, active turn header, and user-expanded turns crisp
+  // against Tern's built-in pre-compaction blur filter on siblings before omp.compaction
+  ".sf-main[data-surface='omp.session'] [data-role='omp.transcript'] > [data-role='omp.compaction.hidden'],",
+  ".sf-main[data-surface='omp.session'] [data-role='omp.transcript'] > [data-role='omp.compaction.hidden'] *,",
+  ".sf-main[data-surface='omp.session'] [data-role='omp.transcript'] > :has(~ [data-role='omp.compaction']),",
+  ".sf-main[data-surface='omp.session'] [data-role='omp.transcript'] > :has(~ [data-role='omp.compaction']) *,",
+  "[data-role='omp.transcript'] > [data-role='omp.compaction.hidden'],",
+  "[data-role='omp.transcript'] > :has(~ [data-role='omp.compaction']) {",
+  '  filter: none;',
+  '}',
+  ".sf-main[data-surface='omp.session'] [data-role='omp.transcript'] > [data-role='omp.compaction.hidden'],",
+  "[data-role='omp.transcript'] > [data-role='omp.compaction.hidden'] {",
+  '  opacity: 1;',
+  '}',
   // Mirror semantic tone colors onto icons inside omp.composer.extras segments
   "[data-role='omp.composer.extras'] [data-tone='success'] .sf-ico,",
   "[data-role='omp.composer.extras'] [data-tone='success'] svg {",

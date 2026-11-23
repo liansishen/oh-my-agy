@@ -345,10 +345,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     swarmActiveCount,
     jobs?.inspectableAgentCount ?? 0
   );
-  const runningJobs = Math.max(
-    jobs?.runningJobCount ?? 0,
-    jobs?.detachedTaskCount ?? 0
-  );
+  const runningJobs = jobs?.runningJobCount ?? 0;
 
   const showSwarmBeeSeg = hasSwarm;
   const showGenericAgentsSeg = !hasSwarm && (runningAgents > 0 || inspectableAgents > 0);

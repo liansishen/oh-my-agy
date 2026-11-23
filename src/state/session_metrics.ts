@@ -59,10 +59,24 @@ export interface TranscriptCompactionCheckpoint {
   readonly stepIndex: number;
   readonly userInputsBefore: number;
   readonly precededByCompactCommand: boolean;
+  /** Count of tool calls (`GENERIC` steps) in the same turn before this `CHECKPOINT`. */
+  readonly toolCallsBeforeInTurn: number;
+  /** Count of non-empty assistant replies (`PLANNER_RESPONSE` steps) in the same turn before this `CHECKPOINT`. */
+  readonly assistantResponsesBeforeInTurn: number;
   readonly summaryText: string;
   readonly createdAt?: string;
   readonly tokensBefore?: number;
   readonly summaryTokens?: number;
+}
+
+export interface TranscriptBackgroundTaskRecord {
+  readonly taskId: string;
+  readonly stepIndex: number;
+  readonly description?: string;
+  readonly logPath?: string;
+  readonly startedAt?: number;
+  readonly status: 'running' | 'completed' | 'failed' | 'cancelled';
+  readonly endedAt?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +248,61 @@ interface ParsedTranscriptLine {
     readonly tokensBefore?: number;
     readonly summaryTokens?: number;
   };
+  readonly backgroundTaskStarted?: {
+    readonly taskId: string;
+    readonly stepIndex?: number;
+    readonly description?: string;
+    readonly logPath?: string;
+    readonly startedAt?: number;
+  };
+  readonly backgroundTaskTerminals?: readonly {
+    readonly taskId: string;
+    readonly status: 'completed' | 'failed' | 'cancelled';
+    readonly endedAt?: number;
+  }[];
+  readonly backgroundTasksResetAll?: {
+    readonly endedAt?: number;
+  };
+  readonly isToolStep?: boolean;
+  readonly isAssistantResponseStep?: boolean;
+}
+
+const TRANSCRIPT_BG_RUNNING_ID_RE =
+  /\bTool\s+is\s+running\s+as\s+a\s+background\s+task\s+with\s+task\s+id:\s*["'`]?([A-Za-z0-9._:/-]+)["'`]?/i;
+const TRANSCRIPT_BG_TASK_DESC_RE =
+  /\bTask\s+Description:\s*([\s\S]*?)(?=(?:\r?\n\s*(?:Task\s+logs\s+are\s+available\s+at:|Log\s+output:|YOU\s+MUST\s+TAKE\s+ONE)|$))/i;
+const TRANSCRIPT_BG_TASK_LOG_RE = /\bTask\s+logs\s+are\s+available\s+at:\s*([^\r\n]+)/i;
+const TRANSCRIPT_BG_TERMINAL_RE =
+  /\bTask\s+id\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(finished|completed|exited|killed|cancelled|canceled|failed|stopped|terminated|aborted|errored|timed\s+out)\b/gi;
+const TRANSCRIPT_BG_SERVER_RESET_RE =
+  /\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i;
+
+function parseTranscriptTimestampMs(raw: Record<string, unknown>): number | undefined {
+  const iso =
+    typeof raw.created_at === 'string'
+      ? raw.created_at
+      : typeof raw.createdAt === 'string'
+        ? raw.createdAt
+        : undefined;
+  if (!iso) return undefined;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function mapTranscriptTerminalVerb(verb: string): 'completed' | 'failed' | 'cancelled' {
+  const lower = verb.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (lower === 'failed' || lower === 'errored' || lower === 'timed out') return 'failed';
+  if (
+    lower === 'killed' ||
+    lower === 'cancelled' ||
+    lower === 'canceled' ||
+    lower === 'stopped' ||
+    lower === 'terminated' ||
+    lower === 'aborted'
+  ) {
+    return 'cancelled';
+  }
+  return 'completed';
 }
 
 const SKIPPED_CHECKPOINT_STATUSES = new Set([
@@ -378,7 +447,75 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     }
   }
 
-  if (!tokens && !explicitUserInput && !checkpoint) {
+  let backgroundTaskStarted: ParsedTranscriptLine['backgroundTaskStarted'];
+  const rawStatus = typeof raw.status === 'string' ? raw.status.trim().toUpperCase() : '';
+  const rawSource = typeof raw.source === 'string' ? raw.source.trim().toUpperCase() : '';
+  if (rawStatus === 'RUNNING' && typeof raw.content === 'string') {
+    const logIdx = raw.content.search(/(?:^|\r?\n)\s*Log\s+output\s*:/i);
+    const header = logIdx >= 0 ? raw.content.slice(0, logIdx) : raw.content;
+    const idMatch = TRANSCRIPT_BG_RUNNING_ID_RE.exec(header);
+    if (idMatch?.[1]) {
+      const taskId = idMatch[1].replace(/[.,;)]+$/, '');
+      const descMatch = TRANSCRIPT_BG_TASK_DESC_RE.exec(header);
+      const description = descMatch?.[1]?.trim();
+      const logMatch = TRANSCRIPT_BG_TASK_LOG_RE.exec(header);
+      const logPath = logMatch?.[1]?.trim();
+      const stepIndex = asNonNegativeFiniteNumber(raw.step_index ?? raw.stepIndex);
+      const startedAt = parseTranscriptTimestampMs(raw);
+      backgroundTaskStarted = {
+        taskId,
+        ...(stepIndex !== undefined ? { stepIndex } : {}),
+        ...(description ? { description } : {}),
+        ...(logPath ? { logPath } : {}),
+        ...(startedAt !== undefined ? { startedAt } : {}),
+      };
+    }
+  }
+
+  let backgroundTaskTerminals: Array<{
+    readonly taskId: string;
+    readonly status: 'completed' | 'failed' | 'cancelled';
+    readonly endedAt?: number;
+  }> | undefined;
+  let backgroundTasksResetAll: ParsedTranscriptLine['backgroundTasksResetAll'];
+  if ((recordType === 'SYSTEM_MESSAGE' || rawSource === 'SYSTEM') && typeof raw.content === 'string') {
+    TRANSCRIPT_BG_TERMINAL_RE.lastIndex = 0;
+    const endedAt = parseTranscriptTimestampMs(raw);
+    let termMatch: RegExpExecArray | null;
+    while ((termMatch = TRANSCRIPT_BG_TERMINAL_RE.exec(raw.content)) !== null) {
+      const taskId = termMatch[1]?.replace(/[.,;)]+$/, '');
+      const verb = termMatch[2];
+      if (!taskId || !verb) continue;
+      if (!backgroundTaskTerminals) {
+        backgroundTaskTerminals = [];
+      }
+      backgroundTaskTerminals.push({
+        taskId,
+        status: mapTranscriptTerminalVerb(verb),
+        ...(endedAt !== undefined ? { endedAt } : {}),
+      });
+    }
+    if (TRANSCRIPT_BG_SERVER_RESET_RE.test(raw.content)) {
+      backgroundTasksResetAll = endedAt !== undefined ? { endedAt } : {};
+    }
+  }
+
+  const isToolStep = recordType === 'GENERIC';
+  const isAssistantResponseStep =
+    recordType === 'PLANNER_RESPONSE' &&
+    typeof raw.content === 'string' &&
+    raw.content.trim().length > 0;
+
+  if (
+    !tokens &&
+    !explicitUserInput &&
+    !checkpoint &&
+    !backgroundTaskStarted &&
+    (!backgroundTaskTerminals || backgroundTaskTerminals.length === 0) &&
+    !backgroundTasksResetAll &&
+    !isToolStep &&
+    !isAssistantResponseStep
+  ) {
     return null;
   }
 
@@ -386,6 +523,13 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     tokens,
     ...(explicitUserInput ? { explicitUserInput } : {}),
     ...(checkpoint ? { checkpoint } : {}),
+    ...(backgroundTaskStarted ? { backgroundTaskStarted } : {}),
+    ...(backgroundTaskTerminals && backgroundTaskTerminals.length > 0
+      ? { backgroundTaskTerminals }
+      : {}),
+    ...(backgroundTasksResetAll ? { backgroundTasksResetAll } : {}),
+    ...(isToolStep ? { isToolStep } : {}),
+    ...(isAssistantResponseStep ? { isAssistantResponseStep } : {}),
   };
 }
 
@@ -426,8 +570,15 @@ export class SessionMetricsTracker {
   // Incremental compaction checkpoint tracking
   private _explicitUserInputCount = 0;
   private _lastExplicitUserInputWasCompact = false;
+  private _turnToolCallsSinceUserInput = 0;
+  private _turnAssistantResponsesSinceUserInput = 0;
   private _checkpointSeq = 0;
   private _latestCheckpoint: TranscriptCompactionCheckpoint | null = null;
+
+  // Incremental background task tracking from transcript.jsonl
+  private _bgTaskSeq = 0;
+  private readonly _transcriptBgTasks = new Map<string, TranscriptBackgroundTaskRecord>();
+  private _bgBaselineMaxStepIndex: number | null = null;
 
   // Streaming sliding window & post-turn calibration
   private _streaming = false;
@@ -516,8 +667,14 @@ export class SessionMetricsTracker {
 
     this._explicitUserInputCount = 0;
     this._lastExplicitUserInputWasCompact = false;
+    this._turnToolCallsSinceUserInput = 0;
+    this._turnAssistantResponsesSinceUserInput = 0;
     this._checkpointSeq = 0;
     this._latestCheckpoint = null;
+
+    this._bgTaskSeq = 0;
+    this._transcriptBgTasks.clear();
+    this._bgBaselineMaxStepIndex = null;
 
     this._streaming = false;
     this._implicitStream = false;
@@ -539,6 +696,34 @@ export class SessionMetricsTracker {
 
   getLatestCheckpoint(): TranscriptCompactionCheckpoint | null {
     return this._latestCheckpoint;
+  }
+
+  /**
+   * Pin the current highest transcript background task step index as historical baseline
+   * (used after `/resume` replay so orphaned `RUNNING` entries from earlier runs are ignored).
+   */
+  markTranscriptBackgroundBaseline(): void {
+    let maxStep = this._bgTaskSeq;
+    for (const rec of this._transcriptBgTasks.values()) {
+      if (rec.stepIndex > maxStep) {
+        maxStep = rec.stepIndex;
+      }
+    }
+    this._bgBaselineMaxStepIndex = maxStep;
+  }
+
+  /**
+   * Return transcript-detected background tasks after any resumed baseline, plus terminal updates.
+   */
+  getTranscriptBackgroundTasks(): readonly TranscriptBackgroundTaskRecord[] {
+    const baseline = this._bgBaselineMaxStepIndex ?? -1;
+    const out: TranscriptBackgroundTaskRecord[] = [];
+    for (const rec of this._transcriptBgTasks.values()) {
+      if (rec.status !== 'running' || rec.stepIndex > baseline) {
+        out.push(rec);
+      }
+    }
+    return out;
   }
 
   getSnapshot(): SessionMetricsSnapshot {
@@ -791,8 +976,13 @@ export class SessionMetricsTracker {
       this._responseCount = 0;
       this._explicitUserInputCount = 0;
       this._lastExplicitUserInputWasCompact = false;
+      this._turnToolCallsSinceUserInput = 0;
+      this._turnAssistantResponsesSinceUserInput = 0;
       this._checkpointSeq = 0;
       this._latestCheckpoint = null;
+      this._bgTaskSeq = 0;
+      this._transcriptBgTasks.clear();
+      this._bgBaselineMaxStepIndex = null;
       this._pendingCalibration = null;
     }
 
@@ -903,6 +1093,14 @@ export class SessionMetricsTracker {
       if (parsed.explicitUserInput) {
         this._explicitUserInputCount += 1;
         this._lastExplicitUserInputWasCompact = parsed.explicitUserInput.isCompactCommand;
+        this._turnToolCallsSinceUserInput = 0;
+        this._turnAssistantResponsesSinceUserInput = 0;
+      }
+      if (parsed.isToolStep) {
+        this._turnToolCallsSinceUserInput += 1;
+      }
+      if (parsed.isAssistantResponseStep) {
+        this._turnAssistantResponsesSinceUserInput += 1;
       }
       if (parsed.checkpoint) {
         const stepIndex = parsed.checkpoint.stepIndex ?? ++this._checkpointSeq;
@@ -913,6 +1111,8 @@ export class SessionMetricsTracker {
           stepIndex,
           userInputsBefore: this._explicitUserInputCount,
           precededByCompactCommand: this._lastExplicitUserInputWasCompact,
+          toolCallsBeforeInTurn: this._turnToolCallsSinceUserInput,
+          assistantResponsesBeforeInTurn: this._turnAssistantResponsesSinceUserInput,
           summaryText: parsed.checkpoint.summaryText,
           ...(parsed.checkpoint.createdAt !== undefined
             ? { createdAt: parsed.checkpoint.createdAt }
@@ -924,6 +1124,73 @@ export class SessionMetricsTracker {
             ? { summaryTokens: parsed.checkpoint.summaryTokens }
             : {}),
         };
+      }
+      if (parsed.backgroundTaskStarted) {
+        const started = parsed.backgroundTaskStarted;
+        const stepIndex = started.stepIndex ?? ++this._bgTaskSeq;
+        if (started.stepIndex !== undefined) {
+          this._bgTaskSeq = Math.max(this._bgTaskSeq, stepIndex);
+        }
+        const existing = this._transcriptBgTasks.get(started.taskId);
+        // Never resurrect a task already observed in terminal state
+        if (!existing || existing.status === 'running') {
+          this._transcriptBgTasks.set(started.taskId, {
+            taskId: started.taskId,
+            stepIndex,
+            ...(started.description !== undefined
+              ? { description: started.description }
+              : existing?.description !== undefined
+                ? { description: existing.description }
+                : {}),
+            ...(started.logPath !== undefined
+              ? { logPath: started.logPath }
+              : existing?.logPath !== undefined
+                ? { logPath: existing.logPath }
+                : {}),
+            ...(started.startedAt !== undefined
+              ? { startedAt: started.startedAt }
+              : existing?.startedAt !== undefined
+                ? { startedAt: existing.startedAt }
+                : {}),
+            status: 'running',
+          });
+        }
+      }
+      if (parsed.backgroundTaskTerminals) {
+        for (const term of parsed.backgroundTaskTerminals) {
+          const existing = this._transcriptBgTasks.get(term.taskId);
+          if (existing) {
+            this._transcriptBgTasks.set(term.taskId, {
+              ...existing,
+              status: term.status,
+              ...(term.endedAt !== undefined
+                ? { endedAt: term.endedAt }
+                : existing.endedAt !== undefined
+                  ? { endedAt: existing.endedAt }
+                  : {}),
+            });
+          } else {
+            const stepIndex = ++this._bgTaskSeq;
+            this._transcriptBgTasks.set(term.taskId, {
+              taskId: term.taskId,
+              stepIndex,
+              status: term.status,
+              ...(term.endedAt !== undefined ? { endedAt: term.endedAt } : {}),
+            });
+          }
+        }
+      }
+      if (parsed.backgroundTasksResetAll) {
+        const resetEndedAt = parsed.backgroundTasksResetAll.endedAt;
+        for (const [taskId, rec] of this._transcriptBgTasks.entries()) {
+          if (rec.status !== 'running') continue;
+          const nextEndedAt = resetEndedAt ?? rec.endedAt;
+          this._transcriptBgTasks.set(taskId, {
+            ...rec,
+            status: 'cancelled',
+            ...(nextEndedAt !== undefined ? { endedAt: nextEndedAt } : {}),
+          });
+        }
       }
     }
 

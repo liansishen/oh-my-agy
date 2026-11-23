@@ -171,7 +171,7 @@ function computeCompletedTurnMemoKey(
       diffSig += `,${d.path}:${hashTextFingerprint(d.patchText ?? '')}:${hashTextFingerprint(d.oldText ?? '')}:${hashTextFingerprint(d.newText ?? '')}`;
     }
     parts.push(
-      `tc:${tc.toolCallId}:${tc.displayName}:${tc.kind ?? ''}:${tc.targetKind}:${tc.status}:${tc.collapsed ? 1 : 0}:${tc.cancelled ? 1 : 0}:${tc.exitCode ?? ''}:${tc.tookMs ?? ''}:${tc.endedAt ?? ''}:${tc.locations.length}:${hashTextFingerprint(tc.outputText)}:${diffSig}:${tc.awaitingPermission ? 1 : 0}:${tc.approved ?? ''}:${hashTextFingerprint(tc.title)}:${hashTextFingerprint(tc.target ?? '')}:${hashTextFingerprint(tc.intent ?? '')}`,
+      `tc:${tc.toolCallId}:${tc.displayName}:${tc.kind ?? ''}:${tc.targetKind}:${tc.status}:${tc.collapsed ? 1 : 0}:${tc.cancelled ? 1 : 0}:${tc.exitCode ?? ''}:${tc.tookMs ?? ''}:${tc.endedAt ?? ''}:${tc.backgroundRunning ? 1 : 0}:${tc.backgroundTaskId ?? ''}:${tc.locations.length}:${hashTextFingerprint(tc.outputText)}:${diffSig}:${tc.awaitingPermission ? 1 : 0}:${tc.approved ?? ''}:${hashTextFingerprint(tc.title)}:${hashTextFingerprint(tc.target ?? '')}:${hashTextFingerprint(tc.intent ?? '')}`,
     );
   }
   for (const n of turn.notices) {
@@ -364,6 +364,15 @@ function computeToolMeta(tool: ToolCallItem): readonly (readonly SpanData[])[] |
     const lineCount = tool.outputText.split(/\r?\n/).length;
     meta.push([{ t: `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`, s: 'muted mono' }]);
   }
+  if (tool.backgroundRunning) {
+    const shortTaskId = tool.backgroundTaskId?.split('/').pop();
+    meta.push([
+      {
+        t: shortTaskId ? `background · ${shortTaskId}` : 'background',
+        s: 'warning mono',
+      },
+    ]);
+  }
   return meta.length > 0 ? meta : undefined;
 }
 
@@ -403,8 +412,10 @@ function renderBashRunBody(
   turnStatus: TranscriptTurn['status'],
   now: number
 ): JSX.Element {
-  const runTone =
-    tool.status === 'error'
+  const isBgRunning = Boolean(tool.backgroundRunning);
+  const runTone = isBgRunning
+    ? 'warning'
+    : tool.status === 'error'
       ? 'error'
       : tool.status === 'cancelled'
         ? 'warning'
@@ -413,7 +424,8 @@ function renderBashRunBody(
           : undefined;
   const cmdText = tool.target || tool.title;
   const isRunning =
-    tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming';
+    isBgRunning ||
+    (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming');
   const liveAgeMs = Math.max(0, now - tool.startedAt);
   const stoppedMs =
     tool.tookMs !== undefined
@@ -421,8 +433,9 @@ function renderBashRunBody(
       : !tool.replayed && tool.endedAt !== undefined
         ? Math.max(0, tool.endedAt - tool.startedAt)
         : undefined;
-  const stateLabel =
-    isRunning
+  const stateLabel = isBgRunning
+    ? 'background'
+    : isRunning
       ? 'running'
       : tool.status === 'ask'
         ? 'awaiting approval'
@@ -431,8 +444,9 @@ function renderBashRunBody(
           : tool.exitCode !== undefined
             ? `exit ${tool.exitCode}`
             : tool.status;
-  const stateStyle =
-    tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
+  const stateStyle = isBgRunning
+    ? 'warning mono'
+    : tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
       ? 'error mono'
       : tool.status === 'done'
         ? 'success mono'
@@ -607,12 +621,16 @@ function renderToolItem(
   nodeKey: string = tool.toolCallId
 ): JSX.Element {
   const isAsk = tool.status === 'ask';
+  const isBgRunning = Boolean(tool.backgroundRunning);
+  const effectiveStatus = isBgRunning ? 'running' : tool.status;
   const isToolRunning =
-    tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming';
+    isBgRunning ||
+    (tool.status === 'running' && tool.endedAt === undefined && turnStatus === 'streaming');
   const isPendingOrRunning =
-    (tool.status === 'pending' || tool.status === 'running') &&
-    tool.endedAt === undefined &&
-    turnStatus === 'streaming';
+    isBgRunning ||
+    ((tool.status === 'pending' || tool.status === 'running') &&
+      tool.endedAt === undefined &&
+      turnStatus === 'streaming');
   const toolAge = isToolRunning ? Math.max(0, now - tool.startedAt) : undefined;
   const toolTook = isToolRunning
     ? undefined
@@ -694,7 +712,7 @@ function renderToolItem(
       href={href}
       meta={meta}
       exit={tool.exitCode}
-      status={tool.status}
+      status={effectiveStatus}
       age={toolAge}
       took={toolTook}
       frame={frame}
@@ -899,6 +917,7 @@ function isRoutineCollapsibleTool(
 ): boolean {
   if (relatedAgents.length > 0) return false;
   if (tool.status === 'ask') return false;
+  if (tool.backgroundRunning) return false;
   if (
     (tool.status === 'pending' || tool.status === 'running') &&
     tool.endedAt === undefined &&
