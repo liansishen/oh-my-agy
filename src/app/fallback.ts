@@ -143,7 +143,8 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         options.continue = true;
         break;
       case '-r':
-      case '--resume': {
+      case '--resume':
+      case '--conversation': {
         const [val, nextIdx] = takeValue(flag, inlineValue, i);
         options.resume = val;
         options.resumeKind = 'resume';
@@ -378,7 +379,7 @@ export function formatHelpText(): string {
     '',
     'Flags:',
     '  -c, --continue              Continue the most recent session in current directory',
-    '  -r, --resume <id|file>      Resume a session by ID or oma anchor JSON file',
+    '  -r, --resume <id|file>      Resume a session by ID or oma anchor JSON file (alias: --conversation)',
     '      --restore <id|file>     Alias for --resume (Tern reopen plugin compatibility)',
     '      --fork <id|file>        Tern pane fork compatibility (loads original session safely)',
     '      --sessions              Open /resume session picker immediately on startup',

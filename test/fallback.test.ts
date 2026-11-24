@@ -96,6 +96,14 @@ describe('parseCliArgs', () => {
     expect(r1.resume).toBe('uuid-1');
     expect(r1.resumeKind).toBe('resume');
 
+    const rConv = parseCliArgs(['--conversation', 'uuid-conv']);
+    expect(rConv.resume).toBe('uuid-conv');
+    expect(rConv.resumeKind).toBe('resume');
+
+    const rConvEq = parseCliArgs(['--conversation=uuid-conv-eq']);
+    expect(rConvEq.resume).toBe('uuid-conv-eq');
+    expect(rConvEq.resumeKind).toBe('resume');
+
     const r2 = parseCliArgs(['--restore=C:/sessions/s1.json']);
     expect(r2.resume).toBe('C:/sessions/s1.json');
     expect(r2.resumeKind).toBe('restore');
@@ -126,6 +134,7 @@ describe('parseCliArgs', () => {
     expect(() => parseCliArgs(['--thought'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--mode'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--resume'])).toThrow(CliParseError);
+    expect(() => parseCliArgs(['--conversation'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--add-dir'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--plain=true'])).toThrow(CliParseError);
   });

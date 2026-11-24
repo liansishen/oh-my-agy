@@ -2741,4 +2741,248 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     app.openPicker('planner', { selectedId: 'custom-two-level' });
     expect(app.getState().picker?.modelPickerThinking).toBe('medium');
   });
+
+  test('TranscriptStore supports update_steps/extended plan statuses and maps failed/timed-out bash commands to error', () => {
+    let now = 10_000;
+    const store = new TranscriptStore({ now: () => now });
+    store.beginUserTurn('Run checks and track steps');
+
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-steps',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: [
+          { title: 'Build project', status: 'done' },
+          { title: 'Optional lint', status: 'skipped' },
+          { title: 'Run tests', status: 'failed' },
+        ],
+      },
+    });
+    expect(store.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
+      'Build project:done',
+      'Optional lint:dropped',
+      'Run tests:blocked',
+    ]);
+
+    // Empty plan_update clears acp plan
+    store.applySessionUpdate({ sessionUpdate: 'plan_update', entries: [] });
+    expect(store.plan).toBeNull();
+
+    // Non-zero exit_code with ACP status=completed maps to TSP error
+    now = 12_000;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-fail',
+      kind: 'execute',
+      name: 'run_command',
+      status: 'completed',
+      rawOutput: { output: 'Command exited with code 2.\nSyntaxError', exit_code: 2 },
+    });
+    expect(store.getToolById('tc-fail')?.status).toBe('error');
+    expect(store.getToolById('tc-fail')?.exitCode).toBe(2);
+
+    // Leading "Command timed out" output maps to TSP error even without explicit exit_code
+    now = 15_000;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-timeout',
+      kind: 'execute',
+      name: 'run_command',
+      status: 'completed',
+      rawOutput: { output: 'Created At: 2026-11-24T00:00:00Z\nCompleted At: 2026-11-24T00:00:05Z\nCommand timed out after 5s' },
+    });
+    expect(store.getToolById('tc-timeout')?.status).toBe('error');
+    expect(store.getToolById('tc-timeout')?.timedOut).toBe(true);
+
+    // Ordinary echo containing "Command timed out" inside stdout does not false-trigger
+    now = 16_000;
+    store.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-grep',
+      kind: 'execute',
+      name: 'run_command',
+      status: 'completed',
+      rawOutput: { output: 'Command exited with code 0.\nsrc/foo.ts:10: Command timed out' },
+    });
+    expect(store.getToolById('tc-grep')?.status).toBe('done');
+  });
+
+  test('AppStore queues concurrent elicitation/create questions FIFO and promotes on resolve', () => {
+    const app = new AppStore({ cwd: '/workspace/demo' });
+    const replies: Array<{ id: number; res: unknown }> = [];
+
+    app.openQuestion(101, { mode: 'form', message: 'Subagent A asks', requestedSchema: { type: 'object', properties: { q1: { type: 'string', title: 'Choice A', enum: ['x', 'y'] } } } }, (res) => {
+      replies.push({ id: 101, res });
+    });
+    app.openQuestion(102, { mode: 'form', message: 'Subagent B asks', requestedSchema: { type: 'object', properties: { q2: { type: 'string', title: 'Reason B' } } } }, (res) => {
+      replies.push({ id: 102, res });
+    });
+
+    expect(replies).toHaveLength(0);
+    expect(app.getState().activeQuestion?.requestId).toBe(101);
+    expect(app.getState().queuedQuestionCount).toBe(1);
+
+    expect(app.resolveActiveQuestion({ action: 'accept', content: { q1: 'x' } })).toBe(true);
+    expect(replies).toEqual([{ id: 101, res: { action: 'accept', content: { q1: 'x' } } }]);
+    expect(app.getState().activeQuestion?.requestId).toBe(102);
+    expect(app.getState().queuedQuestionCount).toBe(0);
+
+    expect(app.cancelAllQuestions()).toBe(1);
+    expect(replies).toEqual([
+      { id: 101, res: { action: 'accept', content: { q1: 'x' } } },
+      { id: 102, res: { action: 'cancel' } },
+    ]);
+    expect(app.getState().activeQuestion).toBeNull();
+  });
+
+  test('TranscriptStore allows update_steps to take over finished todo_tool or unfinished history when preferNativeSteps=true', () => {
+    // 1. Default (preferNativeSteps=false): unfinished todo_tool stays authoritative, finished todo_tool yields to update_steps
+    const mcpStore = new TranscriptStore({ now: () => 10_000 });
+    mcpStore.beginUserTurn('Old MCP work');
+    mcpStore.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'in_progress' }] }], {
+      source: 'todo_tool',
+    });
+
+    mcpStore.beginUserTurn('Follow-up step check');
+    mcpStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-steps-blocked',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: [{ title: 'Native A', status: 'in_progress' }],
+      },
+    });
+    expect(mcpStore.getToolById('tc-steps-blocked')?.target).toBe('0/1');
+    expect(mcpStore.plan?.source).toBe('todo_tool');
+    expect(mcpStore.plan?.entries[0]?.text).toBe('Legacy task');
+
+    mcpStore.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'completed' }] }], {
+      source: 'todo_tool',
+    });
+    mcpStore.beginUserTurn('Next turn after completion');
+    mcpStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-steps-takeover-finished',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: [{ title: 'Native B', status: 'done' }],
+      },
+    });
+    expect(mcpStore.plan?.source).toBe('acp');
+    expect(mcpStore.plan?.entries.map((e) => e.text)).toEqual(['Native B']);
+
+    // 2. Native mode (preferNativeSteps=true): unfinished todo_tool from earlier turn yields to update_steps,
+    //    while same-turn oma_todo keeps todo_tool authoritative
+    const nativeStore = new TranscriptStore({ now: () => 20_000, preferNativeSteps: true });
+    nativeStore.beginUserTurn('Historical MCP turn');
+    nativeStore.applySessionUpdate(
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc-hist-oma',
+        name: 'mcp_oma_todo_todo',
+        status: 'completed',
+        rawInput: { op: 'init', items: ['Unfinished old task'] },
+      },
+      { isReplaying: true },
+    );
+    expect(nativeStore.plan?.source).toBe('todo_tool');
+
+    // Same-turn update_steps alongside oma_todo stays secondary
+    nativeStore.applySessionUpdate(
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc-same-turn-steps',
+        name: 'update_steps',
+        status: 'completed',
+        rawInput: { steps: [{ title: 'Should stay secondary', status: 'in_progress' }] },
+      },
+      { isReplaying: true },
+    );
+    expect(nativeStore.plan?.source).toBe('todo_tool');
+
+    // Subsequent turn using native update_steps takes over HUD/plan
+    nativeStore.beginUserTurn('Resumed native turn');
+    nativeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-native-takeover',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: [
+          { title: 'Native Step 1', status: 'done' },
+          { title: 'Native Step 2', status: 'in_progress' },
+        ],
+      },
+    });
+    expect(nativeStore.plan?.source).toBe('acp');
+    expect(nativeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
+      'Native Step 1:done',
+      'Native Step 2:active',
+    ]);
+
+    // 3. Real agy acp 1.5.16 shape: no `name`, title "Run update_steps", JSON-string `steps`,
+    //    and a same-turn failed `Run mcp_oma_todo_todo` does NOT block takeover
+    const realShapeStore = new TranscriptStore({ now: () => 30_000, preferNativeSteps: true });
+    realShapeStore.beginUserTurn('Old MCP turn');
+    realShapeStore.applySessionUpdate(
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc-old-mcp',
+        title: 'Run mcp_oma_todo_todo',
+        status: 'completed',
+        rawInput: { op: 'init', items: ['Old MCP item'] },
+      },
+      { isReplaying: true },
+    );
+    expect(realShapeStore.plan?.source).toBe('todo_tool');
+
+    realShapeStore.beginUserTurn('Resumed turn where model probes failed mcp_oma_todo_todo then falls back to Run update_steps');
+    realShapeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-failed-mcp',
+      title: 'Run mcp_oma_todo_todo',
+      status: 'failed',
+      rawInput: { op: 'init', items: ['Should not block'] },
+    });
+    realShapeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-real-update-steps-arr',
+      title: 'Run update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: [
+          { title: 'Check payload', status: 'done' },
+          { title: 'Apply fix', status: 'in_progress' },
+        ],
+      },
+    });
+    expect(realShapeStore.getToolById('tc-real-update-steps-arr')?.target).toBe('1/2');
+    expect(realShapeStore.plan?.source).toBe('acp');
+    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
+      'Check payload:done',
+      'Apply fix:active',
+    ]);
+
+    realShapeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-real-update-steps-json',
+      title: 'Run default_api:update_steps',
+      status: 'completed',
+      rawInput: {
+        steps: JSON.stringify([
+          { title: 'Check payload', status: 'done' },
+          { title: 'Apply fix', status: 'done' },
+        ]),
+      },
+    });
+    expect(realShapeStore.getToolById('tc-real-update-steps-json')?.target).toBe('2/2');
+    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
+      'Check payload:done',
+      'Apply fix:done',
+    ]);
+  });
 });

@@ -4,12 +4,14 @@ import { homedir as osHomedir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 
 export type ToolDisplayMode = 'all' | 'compact' | 'hidden';
+export type TodoProvider = 'off' | 'mcp' | 'native';
 
 export interface OmaUiConfig {
   readonly auto_collapse_thought: boolean;
   readonly collapse_compacted: boolean;
   readonly tool_display: ToolDisplayMode;
   readonly tool_preview_lines: number;
+  readonly todo_provider: TodoProvider;
   readonly osc_7501: boolean;
   readonly reopen_anchor: boolean;
 }
@@ -41,6 +43,7 @@ export const DEFAULT_CONFIG: OmaConfig = Object.freeze({
     collapse_compacted: true,
     tool_display: 'all' as ToolDisplayMode,
     tool_preview_lines: 8,
+    todo_provider: 'mcp' as TodoProvider,
     osc_7501: true,
     reopen_anchor: true,
   }),
@@ -87,11 +90,13 @@ const KNOWN_UI_KEYS = new Set([
   'collapse_compacted',
   'tool_display',
   'tool_preview_lines',
+  'todo_provider',
   'osc_7501',
   'reopen_anchor',
 ]);
 
 const KNOWN_TOOL_DISPLAY_MODES = new Set<ToolDisplayMode>(['all', 'compact', 'hidden']);
+const KNOWN_TODO_PROVIDERS = new Set<TodoProvider>(['off', 'mcp', 'native']);
 
 export function normalizeToolDisplayMode(value: unknown): ToolDisplayMode {
   if (typeof value === 'string') {
@@ -99,6 +104,46 @@ export function normalizeToolDisplayMode(value: unknown): ToolDisplayMode {
     if (KNOWN_TOOL_DISPLAY_MODES.has(lower)) return lower;
   }
   return DEFAULT_CONFIG.ui.tool_display;
+}
+
+export function normalizeTodoProvider(value: unknown): TodoProvider {
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase() as TodoProvider;
+    if (KNOWN_TODO_PROVIDERS.has(lower)) return lower;
+  }
+  return DEFAULT_CONFIG.ui.todo_provider;
+}
+
+export function isSemverAtLeast(
+  rawVersion: string | undefined,
+  major: number,
+  minor: number,
+  patch: number,
+): boolean {
+  if (!rawVersion) return false;
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/i.exec(rawVersion.trim());
+  if (!m) return false;
+  const curMajor = Number.parseInt(m[1]!, 10);
+  const curMinor = Number.parseInt(m[2]!, 10);
+  const curPatch = Number.parseInt(m[3]!, 10);
+  if (curMajor !== major) return curMajor > major;
+  if (curMinor !== minor) return curMinor > minor;
+  return curPatch >= patch;
+}
+
+export function supportsNativeUpdateSteps(rawVersion: string | undefined): boolean {
+  return isSemverAtLeast(rawVersion, 1, 5, 16);
+}
+
+export function resolveEffectiveTodoProvider(
+  configured: TodoProvider,
+  agentVersion: string | undefined,
+): TodoProvider {
+  const normalized = normalizeTodoProvider(configured);
+  if (normalized === 'native' && !supportsNativeUpdateSteps(agentVersion)) {
+    return 'off';
+  }
+  return normalized;
 }
 
 const KNOWN_APPROVAL_KEYS = new Set(['auto_allow_tools']);
@@ -380,6 +425,24 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
         return DEFAULT_CONFIG.ui.tool_display;
       })();
 
+  const rawTodoProvider = readStringField(
+    uiTable,
+    'todo_provider',
+    DEFAULT_CONFIG.ui.todo_provider,
+    warnings,
+    'ui.',
+  )
+    .trim()
+    .toLowerCase();
+  const todo_provider = KNOWN_TODO_PROVIDERS.has(rawTodoProvider as TodoProvider)
+    ? (rawTodoProvider as TodoProvider)
+    : (() => {
+        warnings.push(
+          `ui.todo_provider: unrecognized value "${rawTodoProvider}" (expected off|mcp|native), using "${DEFAULT_CONFIG.ui.todo_provider}"`,
+        );
+        return DEFAULT_CONFIG.ui.todo_provider;
+      })();
+
   const config: OmaConfig = {
     agy_bin,
     default_model,
@@ -408,6 +471,7 @@ export function parseConfigToml(tomlText: string): ParseConfigResult {
         DEFAULT_CONFIG.ui.tool_preview_lines,
         warnings,
       ),
+      todo_provider,
       osc_7501: readBooleanField(
         uiTable,
         'osc_7501',
@@ -551,6 +615,7 @@ function normalizeConfigForSave(config: OmaConfig): OmaConfig {
           : DEFAULT_CONFIG.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: clampedLines,
+      todo_provider: normalizeTodoProvider(config.ui?.todo_provider),
       osc_7501: Boolean(config.ui.osc_7501),
       reopen_anchor: Boolean(config.ui.reopen_anchor),
     },
@@ -580,6 +645,7 @@ export function formatConfigToml(config: OmaConfig): string {
     `collapse_compacted = ${String(norm.ui.collapse_compacted)}`,
     `tool_display = ${formatTomlString(norm.ui.tool_display)}`,
     `tool_preview_lines = ${norm.ui.tool_preview_lines}`,
+    `todo_provider = ${formatTomlString(norm.ui.todo_provider)}`,
     `osc_7501 = ${String(norm.ui.osc_7501)}`,
     `reopen_anchor = ${String(norm.ui.reopen_anchor)}`,
     '',

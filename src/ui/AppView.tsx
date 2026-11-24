@@ -166,6 +166,7 @@ export function buildAppView(props: AppViewProps): ViewInput {
       todoExpanded={todoExpanded}
       todoHudDismissed={todoHudDismissed}
       jobs={jobs}
+      activeTurn={turns[turns.length - 1]}
       hasTurns={turns.length > 0}
       commands={commands}
       workingStartedAt={workingStartedAt}

@@ -17,6 +17,7 @@ export const OMA_TODO_SYSTEM_PROMPT_APPEND = [
   '',
   'When to call:',
   `- MUST call \`${OMA_TODO_EXPOSED_TOOL_NAME}\` with \`op="init"\` for any task expected to take 3+ steps or tool calls — including coding, refactoring, debugging, config/version updates, build/test/deployment, multi-source research, plan execution, or multi-item requests.`,
+  `- Use \`${OMA_TODO_EXPOSED_TOOL_NAME}\` instead of \`update_steps\` for task tracking in this session; avoid calling both in the same turn.`,
   '- Mid-turn escalation: if a task starts as a quick check and expands beyond 2 tool calls, call `op="init"` alongside your next tool call.',
   '- Follow-up turns: when the previous list is finished or empty and the user sends a new multi-step request, call `op="init"` to start a fresh list.',
   '- Skip ONLY for single-turn answers, translations, or 1–2 step read-only lookups.',
@@ -146,6 +147,10 @@ export function isOmaTodoToolName(rawName?: string, title?: string): boolean {
 
 export function isTodoTaskFinished(task: Pick<TodoTask, 'status'>): boolean {
   return task.status === 'completed' || task.status === 'abandoned';
+}
+
+export function isChecklistStatusFinished(status: string): boolean {
+  return status === 'done' || status === 'dropped' || status === 'blocked';
 }
 
 export function areAllTodosFinished(phases: readonly TodoPhase[]): boolean {

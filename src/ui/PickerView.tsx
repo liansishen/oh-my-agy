@@ -1282,11 +1282,12 @@ export function computePickerData(
     )) {
       if (seenScope.has(agentName)) continue;
       seenScope.add(agentName);
+      const isSystem = agentName.trim().toLowerCase() === 'system';
       scopes.push({
         id: agentName,
         label: agentName,
-        icon: 'user',
-        dot: 'muted',
+        icon: isSystem ? 'bell' : 'user',
+        dot: isSystem ? 'info' : 'muted',
         count: snapshot.messageCounts[agentName] ?? 0,
       });
     }
@@ -1362,7 +1363,8 @@ export function computePickerData(
       visibleIds.push(id);
 
       const member = snapshot.memberByName[msg.agent];
-      const dot: Tone = member ? memberStatusDot(member.status) : 'muted';
+      const isSystem = !member && msg.agent.trim().toLowerCase() === 'system';
+      const dot: Tone = member ? memberStatusDot(member.status) : isSystem ? 'info' : 'muted';
       const whenLabel = formatSwarmTimeColumn(msg.time, nowMs);
       const facts: Record<string, string> = {};
       if (whenLabel) {

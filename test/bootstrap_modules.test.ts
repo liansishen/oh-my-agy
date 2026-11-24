@@ -284,6 +284,7 @@ auto_allow_tools = ["read_file", "list_dir", "read_file", "  "]
         collapse_compacted: true,
         tool_display: 'all',
         tool_preview_lines: 16,
+        todo_provider: 'mcp',
         osc_7501: false,
         reopen_anchor: true,
       },
@@ -291,6 +292,20 @@ auto_allow_tools = ["read_file", "list_dir", "read_file", "  "]
         auto_allow_tools: ['read_file', 'list_dir'],
       },
     });
+
+    const offTodo = parseConfigToml('[ui]\ntodo_provider = "off"\n');
+    expect(offTodo.warnings).toEqual([]);
+    expect(offTodo.config.ui.todo_provider).toBe('off');
+
+    const nativeTodo = parseConfigToml('[ui]\ntodo_provider = "native"\n');
+    expect(nativeTodo.warnings).toEqual([]);
+    expect(nativeTodo.config.ui.todo_provider).toBe('native');
+
+    const badTodoProvider = parseConfigToml('[ui]\ntodo_provider = "other"\n');
+    expect(badTodoProvider.config.ui.todo_provider).toBe('mcp');
+    expect(badTodoProvider.warnings).toContain(
+      'ui.todo_provider: unrecognized value "other" (expected off|mcp|native), using "mcp"',
+    );
   });
 
   test('validates malformed fields, clamps bounds, and survives broken TOML', async () => {

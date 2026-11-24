@@ -68,10 +68,15 @@ import {
 import {
   DEFAULT_CONFIG,
   getConfigPath,
+  isSemverAtLeast,
   loadConfig,
+  normalizeTodoProvider,
   normalizeToolDisplayMode,
+  resolveEffectiveTodoProvider,
   saveConfig,
+  supportsNativeUpdateSteps,
   type OmaConfig,
+  type TodoProvider,
   type ToolDisplayMode,
 } from '../config/config';
 import {
@@ -138,6 +143,7 @@ import {
   formatPhaseDisplayTitle,
   formatTodoMarkdown,
   formatUserTodoSyncReminder,
+  isChecklistStatusFinished,
   isOmaTodoToolName,
   normalizeSingleInProgress,
   OMA_TODO_SYSTEM_PROMPT_APPEND,
@@ -149,6 +155,7 @@ import {
 import {
   buildElicitationContent,
   type AttachmentItem,
+  type PlanState,
 } from '../state/transcript';
 import {
   loadSwarmBoard,
@@ -196,22 +203,7 @@ const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
 const GIT_PROBE_MIN_INTERVAL_MS = 1500;
 const TPS_FLUSH_MIN_INTERVAL_MS = 120;
 
-export function isSemverAtLeast(
-  rawVersion: string | undefined,
-  major: number,
-  minor: number,
-  patch: number,
-): boolean {
-  if (!rawVersion) return false;
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/i.exec(rawVersion.trim());
-  if (!m) return false;
-  const curMajor = Number.parseInt(m[1]!, 10);
-  const curMinor = Number.parseInt(m[2]!, 10);
-  const curPatch = Number.parseInt(m[3]!, 10);
-  if (curMajor !== major) return curMajor > major;
-  if (curMinor !== minor) return curMinor > minor;
-  return curPatch >= patch;
-}
+export { isSemverAtLeast } from '../config/config';
 
 export interface ClipboardService {
   readImage(): Promise<ClipboardImage | null>;
@@ -291,6 +283,8 @@ export interface AppControllerOptions {
   readonly workspaceSkillsDir?: string;
   /** Optional override for global skills dir (for offline deterministic tests). */
   readonly globalSkillsDir?: string;
+  /** Optional override for `~/.agents/skills` global skills dir (for offline deterministic tests). */
+  readonly agentsGlobalSkillsDir?: string;
   /** Optional override for data dir used by default `/export` & `/log` paths. */
   readonly dataDir?: string;
   /** Optional git subprocess executor override for offline deterministic tests. */
@@ -321,6 +315,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
       collapse_compacted: config.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
+      todo_provider: normalizeTodoProvider(config.ui.todo_provider),
       osc_7501: config.ui.osc_7501,
       reopen_anchor: config.ui.reopen_anchor,
     },
@@ -328,6 +323,54 @@ function cloneConfig(config: OmaConfig): OmaConfig {
       auto_allow_tools: [...(config.approval.auto_allow_tools ?? [])],
     },
   };
+}
+
+/** Converts an active ACP / `update_steps` plan into read-only display phases for `/todo`. */
+function buildDisplayPhasesFromAcpPlan(plan: PlanState | null): TodoPhase[] {
+  if (!plan || plan.source !== 'acp') return [];
+  const toTodoStatus = (status: string) =>
+    status === 'done'
+      ? 'completed'
+      : status === 'active'
+        ? 'in_progress'
+        : status === 'dropped' || status === 'blocked'
+          ? 'abandoned'
+          : 'pending';
+  if (plan.phases && plan.phases.length > 0) {
+    return plan.phases
+      .filter(p => p.items.length > 0)
+      .map(phase => ({
+        name: phase.title,
+        tasks: phase.items.map(item => ({
+          content: item.text,
+          status: toTodoStatus(item.status),
+          ...(item.note
+            ? { note: item.note }
+            : item.status === 'dropped'
+              ? { note: 'skipped' }
+              : item.status === 'blocked'
+                ? { note: 'failed' }
+                : {}),
+        })),
+      }));
+  }
+  if (plan.entries.length === 0) return [];
+  return [
+    {
+      name: 'Plan',
+      tasks: plan.entries.map(entry => ({
+        content: entry.text,
+        status: toTodoStatus(entry.status),
+        ...(entry.priority
+          ? { note: `[${entry.priority}]` }
+          : entry.status === 'dropped'
+            ? { note: 'skipped' }
+            : entry.status === 'blocked'
+              ? { note: 'failed' }
+              : {}),
+      })),
+    },
+  ];
 }
 
 function guessMimeType(filePath: string): string {
@@ -520,6 +563,7 @@ export class AppController {
   readonly #agySettingsPath: string;
   readonly #workspaceSkillsDir?: string;
   readonly #globalSkillsDir?: string;
+  readonly #agentsGlobalSkillsDir?: string;
   readonly #dataDir?: string;
   readonly #gitExec?: GitExecFn;
   readonly #backgroundDoneGraceMs: number;
@@ -528,7 +572,7 @@ export class AppController {
   readonly #replayDrainActiveQuietMs: number;
   readonly #hasExplicitReplayDrainQuietMs: boolean;
   readonly #todoAutoClearDelayMs: number;
-  readonly #enableTodoMcp: boolean;
+  readonly #enableTodoMcpOverride?: boolean;
   readonly #editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
   readonly #metricsTracker: SessionMetricsTracker;
 
@@ -577,6 +621,7 @@ export class AppController {
   #configWriteBlockedReason: string | null = null;
   #configVerifiedWritable = false;
   #configSaveChain: Promise<void> = Promise.resolve();
+  #anchorSaveChains = new Map<string, Promise<void>>();
   #pickerLoadToken = 0;
   #attachmentSeq = 0;
   #shutdownPromise: Promise<void> | null = null;
@@ -624,6 +669,7 @@ export class AppController {
     this.#agySettingsPath = options.agySettingsPath ?? getAgySettingsPath();
     this.#workspaceSkillsDir = options.workspaceSkillsDir;
     this.#globalSkillsDir = options.globalSkillsDir;
+    this.#agentsGlobalSkillsDir = options.agentsGlobalSkillsDir;
     this.#dataDir = options.dataDir;
     this.#gitExec = options.gitExec;
     this.#backgroundDoneGraceMs = Math.max(
@@ -647,7 +693,7 @@ export class AppController {
       options.todoAutoClearDelayMs !== undefined
         ? options.todoAutoClearDelayMs
         : TODO_AUTO_CLEAR_DELAY_MS;
-    this.#enableTodoMcp = options.enableTodoMcp ?? true;
+    this.#enableTodoMcpOverride = options.enableTodoMcp;
     this.#editTodoExternal = options.editTodoExternal;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
@@ -692,6 +738,7 @@ export class AppController {
     if (initialBeeBlobs) {
       this.store.setBeeBlobs(initialBeeBlobs);
     }
+    this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
     const ready = Promise.withResolvers<void>();
     this.readyPromise = ready.promise;
@@ -953,7 +1000,7 @@ export class AppController {
         for (const perm of cancelledPerms) {
           this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
         }
-        this.store.cancelActiveQuestion();
+        this.store.cancelAllQuestions();
 
         // 2. Clean user-initiated exit clears reopen anchor and OSC 7501 status
         if (options.cleanExit) {
@@ -973,8 +1020,9 @@ export class AppController {
         if (this.#activePromptTask) {
           await this.#activePromptTask.catch(() => {});
         }
-        // Wait for any accepted serialized config writes before exiting
+        // Wait for any accepted serialized config and session anchor writes before exiting
         await this.#configSaveChain.catch(() => {});
+        await Promise.all([...this.#anchorSaveChains.values()]);
 
         // 4. Stop background schedulers/indexers
         this.scheduler.dispose();
@@ -1186,6 +1234,7 @@ export class AppController {
         initRes.agentCapabilities?.promptCapabilities,
         { supportsLogout: client.supportsLogout }
       );
+      this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
       const initialOutcome = await this.#openInitialSession(client, retrySessionId);
       if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
@@ -1481,6 +1530,7 @@ export class AppController {
         return false;
       }
       if (
+        this.#isTodoMcpEnabled() &&
         storedTodoAnchor?.todoState &&
         storedTodoAnchor.todoState.toolCallCount >= this.store.transcript.todoToolCallCount &&
         JSON.stringify(storedTodoAnchor.todoState.phases) !==
@@ -1761,6 +1811,7 @@ export class AppController {
       !isReplayingBefore && params.update.sessionUpdate === 'usage_update'
         ? (this.store.getState().usage?.used ?? 0)
         : 0;
+    const prevPlanRef = !isReplayingBefore ? this.store.transcript.plan : null;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
       this.store.traffic.recordSystem(
@@ -1774,6 +1825,19 @@ export class AppController {
     const update = params.update;
 
     if (!isReplaying) {
+      if (
+        update.sessionUpdate === 'plan' ||
+        update.sessionUpdate === 'plan_update' ||
+        ((update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+          this.store.transcript.plan?.source === 'acp' &&
+          this.store.transcript.plan !== prevPlanRef)
+      ) {
+        this.#todoHudDismissed = false;
+        this.#scheduleTodoAutoClearIfDone();
+      } else if (update.sessionUpdate === 'plan_removed') {
+        this.#clearTodoAutoClearTimer();
+        this.#todoHudDismissed = false;
+      }
       if (update.sessionUpdate === 'usage_update') {
         const nextUsageUsed = this.store.getState().usage?.used ?? 0;
         if (prevUsageUsed >= 1_000 && nextUsageUsed > 0 && nextUsageUsed <= prevUsageUsed * 0.7) {
@@ -2121,23 +2185,30 @@ export class AppController {
         void client.respondToServerRequest(req.id, { action: 'cancel' }).catch(() => {});
         return;
       }
-      this.store.transcript.finalizeActiveThoughts({
-        autoCollapseThought: this.store.autoCollapseThought,
-        expandAllTools: this.store.getState().expandAllTools,
-      });
+      const hadActiveQuestion = this.store.getState().activeQuestion !== null;
+      if (!hadActiveQuestion) {
+        this.store.transcript.finalizeActiveThoughts({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: this.store.getState().expandAllTools,
+        });
+      }
       const card = this.store.openQuestion(req.id, req.params, response => {
         void client.respondToServerRequest(req.id, response).catch(() => {});
       });
-      const firstQ = card.items[0];
-      if (firstQ && (!firstQ.choices || firstQ.choices.length === 0) && firstQ.other) {
-        this.store.setQuestionFocusedOther(firstQ.id);
+      if (!hadActiveQuestion) {
+        const firstQ = card.items[0];
+        if (firstQ && (!firstQ.choices || firstQ.choices.length === 0) && firstQ.other) {
+          this.store.setQuestionFocusedOther(firstQ.id);
+        }
+        this.osc.setStatusBlocked('question');
+        this.scheduler.renderNow();
+        if (this.surface && this.session.caps.features.includes('scroll')) {
+          this.surface.reveal('main.questions', 'end');
+        }
+        this.syncFocus();
+      } else {
+        this.scheduler.renderNow();
       }
-      this.osc.setStatusBlocked('question');
-      this.scheduler.renderNow();
-      if (this.surface && this.session.caps.features.includes('scroll')) {
-        this.surface.reveal('main.questions', 'end');
-      }
-      this.syncFocus();
       return;
     }
 
@@ -2178,7 +2249,7 @@ export class AppController {
     for (const perm of cancelledPerms) {
       this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
     }
-    this.store.cancelActiveQuestion();
+    this.store.cancelAllQuestions();
 
     if (this.store.getState().isStreaming || this.store.transcript.activeTurn !== undefined) {
       this.store.transcript.finishActiveTurn(undefined, 'error', undefined, {
@@ -3433,6 +3504,16 @@ export class AppController {
   ): void {
     const resolved = this.store.resolveActiveQuestion(result);
     if (!resolved) return;
+    if (this.store.getState().activeQuestion) {
+      this.#syncQuestionAutoFocus();
+      this.#restoreOscAfterBlock();
+      this.scheduler.renderNow();
+      if (this.surface && this.session.caps.features.includes('scroll')) {
+        this.surface.reveal('main.questions', 'end');
+      }
+      this.syncFocus();
+      return;
+    }
     this.#restoreOscAfterBlock();
     this.scheduler.renderNow();
     this.syncFocus();
@@ -4132,7 +4213,7 @@ export class AppController {
     for (const perm of cancelledPerms) {
       this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
     }
-    const cancelledQ = this.store.cancelActiveQuestion();
+    const cancelledQ = this.store.cancelAllQuestions() > 0;
 
     const state = this.store.getState();
     const hadBackgroundBusy = state.hasActiveBackgroundTasks || state.isSwarmWorking;
@@ -4789,6 +4870,9 @@ export class AppController {
       const scanned = await scanLocalSkills(this.store.getState().cwd, acpCmds, {
         ...(this.#workspaceSkillsDir ? { workspaceSkillsDir: this.#workspaceSkillsDir } : {}),
         ...(this.#globalSkillsDir ? { globalSkillsDir: this.#globalSkillsDir } : {}),
+        ...(this.#agentsGlobalSkillsDir
+          ? { agentsGlobalSkillsDir: this.#agentsGlobalSkillsDir }
+          : {}),
       });
       if (isStale()) return;
       const mapped: SkillItem[] = scanned.map(s => ({
@@ -6088,6 +6172,7 @@ export class AppController {
 
     // 3. `oma` persisted settings (`config.toml`)
     let omaUpdated = false;
+    let omaSavedToast: string | null = null;
     if (rowId === 'ui.auto_collapse_thought') {
       const next = Boolean(value);
       this.#config = {
@@ -6122,6 +6207,32 @@ export class AppController {
         };
         omaUpdated = true;
       }
+    } else if (rowId === 'ui.todo_provider') {
+      const next: TodoProvider = normalizeTodoProvider(value);
+      if (next === 'native' && !this.#supportsNativeTodo()) {
+        const ver = this.#getAgentVersion();
+        this.store.pushToast(
+          `Native update_steps requires agy >= 1.5.16${ver ? ` (detected ${ver})` : ''}.`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+        return;
+      }
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, todo_provider: next },
+      };
+      this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
+      if (next === 'off') {
+        this.#clearTodoAutoClearTimer();
+      } else {
+        this.#scheduleTodoAutoClearIfDone();
+      }
+      omaUpdated = true;
+      omaSavedToast =
+        next === 'off'
+          ? 'Saved todo_provider = off — todo HUD hidden; start a new session (/new) or reconnect to stop MCP todo'
+          : `Saved todo_provider = ${next} — start a new session (/new) or reconnect to apply`;
     } else if (rowId === 'ui.osc_7501') {
       const next = Boolean(value);
       this.#config = {
@@ -6185,7 +6296,11 @@ export class AppController {
     if (omaUpdated) {
       const ok = await this.#saveConfigSafe();
       if (ok) {
-        this.store.pushToast('Saved setting to config.toml', 'success', { ttl: 1800 });
+        this.store.pushToast(
+          omaSavedToast ?? 'Saved setting to config.toml',
+          omaSavedToast ? 'info' : 'success',
+          { ttl: omaSavedToast ? 3000 : 1800 }
+        );
       }
       this.scheduler.renderNow();
       return;
@@ -6281,6 +6396,7 @@ export class AppController {
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
       this.store.setCollapseCompacted(this.#config.ui.collapse_compacted);
       this.store.setToolDisplayMode(this.#config.ui.tool_display);
+      this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
       const ok = await this.#saveConfigSafe();
@@ -6364,8 +6480,34 @@ export class AppController {
     this.syncFocus();
   }
 
+  #getAgentVersion(): string | undefined {
+    const state = this.store.getState();
+    return state.agentVersion ?? state.agentInfo?.version;
+  }
+
+  #supportsNativeTodo(): boolean {
+    return supportsNativeUpdateSteps(this.#getAgentVersion());
+  }
+
+  #getEffectiveTodoProvider(): TodoProvider {
+    return resolveEffectiveTodoProvider(this.#config.ui.todo_provider, this.#getAgentVersion());
+  }
+
+  #isTodoMcpEnabled(): boolean {
+    if (this.#enableTodoMcpOverride !== undefined) {
+      return this.#enableTodoMcpOverride;
+    }
+    return this.#getEffectiveTodoProvider() === 'mcp';
+  }
+
+  #isTodoDisabled(): boolean {
+    return this.#enableTodoMcpOverride === undefined && this.#getEffectiveTodoProvider() === 'off';
+  }
+
   #ensureTodoServer(): EmbeddedTodoMcpServer | null {
-    if (!this.#enableTodoMcp || this.#shuttingDown) {
+    if (!this.#isTodoMcpEnabled() || this.#shuttingDown) {
+      this.#todoServer?.dispose();
+      this.#todoServer = null;
       return null;
     }
     if (this.#todoServer) {
@@ -6413,16 +6555,43 @@ export class AppController {
 
   #scheduleTodoAutoClearIfDone(): void {
     this.#clearTodoAutoClearTimer();
-    const phases = this.store.transcript.todoPhases;
-    if (this.#todoHudDismissed || !areAllTodosFinished(phases)) {
+    const delayMs = this.#todoAutoClearDelayMs;
+    if (
+      this.#isTodoDisabled() ||
+      this.#todoHudDismissed ||
+      !Number.isFinite(delayMs) ||
+      delayMs < 0
+    ) {
       return;
     }
-    const delayMs = this.#todoAutoClearDelayMs;
-    if (!Number.isFinite(delayMs) || delayMs < 0) {
+
+    const plan = this.store.transcript.plan;
+    const expectedEpoch = this.#sessionEpoch;
+
+    if (plan?.source === 'acp') {
+      if (
+        plan.entries.length === 0 ||
+        !plan.entries.every(entry => isChecklistStatusFinished(entry.status))
+      ) {
+        return;
+      }
+      const snapshotJson = JSON.stringify(plan);
+      this.#todoAutoClearTimer = setTimeout(() => {
+        this.#todoAutoClearTimer = undefined;
+        if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
+        if (JSON.stringify(this.store.transcript.plan) !== snapshotJson) return;
+        this.#todoHudDismissed = true;
+        this.scheduler.renderNow();
+      }, delayMs);
+      this.#todoAutoClearTimer.unref?.();
+      return;
+    }
+
+    const phases = this.store.transcript.todoPhases;
+    if (!areAllTodosFinished(phases)) {
       return;
     }
     const snapshotJson = JSON.stringify(phases);
-    const expectedEpoch = this.#sessionEpoch;
     this.#todoAutoClearTimer = setTimeout(() => {
       this.#todoAutoClearTimer = undefined;
       if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
@@ -6508,26 +6677,67 @@ export class AppController {
 
   async #handleTodoCommand(argsText: string): Promise<void> {
     const trimmed = argsText.trim();
+    const sepIdx = trimmed.search(/\s/);
+    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
+    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+
+    if (this.#isTodoDisabled() && verb !== 'help' && verb !== '?') {
+      this.store.pushToast(
+        'Todo tracking is Off. Enable MCP or Native in /settings.',
+        'warning'
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
     const state = this.store.getState();
     const current = cloneTodoPhases(this.store.transcript.todoPhases);
+    const activePlan = this.store.transcript.plan;
+    const isAcpPlanActive = activePlan?.source === 'acp' && activePlan.entries.length > 0;
+    const displayPhases = isAcpPlanActive
+      ? buildDisplayPhasesFromAcpPlan(activePlan)
+      : current.length > 0
+        ? current
+        : buildDisplayPhasesFromAcpPlan(activePlan);
 
     if (!trimmed) {
-      if (current.length === 0) {
-        this.store.pushToast('No todos. Use /todo append <task> to start one.', 'info');
+      if (displayPhases.length === 0) {
+        this.store.pushToast(
+          this.#isTodoMcpEnabled()
+            ? 'No todos. Use /todo append <task> to start one.'
+            : 'No active steps. Native update_steps is managed by the agent.',
+          'info'
+        );
       } else {
-        this.store.transcript.addInfoNotice(formatTodoMarkdown(current).trimEnd(), 'info');
+        this.store.transcript.addInfoNotice(formatTodoMarkdown(displayPhases).trimEnd(), 'info');
       }
       this.scheduler.renderNow();
       return;
     }
 
-    const sepIdx = trimmed.search(/\s/);
-    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
-    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+    if (
+      !this.#isTodoMcpEnabled() &&
+      (isAcpPlanActive || !this.#todoServer || current.length === 0) &&
+      (verb === 'import' ||
+        verb === 'edit' ||
+        verb === 'append' ||
+        verb === 'start' ||
+        verb === 'done' ||
+        verb === 'drop' ||
+        verb === 'clear' ||
+        verb === 'rm')
+    ) {
+      this.store.pushToast(
+        'Todo engine is set to Native (update_steps); manual /todo editing requires MCP (oma_todo) in /settings.',
+        'warning'
+      );
+      this.scheduler.renderNow();
+      return;
+    }
 
     switch (verb) {
       case 'expand': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to expand.', 'info');
           this.scheduler.renderNow();
           return;
@@ -6552,19 +6762,19 @@ export class AppController {
         return;
       }
       case 'copy': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to copy.', 'warning');
           this.scheduler.renderNow();
           return;
         }
         await this.#copyTextWithToast(
-          formatTodoMarkdown(current),
+          formatTodoMarkdown(displayPhases),
           'Copied todos as Markdown to clipboard'
         );
         return;
       }
       case 'export': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to export.', 'warning');
           this.scheduler.renderNow();
           return;
@@ -6572,7 +6782,7 @@ export class AppController {
         const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
         try {
           await mkdir(path.dirname(targetFile), { recursive: true });
-          await writeFile(targetFile, formatTodoMarkdown(current), 'utf8');
+          await writeFile(targetFile, formatTodoMarkdown(displayPhases), 'utf8');
           this.store.pushToast(`Wrote todos to ${targetFile}`, 'success', { ttl: 3000 });
         } catch (err) {
           this.store.pushToast(
@@ -6947,49 +7157,64 @@ export class AppController {
   // -------------------------------------------------------------------------
 
   async #persistSessionAnchorAndOsc(): Promise<void> {
-    const state = this.store.getState();
-    const sid = state.sessionId;
-    if (!sid) return;
-    const epoch = this.#sessionEpoch;
+    const expectedSid = this.store.getState().sessionId;
+    if (!expectedSid) return;
+    const expectedEpoch = this.#sessionEpoch;
 
-    const firstUserText = this.store.transcript.turns.find(t => t.user?.text)?.user?.text;
-    const title =
-      state.sessionTitle ||
-      (firstUserText ? firstUserText.trim().split(/\r?\n/)[0]?.slice(0, 80) : '') ||
-      'New Session';
+    const writeStep = async (): Promise<void> => {
+      if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
+      const state = this.store.getState();
+      if (state.sessionId !== expectedSid) return;
 
-    try {
-      const anchorFile = await this.#previewStore.save({
-        sessionId: sid,
-        cwd: state.cwd,
-        title,
-        ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
-        ...(state.controls.currentThoughtLevel
-          ? { thoughtLevel: state.controls.currentThoughtLevel }
-          : {}),
-        ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
-        turnCount: this.store.transcript.turns.length,
-        preview: this.store.transcript.getPreviewMessages(3, 400),
-        ...(this.store.transcript.hasPersistedTodoState
-          ? {
-              todoState: {
-                phases: cloneTodoPhases(this.store.transcript.todoPhases),
-                toolCallCount: this.store.transcript.todoToolCallCount,
-              },
-            }
-          : {}),
-      });
-      if (
-        this.#shuttingDown ||
-        epoch !== this.#sessionEpoch ||
-        this.store.getState().sessionId !== sid
-      ) {
-        return;
+      const firstUserText = this.store.transcript.turns.find(t => t.user?.text)?.user?.text;
+      const title =
+        state.sessionTitle ||
+        (firstUserText ? firstUserText.trim().split(/\r?\n/)[0]?.slice(0, 80) : '') ||
+        'New Session';
+
+      try {
+        const anchorFile = await this.#previewStore.save({
+          sessionId: expectedSid,
+          cwd: state.cwd,
+          title,
+          ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
+          ...(state.controls.currentThoughtLevel
+            ? { thoughtLevel: state.controls.currentThoughtLevel }
+            : {}),
+          ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
+          turnCount: this.store.transcript.turns.length,
+          preview: this.store.transcript.getPreviewMessages(3, 400),
+          ...(this.store.transcript.hasPersistedTodoState
+            ? {
+                todoState: {
+                  phases: cloneTodoPhases(this.store.transcript.todoPhases),
+                  toolCallCount: this.store.transcript.todoToolCallCount,
+                },
+              }
+            : {}),
+        });
+        if (
+          this.#shuttingDown ||
+          expectedEpoch !== this.#sessionEpoch ||
+          this.store.getState().sessionId !== expectedSid
+        ) {
+          return;
+        }
+        this.osc.setReopenAnchor(anchorFile);
+      } catch {
+        // Anchor persistence errors must not interrupt interactive conversation
       }
-      this.osc.setReopenAnchor(anchorFile);
-    } catch {
-      // Anchor persistence errors must not interrupt interactive conversation
-    }
+    };
+
+    const prev = this.#anchorSaveChains.get(expectedSid) ?? Promise.resolve();
+    const next = prev.then(writeStep, writeStep);
+    const settled = next.catch(() => {}).finally(() => {
+      if (this.#anchorSaveChains.get(expectedSid) === settled) {
+        this.#anchorSaveChains.delete(expectedSid);
+      }
+    });
+    this.#anchorSaveChains.set(expectedSid, settled);
+    await next;
   }
 
   #restoreOscAfterBlock(): void {
@@ -7737,7 +7962,7 @@ export class AppController {
       draft: this.store.draft.getState(),
       turns: allVisibleTurns,
       transcriptTurns: transcriptSlice.turns,
-      plan: this.store.transcript.plan,
+      plan: this.#isTodoDisabled() ? null : this.store.transcript.plan,
       todoExpanded: this.#todoExpanded,
       todoHudDismissed: this.#todoHudDismissed,
       jobs,

@@ -4,7 +4,7 @@ import type { ToolDisplayMode } from '../config/config';
 import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
-import { isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
+import { isChecklistStatusFinished, isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
 import {
   estimateTokensFromText,
   formatFullLocalTime,
@@ -444,7 +444,9 @@ function renderBashRunBody(
           ? 'cancelled'
           : tool.exitCode !== undefined
             ? `exit ${tool.exitCode}`
-            : tool.status;
+            : tool.timedOut
+              ? 'timed out'
+              : tool.status;
   const stateStyle = isBgRunning
     ? 'warning mono'
     : tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
@@ -877,8 +879,34 @@ function renderNotice(
   );
 }
 
+function renderQuestionMetaBanner(
+  card: ActiveQuestionCard,
+  queuedQuestionCount: number
+): JSX.Element | null {
+  if (card.mode !== 'form') return null;
+  const trimmedMessage = card.message?.trim() ?? '';
+  const firstPrompt = card.items[0]?.prompt?.trim() ?? '';
+  const showMessage = trimmedMessage.length > 0 && trimmedMessage !== firstPrompt;
+  if (!showMessage && queuedQuestionCount <= 0) return null;
+
+  return (
+    <row key="questions-meta" role="oma.questions.meta" gap="sm" align="center">
+      <icon key="icon" name="question" tone="info" />
+      {showMessage ? (
+        <text key="msg" spans={[{ t: trimmedMessage, s: 'muted' }]} wrap="word" grow={1} shrink={1} />
+      ) : (
+        <text key="msg" spans={[{ t: 'Additional questions pending', s: 'muted' }]} wrap="word" grow={1} shrink={1} />
+      )}
+      {queuedQuestionCount > 0 ? (
+        <badge key="queued" text={`+${queuedQuestionCount} queued`} tone="warning" />
+      ) : null}
+    </row>
+  );
+}
+
 function renderQuestionCard(
   card: ActiveQuestionCard,
+  queuedQuestionCount: number,
   callbacks: TranscriptCallbacks
 ): JSX.Element {
   if (card.mode === 'url') {
@@ -888,6 +916,11 @@ function renderQuestionCard(
         head={card.message || 'External Action Required'}
         icon="globe"
         tone="warning"
+        end={
+          queuedQuestionCount > 0 ? (
+            <badge key="queued" text={`+${queuedQuestionCount} queued`} tone="warning" />
+          ) : undefined
+        }
       >
         <col key="body" gap="sm">
           {card.url ? (
@@ -1743,37 +1776,58 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
         return turnNodes;
       })}
 
-      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool' ? (
-        <tool
-          key="plan"
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          target={`${plan.entries.filter(e => e.status === 'done').length}/${plan.entries.length}`}
-          targetKind="text"
-          status={plan.entries.every(e => e.status === 'done') ? 'done' : 'running'}
-          frame="card"
-        >
-          <checklist
-            key="checklist"
-            mode="full"
-            phases={[
-              {
-                id: 'plan',
-                title: 'Plan',
-                items: plan.entries.map(e => ({
-                  id: e.id,
-                  text: e.text,
-                  status: e.status,
-                  note: e.priority ? `[${e.priority}]` : undefined,
-                })),
-              },
-            ]}
-          />
-        </tool>
-      ) : null}
+      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool'
+        ? (() => {
+            const doneCount = plan.entries.filter(e => e.status === 'done').length;
+            const skippedCount = plan.entries.filter(e => e.status === 'dropped').length;
+            const failedCount = plan.entries.filter(e => e.status === 'blocked').length;
+            const allFinished = plan.entries.every(e => isChecklistStatusFinished(e.status));
+            const extraParts = [
+              skippedCount > 0 ? `${skippedCount} skipped` : '',
+              failedCount > 0 ? `${failedCount} failed` : '',
+            ].filter(Boolean);
+            const target =
+              extraParts.length > 0
+                ? `${doneCount}/${plan.entries.length} (${extraParts.join(', ')})`
+                : `${doneCount}/${plan.entries.length}`;
+            return (
+              <tool
+                key="plan"
+                role="omp.tool.todo"
+                name="todo"
+                title="Todo"
+                target={target}
+                targetKind="text"
+                status={allFinished ? (failedCount > 0 ? 'error' : 'done') : 'running'}
+                frame="card"
+              >
+                <checklist
+                  key="checklist"
+                  mode="full"
+                  phases={[
+                    {
+                      id: 'plan',
+                      title: 'Plan',
+                      items: plan.entries.map(e => ({
+                        id: e.id,
+                        text: e.text,
+                        status: e.status,
+                        note: e.priority ? `[${e.priority}]` : undefined,
+                      })),
+                    },
+                  ]}
+                />
+              </tool>
+            );
+          })()
+        : null}
 
-      {state.activeQuestion ? renderQuestionCard(state.activeQuestion, callbacks) : null}
+      {state.activeQuestion
+        ? renderQuestionMetaBanner(state.activeQuestion, state.queuedQuestionCount)
+        : null}
+      {state.activeQuestion
+        ? renderQuestionCard(state.activeQuestion, state.queuedQuestionCount, callbacks)
+        : null}
 
       {state.authRequired ? (
         <card

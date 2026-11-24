@@ -660,8 +660,15 @@ export interface ToolCallDeltaUpdate extends ToolCallFields {
 }
 
 export type PlanEntryPriority = "high" | "medium" | "low";
-export type PlanEntryStatus = "pending" | "in_progress" | "completed";
-export type TspChecklistStatus = "pending" | "active" | "done" | "dropped";
+export type PlanEntryStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "done"
+  | "skipped"
+  | "failed"
+  | (string & {});
+export type TspChecklistStatus = "pending" | "active" | "done" | "dropped" | "blocked";
 
 export interface PlanEntry {
   content: string;
@@ -970,11 +977,17 @@ export function isElicitationCreateRequest(
 
 /**
  * 将 ACP tool_call 状态映射为 TSP `<tool status>`。
- * 优先级：cancelled > awaitingPermission ("ask") > ACP status。
+ * 优先级：cancelled > awaitingPermission ("ask") > 非后台命令失败/超时 ("error") > ACP status。
  */
 export function mapAcpToolStatusToTsp(
   status?: ToolCallStatus,
-  options?: { awaitingPermission?: boolean; cancelled?: boolean },
+  options?: {
+    awaitingPermission?: boolean;
+    cancelled?: boolean;
+    exitCode?: number;
+    timedOut?: boolean;
+    backgroundRunning?: boolean;
+  },
 ): TspToolStatus {
   if (options?.cancelled) {
     return "cancelled";
@@ -988,6 +1001,15 @@ export function mapAcpToolStatusToTsp(
     case "in_progress":
       return "running";
     case "completed":
+      if (
+        !options?.backgroundRunning &&
+        (options?.timedOut ||
+          (typeof options?.exitCode === "number" &&
+            Number.isFinite(options.exitCode) &&
+            options.exitCode !== 0))
+      ) {
+        return "error";
+      }
       return "done";
     case "failed":
       return "error";
@@ -996,18 +1018,43 @@ export function mapAcpToolStatusToTsp(
   }
 }
 
-/** 将 ACP plan entry 状态映射为 TSP `<checklist>` 项状态 */
+/** 将 ACP plan / update_steps 条目状态映射为 TSP `<checklist>` 项状态 */
 export function mapPlanStatusToChecklist(
   status: PlanEntryStatus,
 ): TspChecklistStatus {
-  switch (status) {
+  switch (typeof status === "string" ? status.trim().toLowerCase() : "") {
     case "pending":
       return "pending";
     case "in_progress":
+    case "active":
       return "active";
     case "completed":
+    case "done":
       return "done";
+    case "skipped":
+    case "dropped":
+    case "cancelled":
+    case "canceled":
+      return "dropped";
+    case "failed":
+    case "error":
+    case "blocked":
+      return "blocked";
+    default:
+      return "pending";
   }
+}
+
+/** 判断 tool_call rawOutput 是否携带超时标记 */
+export function isToolRawOutputTimedOut(rawOutput: unknown): boolean {
+  if (typeof rawOutput !== "object" || rawOutput === null || Array.isArray(rawOutput)) {
+    return false;
+  }
+  const rec = rawOutput as Record<string, unknown>;
+  if (rec.timed_out === true || rec.timedOut === true) {
+    return true;
+  }
+  return typeof rec.status === "string" && rec.status.trim().toLowerCase() === "timed_out";
 }
 
 /**

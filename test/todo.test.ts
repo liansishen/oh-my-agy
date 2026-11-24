@@ -8,6 +8,7 @@ import {
   findTodoTaskFuzzy,
   formatTodoMarkdown,
   formatUserTodoSyncReminder,
+  isChecklistStatusFinished,
   isOmaTodoToolName,
   mapTodoPhasesToChecklist,
   OMA_TODO_EXPOSED_TOOL_NAME,
@@ -275,6 +276,12 @@ describe('EmbeddedTodoMcpServer', () => {
     expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Mid-turn escalation');
     expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Follow-up turns');
     expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('Batch `op="init"` in parallel');
+    expect(OMA_TODO_SYSTEM_PROMPT_APPEND).toContain('instead of `update_steps`');
+    expect(isChecklistStatusFinished('done')).toBe(true);
+    expect(isChecklistStatusFinished('dropped')).toBe(true);
+    expect(isChecklistStatusFinished('blocked')).toBe(true);
+    expect(isChecklistStatusFinished('active')).toBe(false);
+    expect(isChecklistStatusFinished('pending')).toBe(false);
     expect(listJson.result.tools[0]?.annotations?.readOnlyHint).toBe(true);
     expect(listJson.result.tools[0]?._meta?.['antigravity/alwaysLoad']).toBe(true);
 

@@ -122,6 +122,10 @@ function sanitizeNodeKey(raw: string, fallback: string): string {
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
+function isSystemSwarmAgent(agent: string): boolean {
+  return agent.trim().toLowerCase() === 'system';
+}
+
 function resolveMemberBeeBlob(
   state: AppState,
   member: SwarmMember | undefined,
@@ -303,12 +307,14 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
   const selectedSender = selectedPost
     ? snapshot.memberByName[selectedPost.agent]
     : undefined;
+  const selectedIsSystem = Boolean(selectedPost && isSystemSwarmAgent(selectedPost.agent));
   const selectedSenderPalette = selectedPost
     ? getBeePaletteIdForMember(selectedPost.agent, selectedSender?.role)
     : 'gold';
-  const selectedSenderBee = selectedPost
-    ? resolveMemberBeeBlob(state, selectedSender, false)
-    : undefined;
+  const selectedSenderBee =
+    selectedPost && !selectedIsSystem
+      ? resolveMemberBeeBlob(state, selectedSender, false)
+      : undefined;
 
   const overview = snapshot.overview ?? null;
   const showOverview = Boolean(overview && state.terminalRows >= SWARM_OVERVIEW_MIN_ROWS);
@@ -668,7 +674,12 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
             >
               {keyedPosts.map(({ msg, key: postKey }) => {
                 const sender = snapshot.memberByName[msg.agent];
-                const tone: Tone = sender ? memberStatusTone(sender.status) : 'muted';
+                const isSystemPost = !sender && isSystemSwarmAgent(msg.agent);
+                const tone: Tone = sender
+                  ? memberStatusTone(sender.status)
+                  : isSystemPost
+                    ? 'info'
+                    : 'muted';
                 const labelSpans: SpanData[] = [
                   { t: `#${msg.seq}`, s: 'mono dim' },
                   { t: ` ${msg.agent}`, s: 'strong' },
@@ -695,7 +706,13 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
                     label={labelSpans}
                     detail={msg.summary || '(empty message)'}
                     value={clock ? [{ t: clock, s: 'mono muted' }] : undefined}
-                    icon={sender?.role === 'coordinator' ? 'compass' : 'message'}
+                    icon={
+                      isSystemPost
+                        ? 'bell'
+                        : sender?.role === 'coordinator'
+                          ? 'compass'
+                          : 'message'
+                    }
                     tone={tone}
                   />
                 );
@@ -718,7 +735,11 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
                         alt={selectedPost.agent}
                       />
                     ) : (
-                      <icon key="icon" name="message" tone="accent" />
+                      <icon
+                        key="icon"
+                        name={selectedIsSystem ? 'bell' : 'message'}
+                        tone={selectedIsSystem ? 'info' : 'accent'}
+                      />
                     )}
                     <text
                       key="seq"
@@ -749,6 +770,8 @@ export function SwarmBoardView(props: SwarmBoardViewProps): JSX.Element {
                       text={selectedSender.status}
                       tone={memberStatusTone(selectedSender.status)}
                     />
+                  ) : selectedIsSystem ? (
+                    <badge key="system" text="system" tone="info" />
                   ) : null}
                   {selectedSender?.model ? (
                     <badge key="model" text={selectedSender.model} tone="muted" />

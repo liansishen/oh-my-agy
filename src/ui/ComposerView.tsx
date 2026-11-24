@@ -30,7 +30,7 @@ import {
   type AppState,
   type ModalPickerKind,
 } from '../state/store';
-import type { BackgroundJobsSnapshot, PlanState } from '../state/transcript';
+import type { BackgroundJobsSnapshot, PlanState, TranscriptTurn } from '../state/transcript';
 import { BEE_HUD_SIZE, BEE_ORBIT_SIZE, MAX_ORBIT_BEES, type OrbitBeeSpec } from './assets';
 
 export interface OrbitBeeEntry extends OrbitBeeSpec {
@@ -103,12 +103,83 @@ export interface ComposerViewProps {
   readonly todoExpanded?: boolean;
   readonly todoHudDismissed?: boolean;
   readonly jobs?: BackgroundJobsSnapshot;
+  readonly activeTurn?: TranscriptTurn;
   readonly hasTurns: boolean;
   readonly commands?: readonly SlashCommandDef[];
   readonly workingStartedAt?: number;
   readonly hasPendingApproval?: boolean;
   readonly now?: number;
   readonly callbacks: ComposerCallbacks;
+}
+
+const STREAMING_TOOL_LABELS: Readonly<Record<string, string>> = {
+  bash: 'Running command…',
+  read: 'Reading file…',
+  edit: 'Editing file…',
+  write: 'Editing file…',
+  search: 'Searching…',
+  web: 'Searching web…',
+  todo: 'Updating todos…',
+  task: 'Running agent…',
+};
+
+/**
+ * Resolve the current streaming phase label and phase-scoped start timestamp so
+ * `omp.working` resets its elapsed timer cleanly across thinking, tool runs, and replies.
+ */
+export function resolveStreamingWorkingPhase(
+  activeTurn: TranscriptTurn | undefined,
+  workingStartedAt: number | undefined,
+): { readonly label: string; readonly startedAt: number | undefined } {
+  if (!activeTurn || activeTurn.status !== 'streaming') {
+    return { label: 'Working…', startedAt: workingStartedAt };
+  }
+
+  for (let i = activeTurn.toolCalls.length - 1; i >= 0; i--) {
+    const tool = activeTurn.toolCalls[i]!;
+    if (
+      (tool.status === 'running' || tool.status === 'pending') &&
+      tool.endedAt === undefined &&
+      !tool.backgroundRunning
+    ) {
+      const key = tool.displayName.trim().toLowerCase();
+      const label = STREAMING_TOOL_LABELS[key] ?? `Running ${tool.displayName}…`;
+      return { label, startedAt: tool.startedAt };
+    }
+  }
+
+  for (let i = activeTurn.thoughts.length - 1; i >= 0; i--) {
+    const thought = activeTurn.thoughts[i]!;
+    if (thought.status === 'running' && thought.endedAt === undefined) {
+      return { label: 'Thinking…', startedAt: thought.startedAt };
+    }
+  }
+
+  const lastRef = activeTurn.timeline[activeTurn.timeline.length - 1];
+  if (lastRef?.kind === 'assistant') {
+    const lastSeg = activeTurn.assistantSegments.find(s => s.id === lastRef.id);
+    return {
+      label: 'Responding…',
+      startedAt: lastSeg?.startedAt ?? workingStartedAt ?? activeTurn.startedAt,
+    };
+  }
+
+  let latestEndedAt: number | undefined;
+  for (const th of activeTurn.thoughts) {
+    if (th.endedAt !== undefined && (latestEndedAt === undefined || th.endedAt > latestEndedAt)) {
+      latestEndedAt = th.endedAt;
+    }
+  }
+  for (const tc of activeTurn.toolCalls) {
+    if (tc.endedAt !== undefined && (latestEndedAt === undefined || tc.endedAt > latestEndedAt)) {
+      latestEndedAt = tc.endedAt;
+    }
+  }
+
+  return {
+    label: 'Working…',
+    startedAt: latestEndedAt ?? workingStartedAt ?? activeTurn.startedAt,
+  };
 }
 
 function normalizeEffortLevel(raw: string | null | undefined): string {
@@ -276,6 +347,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     todoExpanded,
     todoHudDismissed,
     jobs,
+    activeTurn,
     commands,
     workingStartedAt,
     hasPendingApproval,
@@ -285,8 +357,13 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const { controls } = state;
 
   const isCtrlCArmed = state.ctrlCArmedUntil > 0 && now <= state.ctrlCArmedUntil;
+  const streamingPhase =
+    !hasPendingApproval && state.isStreaming
+      ? resolveStreamingWorkingPhase(activeTurn, workingStartedAt)
+      : undefined;
+  const effectiveWorkingStartedAt = streamingPhase ? streamingPhase.startedAt : workingStartedAt;
   const workingAgeMs =
-    workingStartedAt !== undefined ? Math.max(0, now - workingStartedAt) : 0;
+    effectiveWorkingStartedAt !== undefined ? Math.max(0, now - effectiveWorkingStartedAt) : 0;
   const hasActiveQuestion = state.activeQuestion !== null;
 
   const hasSwarm = Boolean(state.hasSwarm || state.swarmSnapshot !== null);
@@ -328,7 +405,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const workingLabel = hasPendingApproval
     ? 'Waiting for approval…'
     : state.isStreaming
-      ? 'Working…'
+      ? (streamingPhase?.label ?? 'Working…')
       : isSwarmWorking
         ? swarmWorkingCount > 0
           ? `Swarm running (${swarmWorkingCount} active)…`

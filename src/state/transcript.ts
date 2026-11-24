@@ -17,6 +17,7 @@ import {
   extractToolExitCode,
   extractToolOutputText,
   isKnownSessionUpdate,
+  isToolRawOutputTimedOut,
   mapAcpToolStatusToTsp,
   mapPlanStatusToChecklist,
   type AvailableCommand,
@@ -47,8 +48,10 @@ import type {
 } from './session_metrics';
 import {
   applyTodoOperation,
+  areAllTodosFinished,
   cloneTodoPhases,
   extractUserTodoSyncReminderFromText,
+  isChecklistStatusFinished,
   isOmaTodoToolName,
   isTodoTaskFinished,
   mapTodoPhasesToChecklist,
@@ -131,6 +134,7 @@ export interface ToolCallItem {
   rawInput?: unknown;
   rawOutput?: unknown;
   exitCode?: number;
+  timedOut?: boolean;
   outputText: string;
   diffs: ToolDiffItem[];
   locations: ToolCallLocation[];
@@ -189,6 +193,7 @@ export interface SubagentEntry {
 export interface AssistantSegment {
   readonly id: string;
   text: string;
+  readonly startedAt?: number;
 }
 
 export interface NoticeItem {
@@ -466,6 +471,20 @@ function formatTimeLabel(timestamp: number): string {
   return formatTurnTime(timestamp, false);
 }
 
+function isUpdateStepsToolName(rawName?: string, title?: string): boolean {
+  const n = rawName?.trim().toLowerCase() ?? '';
+  if (n === 'update_steps' || n === 'default_api:update_steps') {
+    return true;
+  }
+  const t = title?.trim().toLowerCase() ?? '';
+  return (
+    t === 'update_steps' ||
+    t === 'run update_steps' ||
+    t === 'default_api:update_steps' ||
+    t === 'run default_api:update_steps'
+  );
+}
+
 /**
  * Estimate token count from raw text using a lightweight CJK-aware heuristic
  * (~4 chars/token for ASCII, ~1.5 chars/token for non-ASCII / CJK).
@@ -649,6 +668,33 @@ export function extractToolDurationFromOutput(outputText: string): number | unde
   const delta = completedMs - createdMs;
   if (delta < 0 || delta > 24 * 60 * 60 * 1000) return undefined;
   return delta;
+}
+
+/**
+ * Extract leading `agy` shell summary status (`Command exited with code N` or
+ * `Command timed out`) after optional `Created At:` / `Completed At:` headers.
+ */
+export function extractLeadingBashExitStatus(outputText: string): {
+  readonly exitCode?: number;
+  readonly timedOut?: boolean;
+} {
+  if (!outputText) return {};
+  const lines = outputText.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (/^(?:Created|Completed)\s+At:/i.test(trimmed)) continue;
+    const exitMatch = /^Command\s+exited\s+with\s+code\s+(-?\d+)\b/i.exec(trimmed);
+    if (exitMatch?.[1]) {
+      const code = Number(exitMatch[1]);
+      return Number.isFinite(code) ? { exitCode: code } : {};
+    }
+    if (/^Command\s+timed\s+out\b/i.test(trimmed)) {
+      return { timedOut: true };
+    }
+    return {};
+  }
+  return {};
 }
 
 function mapToolStatusToAgentStatus(status: TspToolStatus): SubagentTspStatus {
@@ -1633,10 +1679,16 @@ export class TranscriptStore {
   private _compactedBeforeTurnIndex: number | null = null;
   private _showCompactedHistory = false;
   private _lastAppliedCheckpointStepIndex: number | null = null;
+  private _preferNativeSteps: boolean;
   private _idSeq = 1;
 
-  constructor(options: { now?: () => number } = {}) {
+  constructor(options: { now?: () => number; preferNativeSteps?: boolean } = {}) {
     this._now = options.now ?? (() => Date.now());
+    this._preferNativeSteps = options.preferNativeSteps ?? false;
+  }
+
+  setPreferNativeSteps(prefer: boolean): void {
+    this._preferNativeSteps = prefer;
   }
 
   get turns(): readonly TranscriptTurn[] {
@@ -2430,6 +2482,7 @@ export class TranscriptStore {
           const seg: AssistantSegment = {
             id: `msg-${this._idSeq++}`,
             text: chunkText,
+            startedAt: this._now(),
           };
           turn.assistantSegments.push(seg);
           turn.timeline.push({ kind: 'assistant', id: seg.id });
@@ -2460,6 +2513,12 @@ export class TranscriptStore {
           });
         }
         const entries = update.entries ?? [];
+        if (entries.length === 0) {
+          if (this._plan?.source === 'acp') {
+            this._plan = null;
+          }
+          return { handled: true };
+        }
         this._plan = {
           entries: entries.map((e, idx) => ({
             id: `plan-${idx}`,
@@ -2657,6 +2716,9 @@ export class TranscriptStore {
     tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
       awaitingPermission: true,
       cancelled: tool.cancelled,
+      exitCode: tool.exitCode,
+      timedOut: tool.timedOut,
+      backgroundRunning: tool.backgroundRunning,
     });
 
     const entry = this._toolIndex.get(tool.toolCallId);
@@ -2696,6 +2758,9 @@ export class TranscriptStore {
         tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
           awaitingPermission: false,
           cancelled: tool.cancelled,
+          exitCode: tool.exitCode,
+          timedOut: tool.timedOut,
+          backgroundRunning: tool.backgroundRunning,
         });
       }
     }
@@ -3684,6 +3749,9 @@ export class TranscriptStore {
         if (exitCode !== undefined) {
           tool.exitCode = exitCode;
         }
+        if (isToolRawOutputTimedOut(fields.rawOutput)) {
+          tool.timedOut = true;
+        }
         const rawOutText = extractToolOutputText(fields.rawOutput);
         if (rawOutText !== undefined && rawOutText.length > 0) {
           tool.outputText = rawOutText;
@@ -3701,6 +3769,16 @@ export class TranscriptStore {
             tool.outputText.length > 0 && !tool.outputText.includes(contentText)
               ? `${tool.outputText}\n${contentText}`
               : contentText;
+        }
+      }
+
+      if (tool.displayName === 'bash' && tool.outputText.length > 0) {
+        const leadingStatus = extractLeadingBashExitStatus(tool.outputText);
+        if (tool.exitCode === undefined && leadingStatus.exitCode !== undefined) {
+          tool.exitCode = leadingStatus.exitCode;
+        }
+        if (leadingStatus.timedOut) {
+          tool.timedOut = true;
         }
       }
 
@@ -3723,6 +3801,9 @@ export class TranscriptStore {
       tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
         awaitingPermission: tool.awaitingPermission,
         cancelled: tool.cancelled,
+        exitCode: tool.exitCode,
+        timedOut: tool.timedOut,
+        backgroundRunning: tool.backgroundRunning,
       });
 
       if (existingTurn) {
@@ -3731,6 +3812,7 @@ export class TranscriptStore {
           this.syncBackgroundTaskForTool(existingTurn.index, tool);
         }
         this.syncTodoToolState(existingTurn, tool, isReplaying);
+        this.syncUpdateStepsToolState(existingTurn, tool);
       }
       return tool;
     }
@@ -3749,10 +3831,20 @@ export class TranscriptStore {
       path: normalizeDisplayPath(loc.path),
     }));
     const acpStatus: ToolCallStatus = fields.status ?? 'pending';
-    const exitCode = extractToolExitCode(fields.rawOutput);
+    let exitCode = extractToolExitCode(fields.rawOutput);
+    let timedOut = isToolRawOutputTimedOut(fields.rawOutput);
     const contentText = extractToolContentText(fields.content);
     const rawOutText = extractToolOutputText(fields.rawOutput) ?? '';
     const outputText = contentText || rawOutText;
+    if (meta.displayName === 'bash' && outputText.length > 0) {
+      const leadingStatus = extractLeadingBashExitStatus(outputText);
+      if (exitCode === undefined && leadingStatus.exitCode !== undefined) {
+        exitCode = leadingStatus.exitCode;
+      }
+      if (leadingStatus.timedOut) {
+        timedOut = true;
+      }
+    }
     const diffs = extractDiffItems(fields.content);
     const title = normalizeDisplayPath(fields.title || fields.name || meta.displayName);
     const target = extractToolTarget(
@@ -3775,7 +3867,7 @@ export class TranscriptStore {
     const tool: ToolCallItem = {
       toolCallId: fields.toolCallId,
       acpStatus,
-      status: mapAcpToolStatusToTsp(acpStatus),
+      status: mapAcpToolStatusToTsp(acpStatus, { exitCode, timedOut }),
       ...(fields.kind !== undefined ? { kind: fields.kind } : {}),
       ...(fields.name !== undefined ? { rawName: fields.name } : {}),
       displayName: meta.displayName,
@@ -3787,6 +3879,7 @@ export class TranscriptStore {
       ...(fields.rawInput !== undefined ? { rawInput: fields.rawInput } : {}),
       ...(fields.rawOutput !== undefined ? { rawOutput: fields.rawOutput } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(timedOut ? { timedOut: true } : {}),
       outputText,
       diffs,
       locations,
@@ -3815,6 +3908,7 @@ export class TranscriptStore {
       this.syncBackgroundTaskForTool(turn.index, tool);
     }
     this.syncTodoToolState(turn, tool, isReplaying);
+    this.syncUpdateStepsToolState(turn, tool);
 
     return tool;
   }
@@ -3918,6 +4012,80 @@ export class TranscriptStore {
         if (pending) {
           this.assignTodoSnapshotToTool(turn, tool, pending);
         }
+      }
+    }
+  }
+
+  private syncUpdateStepsToolState(turn: TranscriptTurn, tool: ToolCallItem): void {
+    if (!isUpdateStepsToolName(tool.rawName, tool.title)) {
+      return;
+    }
+    if (tool.acpStatus === 'failed') {
+      return;
+    }
+    let inputRec = asRecord(tool.rawInput) ?? asRecord(tool.args);
+    if (!inputRec && typeof tool.rawInput === 'string') {
+      try {
+        inputRec = asRecord(JSON.parse(tool.rawInput));
+      } catch {
+        // Ignore malformed rawInput JSON string
+      }
+    }
+    let rawSteps: unknown = inputRec?.steps;
+    if (typeof rawSteps === 'string') {
+      try {
+        rawSteps = JSON.parse(rawSteps);
+      } catch {
+        rawSteps = undefined;
+      }
+    }
+    if (!Array.isArray(rawSteps)) {
+      return;
+    }
+    if (rawSteps.length === 0) {
+      if (this._plan?.source === 'acp') {
+        this._plan = null;
+      }
+      return;
+    }
+    const entries: PlanItemState[] = [];
+    for (let idx = 0; idx < rawSteps.length; idx++) {
+      const step = asRecord(rawSteps[idx]);
+      if (!step) continue;
+      const title = typeof step.title === 'string' ? step.title.trim() : '';
+      const status = typeof step.status === 'string' ? step.status.trim() : '';
+      if (!title || !status) continue;
+      entries.push({
+        id: `plan-${idx}`,
+        text: title,
+        status: mapPlanStatusToChecklist(status),
+      });
+    }
+    if (entries.length > 0) {
+      const doneCount = entries.filter(e => e.status === 'done').length;
+      const skippedCount = entries.filter(e => e.status === 'dropped').length;
+      const failedCount = entries.filter(e => e.status === 'blocked').length;
+      const extraParts = [
+        skippedCount > 0 ? `${skippedCount} skipped` : '',
+        failedCount > 0 ? `${failedCount} failed` : '',
+      ].filter(Boolean);
+      tool.target =
+        extraParts.length > 0
+          ? `${doneCount}/${entries.length} (${extraParts.join(', ')})`
+          : `${doneCount}/${entries.length}`;
+      const turnHasActiveOmaTodo = turn.toolCalls.some(
+        t => t.isOmaTodo && t.acpStatus !== 'failed' && !t.todoSnapshot?.isError,
+      );
+      const canTakeOverPlan =
+        this._plan?.source !== 'todo_tool' ||
+        (!turnHasActiveOmaTodo &&
+          (this._preferNativeSteps || areAllTodosFinished(this._todoPhases)));
+      if (canTakeOverPlan) {
+        this._plan = {
+          entries,
+          source: 'acp',
+          updatedAt: this._now(),
+        };
       }
     }
   }

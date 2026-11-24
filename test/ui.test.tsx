@@ -12570,4 +12570,1079 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await controller.shutdown({ cleanExit: true });
     await runPromise;
   });
+
+  test('agy 1.5.16 parity: concurrent elicitation queue & meta banner, phase-aware omp.working timers, update_steps plan card, and Swarm system posts', async () => {
+    const tmp = makeTempDir();
+    const sessionId = 'sess-1516';
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      join(swarmDir, 'swarm.json'),
+      JSON.stringify({
+        version: 1,
+        backend: 'local',
+        swarm_id: sessionId,
+        created_at: '2026-11-24T00:00:00Z',
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: '1.5.16 Swarm',
+        members: {
+          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions' },
+        },
+      }),
+      'utf8',
+    );
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      JSON.stringify({
+        seq: 1,
+        agent: 'system',
+        text: 'Board wakeup scheduled',
+        time: '2026-11-24 12:00:00',
+      }) + '\n',
+      'utf8',
+    );
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    let fakeNow = 100_000;
+    const elicitationReplies: RpcEnvelope[] = [];
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+    let promptId: string | number | undefined;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+            agentCapabilities: { loadSession: true },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+      } else if (msg.method === 'session/prompt') {
+        promptId = msg.id;
+        new Promise<{ stopReason: string }>((resolve) => {
+          promptResolver = resolve;
+        }).then((res) => {
+          h.send({ jsonrpc: '2.0', id: promptId, result: res });
+        });
+      } else if (msg.result !== undefined) {
+        elicitationReplies.push(msg);
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      swarmDir,
+      configPath: join(tmp, 'config.toml'),
+      agySettingsPath: join(tmp, 'settings.json'),
+      workspaceSkillsDir: join(tmp, 'empty-ws'),
+      globalSkillsDir: join(tmp, 'empty-global'),
+      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
+      dataDir: join(tmp, 'data'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      now: () => fakeNow,
+      throttleMs: 5,
+      installSignals: false,
+    });
+
+    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSub = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSub(child);
+        }
+      };
+      const delSub = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSub(op[4]);
+        else if (op[0] === 'del') delSub(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(() => controller.store.getState().isReady);
+
+    // 1. Phase-aware omp.working: Thinking -> Running command -> Responding
+    await controller.submitInput('Check phase timers');
+    await waitFor(() => promptResolver !== null);
+
+    fakeNow = 102_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning…' } },
+      },
+    });
+    await waitFor(() => {
+      const labelNode = replayWire().get('dock.activity.status.working.label');
+      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Thinking…');
+    });
+    fakeNow = 107_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ' more' } },
+      },
+    });
+    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 5000);
+
+    fakeNow = 108_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-phase-bash',
+          kind: 'execute',
+          name: 'run_command',
+          status: 'in_progress',
+          title: 'echo hi',
+        },
+      },
+    });
+    await waitFor(() => {
+      const labelNode = replayWire().get('dock.activity.status.working.label');
+      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Running command…');
+    });
+    fakeNow = 111_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-phase-bash',
+          status: 'in_progress',
+          rawOutput: { output: 'hi\n' },
+        },
+      },
+    });
+    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 3000);
+
+    // Update steps with done/skipped/failed renders extended status & target
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-steps-ui',
+          name: 'update_steps',
+          status: 'completed',
+          rawInput: {
+            steps: [
+              { title: 'Step A', status: 'done' },
+              { title: 'Step B', status: 'skipped' },
+              { title: 'Step C', status: 'failed' },
+            ],
+          },
+        },
+      },
+    });
+    await waitFor(() => replayWire().get('main.plan')?.p['target'] === '1/3 (1 skipped, 1 failed)');
+    expect(replayWire().get('main.plan')?.p['status']).toBe('error');
+
+    fakeNow = 112_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tc-phase-bash',
+          status: 'completed',
+          rawOutput: { output: 'hi', exit_code: 0 },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } },
+      },
+    });
+    await waitFor(() => {
+      const labelNode = replayWire().get('dock.activity.status.working.label');
+      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Responding…');
+    });
+    fakeNow = 114_000;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' done' } },
+      },
+    });
+    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 2000);
+
+    // 2. Concurrent elicitation/create requests queue cleanly and show message + queued badge
+    acp.send({
+      jsonrpc: '2.0',
+      id: 9001,
+      method: 'elicitation/create',
+      params: {
+        sessionId,
+        mode: 'form',
+        message: 'Subagent researcher asks:',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            choice1: { type: 'string', title: 'Pick mode', enum: ['fast', 'deep'] },
+          },
+        },
+      },
+    });
+    await waitFor(() => controller.store.getState().activeQuestion?.requestId === 9001);
+
+    acp.send({
+      jsonrpc: '2.0',
+      id: 9002,
+      method: 'elicitation/create',
+      params: {
+        sessionId,
+        mode: 'form',
+        message: 'Subagent verifier asks:',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            note2: { type: 'string', title: 'Provide note' },
+          },
+        },
+      },
+    });
+    await waitFor(() => controller.store.getState().queuedQuestionCount === 1);
+    expect(elicitationReplies).toHaveLength(0);
+    const metaNodes = replayWire();
+    expect(metaNodes.get('main.questions-meta.msg')?.p['spans']).toEqual([
+      { t: 'Subagent researcher asks:', s: 'muted' },
+    ]);
+    expect(metaNodes.get('main.questions-meta.queued')?.p['text']).toBe('+1 queued');
+
+    // Submit first -> promotes second and auto-focuses main.questions.note2.other
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { choice1: 'fast' } });
+    await waitFor(() => elicitationReplies.length === 1);
+    expect(elicitationReplies[0]?.id).toBe(9001);
+    expect(elicitationReplies[0]?.result).toEqual({ action: 'accept', content: { choice1: 'fast' } });
+    await waitFor(() => controller.store.getState().activeQuestion?.requestId === 9002);
+    expect(controller.currentSurfaceFocus).toBe('main.questions.note2.other');
+
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { note2: 'looks good' } });
+    await waitFor(() => elicitationReplies.length === 2);
+    expect(elicitationReplies[1]?.id).toBe(9002);
+    expect(elicitationReplies[1]?.result).toEqual({ action: 'accept', content: { note2: 'looks good' } });
+
+    promptResolver!({ stopReason: 'end_turn' });
+    await waitFor(() => !controller.store.getState().isStreaming);
+
+    // 3. Swarm board displays "system" posts with bell icon & info badge instead of bee sprite
+    await controller.submitInput('/swarm board');
+    await waitFor(() => controller.store.getState().swarmBoardOpen);
+    const swarmNodes = replayWire();
+    expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['icon']).toBe('bell');
+    expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['tone']).toBe('info');
+    expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.head.who.icon')?.p['name']).toBe('bell');
+    expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.meta-row.system')?.p['text']).toBe('system');
+
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('ui.todo_provider setting switches between native update_steps and embedded MCP oma_todo across /settings and /new', async () => {
+    const tmp = makeTempDir();
+    const configPath = join(tmp, 'config.toml');
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    const newSessionParams: Array<Record<string, unknown>> = [];
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+    let shuttingDown = false;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+            agentCapabilities: { loadSession: true },
+          },
+        });
+      } else if (msg.method === 'session/new') {
+        newSessionParams.push((msg.params ?? {}) as Record<string, unknown>);
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: `sess-todo-mode-${newSessionParams.length}`,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const promptId = msg.id;
+        new Promise<{ stopReason: string }>(resolve => {
+          promptResolver = resolve;
+        }).then(res => {
+          h.send({ jsonrpc: '2.0', id: promptId, result: res });
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        if (shuttingDown) {
+          h.crash(0);
+        }
+      } else if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: {
+        ...DEFAULT_CONFIG,
+        ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' },
+      },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      configPath,
+      agySettingsPath: join(tmp, 'settings.json'),
+      workspaceSkillsDir: join(tmp, 'empty-ws'),
+      globalSkillsDir: join(tmp, 'empty-global'),
+      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
+      dataDir: join(tmp, 'data'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSub = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSub(child);
+        }
+      };
+      const delSub = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSub(op[4]);
+        else if (op[0] === 'del') delSub(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(() => controller.store.getState().isReady);
+
+    // 1. Native mode startup skips oma_todo MCP server & systemPrompt.append
+    expect(newSessionParams).toHaveLength(1);
+    expect(newSessionParams[0]?.mcpServers).toEqual([]);
+    expect(newSessionParams[0]?._meta).toBeUndefined();
+
+    // 2. Receiving native update_steps renders HUD + plan card + supports read-only /todo & warns on mutating /todo
+    await controller.submitInput('Track with native update_steps');
+    await waitFor(() => promptResolver !== null);
+    const activeSessionId = controller.store.getState().sessionId;
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: activeSessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-native-steps',
+          name: 'update_steps',
+          status: 'completed',
+          rawInput: {
+            steps: [
+              { title: 'Step 1', status: 'done' },
+              { title: 'Step 2', status: 'in_progress' },
+            ],
+          },
+        },
+      },
+    });
+    promptResolver!({ stopReason: 'end_turn' });
+    promptResolver = null;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(
+      () =>
+        replayWire().has('dock.activity.todo') &&
+        replayWire().get('main.plan')?.p['target'] === '1/2',
+    );
+    expect(controller.store.transcript.getToolById('tc-native-steps')?.target).toBe('1/2');
+
+    await controller.submitInput('/todo');
+    const latestNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    expect(latestNotice?.text).toContain('# Plan');
+    expect(latestNotice?.text).toContain('- [x] Step 1');
+    expect(latestNotice?.text).toContain('- [/] Step 2');
+
+    await controller.submitInput('/todo done Step 2');
+    expect(
+      controller.store
+        .getState()
+        .toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)')),
+    ).toBe(true);
+
+    // 3. Switching ui.todo_provider -> 'mcp' in /settings persists to config.toml and injects oma_todo on /new
+    await controller.submitInput('/settings interface');
+    await waitFor(() => controller.store.getState().settings?.page === 'interface');
+    host.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.todo_provider',
+      value: 'mcp',
+    });
+    await waitFor(
+      () =>
+        existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'),
+    );
+    expect(
+      controller.store
+        .getState()
+        .toasts.some(t => t.tone === 'info' && t.text.includes('/new')),
+    ).toBe(true);
+
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().settings === null);
+    await controller.submitInput('/new');
+    await waitFor(() => newSessionParams.length === 2);
+    const mcpServers = newSessionParams[1]?.mcpServers as Array<{ name?: string }> | undefined;
+    expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
+    const meta1 = newSessionParams[1]?._meta as
+      | { antigravity?: { systemPrompt?: { append?: string } } }
+      | undefined;
+    expect(meta1?.antigravity?.systemPrompt?.append).toContain('mcp_oma_todo_todo');
+
+    // 4. Switching ui.todo_provider -> 'native' in /settings stops injecting oma_todo on next /new
+    await controller.submitInput('/settings interface');
+    await waitFor(() => controller.store.getState().settings?.page === 'interface');
+    host.input.emitTspEvent({
+      ev: 'change',
+      sf: 'oma',
+      id: 'layer.settings',
+      item: 'ui.todo_provider',
+      value: 'native',
+    });
+    await waitFor(() => readFileSync(configPath, 'utf8').includes('todo_provider = "native"'));
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().settings === null);
+
+    await controller.submitInput('/new');
+    await waitFor(() => newSessionParams.length === 3);
+    expect(newSessionParams[2]?.mcpServers).toEqual([]);
+    expect(newSessionParams[2]?._meta).toBeUndefined();
+
+    shuttingDown = true;
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('resuming an unfinished mcp_oma_todo session in native mode skips stale anchor reminder and lets update_steps take over HUD and /todo', async () => {
+    const tmp = makeTempDir();
+    const oldSessionId = 'sess-legacy-mcp-unfinished';
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    await previewStore.save({
+      sessionId: oldSessionId,
+      cwd: tmp,
+      title: 'Legacy MCP Session',
+      turnCount: 1,
+      updatedAt: '2026-11-24T06:00:00.000Z',
+      preview: [{ role: 'user', text: 'Run legacy MCP tasks' }],
+      todoState: {
+        phases: [
+          {
+            name: 'Anchor Phase',
+            tasks: [{ content: 'Stale anchor task', status: 'in_progress' }],
+          },
+        ],
+        toolCallCount: 2,
+      },
+    });
+
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+    let capturedLoadParams: Record<string, unknown> | undefined;
+    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+    let shuttingDown = false;
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+            agentCapabilities: { loadSession: true },
+          },
+        });
+      } else if (msg.method === 'session/load') {
+        capturedLoadParams = (msg.params ?? {}) as Record<string, unknown>;
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: oldSessionId,
+            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Old MCP work' } },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: oldSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-legacy-oma',
+              name: 'mcp_oma_todo_todo',
+              status: 'completed',
+              rawInput: {
+                op: 'init',
+                items: ['Old MCP task A', 'Old MCP task B'],
+              },
+            },
+          },
+        });
+        h.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: oldSessionId,
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
+        });
+      } else if (msg.method === 'session/prompt') {
+        const promptId = msg.id;
+        const p = (msg.params ?? {}) as { prompt?: Array<{ type?: string; text?: string }> };
+        sentPrompts.push(p.prompt ?? []);
+        new Promise<{ stopReason: string }>(resolve => {
+          promptResolver = resolve;
+        }).then(res => {
+          h.send({ jsonrpc: '2.0', id: promptId, result: res });
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        if (shuttingDown) h.crash(0);
+      } else if (msg.id !== undefined) {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs(['--resume', oldSessionId]),
+      config: {
+        ...DEFAULT_CONFIG,
+        ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' },
+      },
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore,
+      configPath: join(tmp, 'config.toml'),
+      agySettingsPath: join(tmp, 'settings.json'),
+      workspaceSkillsDir: join(tmp, 'empty-ws'),
+      globalSkillsDir: join(tmp, 'empty-global'),
+      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
+      dataDir: join(tmp, 'data'),
+      gitExec: async () => ({ exitCode: 128, stdout: '' }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSub = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSub(child);
+        }
+      };
+      const delSub = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSub(op[4]);
+        else if (op[0] === 'del') delSub(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    const runPromise = controller.run();
+    await controller.readyPromise;
+    await waitFor(
+      () =>
+        controller.store.getState().isReady &&
+        !controller.store.getState().isReplaying,
+    );
+
+    expect(capturedLoadParams?.mcpServers).toEqual([]);
+    expect(capturedLoadParams?._meta).toBeUndefined();
+    expect(controller.store.transcript.todoPhases[0]?.tasks[0]?.content).toBe('Old MCP task A');
+
+    // Subsequent turn in native mode does NOT inject stale MCP `<system-reminder>`,
+    // and even if a failed `Run mcp_oma_todo_todo` occurs first, real `Run update_steps` (without `name`) takes over HUD + main.plan
+    await controller.submitInput('Continue with native update_steps');
+    await waitFor(() => promptResolver !== null);
+    expect(sentPrompts).toHaveLength(1);
+    expect(sentPrompts[0]?.some(b => (b.text ?? '').includes('<system-reminder>'))).toBe(false);
+
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: oldSessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-failed-legacy-oma',
+          title: 'Run mcp_oma_todo_todo',
+          status: 'failed',
+          rawInput: { op: 'init', items: ['Failed fallback attempt'] },
+        },
+      },
+    });
+    acp.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: oldSessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc-resumed-native-steps',
+          title: 'Run update_steps',
+          status: 'completed',
+          rawInput: {
+            steps: [
+              { title: 'Native Step 1', status: 'done' },
+              { title: 'Native Step 2', status: 'in_progress' },
+            ],
+          },
+        },
+      },
+    });
+    promptResolver!({ stopReason: 'end_turn' });
+    promptResolver = null;
+    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => replayWire().get('main.plan')?.p['target'] === '1/2');
+    expect(controller.store.transcript.getToolById('tc-resumed-native-steps')?.target).toBe('1/2');
+
+    const hudPhases = replayWire().get('dock.activity.todo')?.p['phases'] as Array<{
+      title: string;
+      items: Array<{ text: string; status: string }>;
+    }>;
+    expect(hudPhases).toHaveLength(1);
+    expect(hudPhases[0]?.title).toBe('Plan');
+    expect(hudPhases[0]?.items.map(i => `${i.text}:${i.status}`)).toEqual([
+      'Native Step 1:done',
+      'Native Step 2:active',
+    ]);
+
+    await controller.submitInput('/todo');
+    const latestNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    expect(latestNotice?.text).toContain('- [x] Native Step 1');
+    expect(latestNotice?.text).toContain('- [/] Native Step 2');
+    expect(latestNotice?.text).not.toContain('Old MCP task A');
+    expect(latestNotice?.text).not.toContain('Stale anchor task');
+
+    await controller.submitInput('/todo done Native Step 2');
+    expect(
+      controller.store
+        .getState()
+        .toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)')),
+    ).toBe(true);
+
+    shuttingDown = true;
+    await controller.shutdown({ cleanExit: true });
+    await runPromise;
+  });
+
+  test('ui.todo_provider supports off mode and gates /settings options by agy version (1.5.15 Off/MCP vs 1.5.16 Off/MCP/Native)', async () => {
+    type PrefsSectionWire = {
+      id: string;
+      rows: Array<{
+        id: string;
+        warning?: string;
+        control?: { k: string; value?: unknown; options?: Array<{ value: string; label: string }> };
+      }>;
+    };
+    const findTodoProviderRow = (
+      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
+    ) => {
+      const sections = (nodes.get('layer.settings')?.p['sections'] as PrefsSectionWire[] | undefined) ?? [];
+      return sections.flatMap(s => s.rows).find(r => r.id === 'ui.todo_provider');
+    };
+
+    const replayWireFor = (host: FakeTernHost): Map<string, { k: string; p: Record<string, unknown> }> => {
+      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
+      const addSub = (n: WireNode): void => {
+        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
+        if (n.c) {
+          for (const child of n.c) addSub(child);
+        }
+      };
+      const delSub = (id: string): void => {
+        nodes.delete(id);
+        const prefix = `${id}.`;
+        for (const k of [...nodes.keys()]) {
+          if (k.startsWith(prefix)) nodes.delete(k);
+        }
+      };
+      for (const op of host.allOps) {
+        if (op[0] === 'add') addSub(op[4]);
+        else if (op[0] === 'del') delSub(op[1]);
+        else if (op[0] === 'set') {
+          const entry = nodes.get(op[1]);
+          if (entry) {
+            for (const [k, v] of Object.entries(op[2])) {
+              if (v === null) delete entry.p[k];
+              else entry.p[k] = v;
+            }
+          }
+        }
+      }
+      return nodes;
+    };
+
+    // Part A: agy 1.5.16 shows Off/MCP/Native, and switching to 'off' hides HUD/main.plan + omits MCP
+    {
+      const tmp = makeTempDir();
+      const configPath = join(tmp, 'config.toml');
+      const host = new FakeTernHost();
+      const session = await createConnectedSession(host);
+      const acp = new MockAcpHarness();
+      const newParams: Array<Record<string, unknown>> = [];
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      let shuttingDown = false;
+
+      acp.setHandler((msg, h) => {
+        if (msg.method === 'initialize') {
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              protocolVersion: 1,
+              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+              agentCapabilities: { loadSession: true },
+            },
+          });
+        } else if (msg.method === 'session/new') {
+          newParams.push((msg.params ?? {}) as Record<string, unknown>);
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: `sess-new-${newParams.length}`, configOptions: DEFAULT_CONFIG_OPTIONS },
+          });
+        } else if (msg.method === 'session/prompt') {
+          const pid = msg.id;
+          new Promise<{ stopReason: string }>(resolve => {
+            promptResolver = resolve;
+          }).then(res => h.send({ jsonrpc: '2.0', id: pid, result: res }));
+        } else if (msg.method === 'session/close') {
+          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+          if (shuttingDown) h.crash(0);
+        } else if (msg.id !== undefined) {
+          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      });
+
+      const controller = new AppController({
+        cli: parseCliArgs([]),
+        config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' } },
+        cwd: tmp,
+        session,
+        output: host.safeOutput,
+        acpSpawn: acp.createSpawnFn(),
+        previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+        configPath,
+        agySettingsPath: join(tmp, 'settings.json'),
+        workspaceSkillsDir: join(tmp, 'empty-ws'),
+        globalSkillsDir: join(tmp, 'empty-global'),
+        agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
+        dataDir: join(tmp, 'data'),
+        gitExec: async () => ({ exitCode: 128, stdout: '' }),
+        installSignals: false,
+        throttleMs: 5,
+      });
+      const runPromise = controller.run();
+      await controller.readyPromise;
+      await waitFor(() => controller.store.getState().isReady);
+
+      await controller.submitInput('Show native plan');
+      await waitFor(() => promptResolver !== null);
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: controller.store.getState().sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tc-on-off',
+            name: 'update_steps',
+            status: 'completed',
+            rawInput: { steps: [{ title: 'Active task', status: 'in_progress' }] },
+          },
+        },
+      });
+      promptResolver!({ stopReason: 'end_turn' });
+      promptResolver = null;
+      await waitFor(() => replayWireFor(host).has('dock.activity.todo') && replayWireFor(host).has('main.plan'));
+
+      await controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(replayWireFor(host))));
+      const rowNew = findTodoProviderRow(replayWireFor(host));
+      expect(rowNew?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp', 'native']);
+      expect(rowNew?.control?.value).toBe('native');
+      expect(rowNew?.warning).toBeUndefined();
+
+      host.input.emitTspEvent({
+        ev: 'change',
+        sf: 'oma',
+        id: 'layer.settings',
+        item: 'ui.todo_provider',
+        value: 'off',
+      });
+      await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "off"'));
+      await waitFor(() => !replayWireFor(host).has('dock.activity.todo') && !replayWireFor(host).has('main.plan'));
+      host.input.emit('\x1b');
+      await waitFor(() => controller.store.getState().settings === null);
+
+      await controller.submitInput('/todo');
+      expect(
+        controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Todo tracking is Off')),
+      ).toBe(true);
+      await controller.submitInput('/todo help');
+      const helpNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+      expect(helpNotice?.text).toContain('Usage: /todo');
+
+      await controller.submitInput('/new');
+      await waitFor(() => newParams.length === 2);
+      expect(newParams[1]?.mcpServers).toEqual([]);
+      expect(newParams[1]?._meta).toBeUndefined();
+
+      shuttingDown = true;
+      await controller.shutdown({ cleanExit: true });
+      await runPromise;
+    }
+
+    // Part B: older agy 1.5.15 shows only Off/MCP, falls back configured 'native' -> 'off', rejects selecting 'native', and enables MCP on switch
+    {
+      const tmp = makeTempDir();
+      const configPath = join(tmp, 'config.toml');
+      const host = new FakeTernHost();
+      const session = await createConnectedSession(host);
+      const acp = new MockAcpHarness();
+      const newParams: Array<Record<string, unknown>> = [];
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      let shuttingDown = false;
+
+      acp.setHandler((msg, h) => {
+        if (msg.method === 'initialize') {
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              protocolVersion: 1,
+              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.15' },
+              agentCapabilities: { loadSession: true },
+            },
+          });
+        } else if (msg.method === 'session/new') {
+          newParams.push((msg.params ?? {}) as Record<string, unknown>);
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: `sess-old-${newParams.length}`, configOptions: DEFAULT_CONFIG_OPTIONS },
+          });
+        } else if (msg.method === 'session/prompt') {
+          const pid = msg.id;
+          new Promise<{ stopReason: string }>(resolve => {
+            promptResolver = resolve;
+          }).then(res => h.send({ jsonrpc: '2.0', id: pid, result: res }));
+        } else if (msg.method === 'session/close') {
+          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+          if (shuttingDown) h.crash(0);
+        } else if (msg.id !== undefined) {
+          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        }
+      });
+
+      const controller = new AppController({
+        cli: parseCliArgs([]),
+        config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' } },
+        cwd: tmp,
+        session,
+        output: host.safeOutput,
+        acpSpawn: acp.createSpawnFn(),
+        previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+        configPath,
+        agySettingsPath: join(tmp, 'settings.json'),
+        workspaceSkillsDir: join(tmp, 'empty-ws'),
+        globalSkillsDir: join(tmp, 'empty-global'),
+        agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
+        dataDir: join(tmp, 'data'),
+        gitExec: async () => ({ exitCode: 128, stdout: '' }),
+        installSignals: false,
+        throttleMs: 5,
+      });
+      const runPromise = controller.run();
+      await controller.readyPromise;
+      await waitFor(() => controller.store.getState().isReady);
+
+      expect(newParams[0]?.mcpServers).toEqual([]);
+      expect(newParams[0]?._meta).toBeUndefined();
+
+      await controller.submitInput('Check suppressed plan on 1.5.15');
+      await waitFor(() => promptResolver !== null);
+      acp.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: controller.store.getState().sessionId,
+          update: {
+            sessionUpdate: 'plan',
+            entries: [{ content: 'Should stay hidden when fallback off', status: 'in_progress' }],
+          },
+        },
+      });
+      promptResolver!({ stopReason: 'end_turn' });
+      promptResolver = null;
+      await waitFor(() => !controller.store.getState().isStreaming);
+      expect(replayWireFor(host).has('dock.activity.todo')).toBe(false);
+      expect(replayWireFor(host).has('main.plan')).toBe(false);
+
+      await controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(replayWireFor(host))));
+      const rowOld = findTodoProviderRow(replayWireFor(host));
+      expect(rowOld?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp']);
+      expect(rowOld?.control?.value).toBe('off');
+      expect(rowOld?.warning).toContain('1.5.16');
+
+      // Attempting to select 'native' on 1.5.15 is rejected with warning toast
+      host.input.emitTspEvent({
+        ev: 'change',
+        sf: 'oma',
+        id: 'layer.settings',
+        item: 'ui.todo_provider',
+        value: 'native',
+      });
+      await waitFor(() =>
+        controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('1.5.16')),
+      );
+      expect(existsSync(configPath)).toBe(false);
+
+      // Switching to 'mcp' persists and enables oma_todo on /new
+      host.input.emitTspEvent({
+        ev: 'change',
+        sf: 'oma',
+        id: 'layer.settings',
+        item: 'ui.todo_provider',
+        value: 'mcp',
+      });
+      await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'));
+      host.input.emit('\x1b');
+      await waitFor(() => controller.store.getState().settings === null);
+
+      await controller.submitInput('/new');
+      await waitFor(() => newParams.length === 2);
+      const mcpServers = newParams[1]?.mcpServers as Array<{ name?: string }> | undefined;
+      expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
+
+      shuttingDown = true;
+      await controller.shutdown({ cleanExit: true });
+      await runPromise;
+    }
+  });
 });

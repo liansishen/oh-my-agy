@@ -505,6 +505,7 @@ export interface AppState {
   readonly gitOverlay: GitOverlayState | null;
   readonly helpOpen: boolean;
   readonly activeQuestion: ActiveQuestionCard | null;
+  readonly queuedQuestionCount: number;
   readonly completion: CompletionPopupState;
   readonly pendingAttachments: readonly AttachmentItem[];
   readonly toasts: readonly ToastItem[];
@@ -663,6 +664,7 @@ export class AppStore {
   private _gitOverlay: GitOverlayState | null = null;
   private _helpOpen = false;
   private _activeQuestion: ActiveQuestionCard | null = null;
+  private readonly _questionQueue: ActiveQuestionCard[] = [];
   private _completion: CompletionPopupState = EMPTY_COMPLETION;
 
   private _pendingAttachments: AttachmentItem[] = [];
@@ -1157,6 +1159,7 @@ export class AppStore {
       gitOverlay: this._gitOverlay,
       helpOpen: this._helpOpen,
       activeQuestion: this._activeQuestion,
+      queuedQuestionCount: this._questionQueue.length,
       completion: this._completion,
       pendingAttachments: this._pendingAttachments,
       toasts: this._toasts,
@@ -1383,7 +1386,7 @@ export class AppStore {
   resetSessionState(options: { keepCommands?: boolean } = {}): void {
     this._sessionId = null;
     this.approvals.cancelAll();
-    this.cancelActiveQuestion();
+    this.cancelAllQuestions();
     this.transcript.clear();
     this._usage = null;
     this._sessionMetrics = null;
@@ -2425,18 +2428,21 @@ export class AppStore {
     params: ElicitationCreateParams,
     resolve: (result: ElicitationCreateResult) => void,
   ): ActiveQuestionCard {
-    if (this._activeQuestion) {
-      this._activeQuestion.resolve({ action: 'cancel' });
-    }
-    this._completion = EMPTY_COMPLETION;
-    this._activeQuestion = buildQuestionCardFromElicitation(
+    const card = buildQuestionCardFromElicitation(
       requestId,
       params,
       resolve,
       this._now(),
     );
+    if (this._activeQuestion) {
+      this._questionQueue.push(card);
+      this.emit();
+      return card;
+    }
+    this._completion = EMPTY_COMPLETION;
+    this._activeQuestion = card;
     this.emit();
-    return this._activeQuestion;
+    return card;
   }
 
   setQuestionAnswer(questionId: string, answer: string | string[]): void {
@@ -2501,7 +2507,11 @@ export class AppStore {
   resolveActiveQuestion(result: ElicitationCreateResult): boolean {
     const card = this._activeQuestion;
     if (!card) return false;
-    this._activeQuestion = null;
+    const nextCard = this._questionQueue.shift() ?? null;
+    this._activeQuestion = nextCard;
+    if (nextCard) {
+      this._completion = EMPTY_COMPLETION;
+    }
     card.resolve(result);
     this.emit();
     return true;
@@ -2509,6 +2519,23 @@ export class AppStore {
 
   cancelActiveQuestion(): boolean {
     return this.resolveActiveQuestion({ action: 'cancel' });
+  }
+
+  cancelAllQuestions(): number {
+    const pending: ActiveQuestionCard[] = [];
+    if (this._activeQuestion) {
+      pending.push(this._activeQuestion);
+      this._activeQuestion = null;
+    }
+    if (this._questionQueue.length > 0) {
+      pending.push(...this._questionQueue.splice(0, this._questionQueue.length));
+    }
+    if (pending.length === 0) return 0;
+    for (const card of pending) {
+      card.resolve({ action: 'cancel' });
+    }
+    this.emit();
+    return pending.length;
   }
 
   // -------------------------------------------------------------------------
