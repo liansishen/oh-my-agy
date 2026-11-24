@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/liansishen/oh-my-agy/main/scripts/i
 默认安装到 `~/.local/bin/oma`（以 `root` 运行且存在 `/usr/local/bin` 时自动创建 `/usr/local/bin/oma` 软链接）；若检测到 `tern`，自动安装 `oma-reopen` 插件。
 
 > **安装脚本可选环境变量**：
-> - `OMA_VERSION`：指定版本（如 `v0.3.1`，默认 `latest`）
+> - `OMA_VERSION`：指定版本（如 `v0.3.2`，默认 `latest`）
 > - `OMA_INSTALL_DIR`：自定义安装目录
 > - `OMA_SKIP_PLUGIN=1`：跳过自动安装 `oma-reopen` Tern 插件
 > - `OMA_REPO`：自定义 GitHub 仓库（默认 `liansishen/oh-my-agy`）
@@ -49,7 +49,7 @@ oma update --check
 
 # 强制重装或切换到指定版本
 oma update --force
-oma update --version v0.3.1
+oma update --version v0.3.2
 ```
 
 ## 核心特性
