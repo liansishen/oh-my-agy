@@ -11,7 +11,6 @@ import {
   formatTurnTime,
   type ActiveQuestionCard,
   type NoticeItem,
-  type PlanState,
   type SubagentEntry,
   type ToolCallItem,
   type ToolDiffItem,
@@ -54,7 +53,6 @@ export interface TranscriptCallbacks {
 export interface TranscriptViewProps {
   readonly state: AppState;
   readonly turns: readonly TranscriptTurn[];
-  readonly plan: PlanState | null;
   readonly version: string;
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
@@ -766,6 +764,72 @@ function renderToolItem(
     );
   }
 
+  if (tool.isUpdateSteps) {
+    const entries = tool.updateStepsEntries;
+    const hasEntries = Boolean(entries && entries.length > 0);
+    const failedCount = entries ? entries.filter(e => e.status === 'blocked').length : 0;
+    const allFinished = hasEntries && entries!.every(e => isChecklistStatusFinished(e.status));
+    const status = isToolRunning
+      ? 'running'
+      : effectiveStatus === 'error' || (allFinished && failedCount > 0)
+        ? 'error'
+        : effectiveStatus;
+    const effectiveCollapsed = isAsk
+      ? false
+      : tool.userToggled
+        ? tool.collapsed
+        : !expandAllTools;
+    const errorText = status === 'error' && !hasEntries ? tool.outputText.trim() : '';
+    const hasBody = hasEntries || errorText.length > 0;
+    const frame = isAsk || (hasBody && !effectiveCollapsed) ? 'card' : 'inline';
+
+    return (
+      <tool
+        key={nodeKey}
+        role="omp.tool.todo"
+        name="todo"
+        title="Todo"
+        target={tool.target}
+        targetKind={tool.target ? 'text' : undefined}
+        status={status}
+        age={toolAge}
+        took={toolTook}
+        frame={frame}
+        collapsible={hasBody && !isAsk}
+        collapsed={effectiveCollapsed}
+        preview="none"
+        confirm={isAsk ? 'card' : undefined}
+        ask={isAsk ? tool.ask : undefined}
+        approved={tool.approved}
+        onToggle={ev =>
+          callbacks.onToggleTool(tool.toolCallId, ev.collapsed ?? !effectiveCollapsed)
+        }
+        onAction={approvalHandlers}
+      >
+        {hasEntries && entries ? (
+          <checklist
+            key="checklist"
+            mode="full"
+            phases={[
+              {
+                id: 'plan',
+                title: 'Plan',
+                items: entries.map(e => ({
+                  id: e.id,
+                  text: e.text,
+                  status: e.status,
+                  note: e.priority ? `[${e.priority}]` : undefined,
+                })),
+              },
+            ]}
+          />
+        ) : errorText ? (
+          <text key="err" spans={[{ t: errorText, s: 'error' }]} wrap="word" />
+        ) : null}
+      </tool>
+    );
+  }
+
   const bodyNodes = renderToolBody(tool, toolPreviewLines, turnStatus, now);
   const hasBody = bodyNodes.length > 0;
   const frame = resolveToolFrame(tool, toolDisplayMode, isPendingOrRunning);
@@ -1319,7 +1383,7 @@ function renderTurnFooterNodes(
  * - Individual top-level nodes are settled via `RenderScheduler.settleTurn()` and filtered on `GoneEvent`.
  */
 export function TranscriptView(props: TranscriptViewProps): JSX.Element {
-  const { state, turns, plan, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
+  const { state, turns, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
   const hasCompactedHistory = Boolean(props.hasCompactedHistory);
   const compactedHistoryExpanded = Boolean(props.compactedHistoryExpanded);
   const hiddenCompactedTurnCount = props.hiddenCompactedTurnCount ?? 0;
@@ -1775,52 +1839,6 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
 
         return turnNodes;
       })}
-
-      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool'
-        ? (() => {
-            const doneCount = plan.entries.filter(e => e.status === 'done').length;
-            const skippedCount = plan.entries.filter(e => e.status === 'dropped').length;
-            const failedCount = plan.entries.filter(e => e.status === 'blocked').length;
-            const allFinished = plan.entries.every(e => isChecklistStatusFinished(e.status));
-            const extraParts = [
-              skippedCount > 0 ? `${skippedCount} skipped` : '',
-              failedCount > 0 ? `${failedCount} failed` : '',
-            ].filter(Boolean);
-            const target =
-              extraParts.length > 0
-                ? `${doneCount}/${plan.entries.length} (${extraParts.join(', ')})`
-                : `${doneCount}/${plan.entries.length}`;
-            return (
-              <tool
-                key="plan"
-                role="omp.tool.todo"
-                name="todo"
-                title="Todo"
-                target={target}
-                targetKind="text"
-                status={allFinished ? (failedCount > 0 ? 'error' : 'done') : 'running'}
-                frame="card"
-              >
-                <checklist
-                  key="checklist"
-                  mode="full"
-                  phases={[
-                    {
-                      id: 'plan',
-                      title: 'Plan',
-                      items: plan.entries.map(e => ({
-                        id: e.id,
-                        text: e.text,
-                        status: e.status,
-                        note: e.priority ? `[${e.priority}]` : undefined,
-                      })),
-                    },
-                  ]}
-                />
-              </tool>
-            );
-          })()
-        : null}
 
       {state.activeQuestion
         ? renderQuestionMetaBanner(state.activeQuestion, state.queuedQuestionCount)

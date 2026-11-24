@@ -865,11 +865,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const agentNodes = host.findWireNodes(n => n.k === 'agent');
     expect(agentNodes.length).toBeGreaterThan(0);
 
-    // Verify plan in main (omp.tool.todo) and dock HUD (omp.hud.todo)
-    const todoTool = host.findWireNodes(n => n.k === 'tool' && n.p?.['role'] === 'omp.tool.todo')[0];
-    expect(todoTool).toBeDefined();
-    const planNodes = host.findWireNodes(n => n.k === 'checklist' && n.p?.['mode'] === 'full');
-    expect(planNodes.length).toBeGreaterThan(0);
+    // Verify ACP plan renders in dock HUD (omp.hud.todo) without duplicating a floating main.plan card
+    expect(host.findWireNodes(n => n.id === 'main.plan')).toHaveLength(0);
     const hudTodoNodes = host.findWireNodes(n => n.k === 'checklist' && n.p?.['role'] === 'omp.hud.todo');
     expect(hudTodoNodes.length).toBeGreaterThan(0);
 
@@ -12792,8 +12789,16 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         },
       },
     });
-    await waitFor(() => replayWire().get('main.plan')?.p['target'] === '1/3 (1 skipped, 1 failed)');
-    expect(replayWire().get('main.plan')?.p['status']).toBe('error');
+    await waitFor(() => replayWire().get('main.t0-tc-steps-ui')?.p['target'] === '1/3 (1 skipped, 1 failed)');
+    const stepsToolUi = replayWire().get('main.t0-tc-steps-ui');
+    expect(stepsToolUi?.p['role']).toBe('omp.tool.todo');
+    expect(stepsToolUi?.p['title']).toBe('Todo');
+    expect(stepsToolUi?.p['status']).toBe('error');
+    expect(stepsToolUi?.p['collapsed']).toBe(true);
+    expect(stepsToolUi?.p['collapsible']).toBe(true);
+    expect(stepsToolUi?.p['frame']).toBe('inline');
+    expect(replayWire().has('main.plan')).toBe(false);
+    expect(replayWire().get('dock.activity.todo')?.p['role']).toBe('omp.hud.todo');
 
     fakeNow = 112_000;
     acp.send({
@@ -13014,7 +13019,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(newSessionParams[0]?.mcpServers).toEqual([]);
     expect(newSessionParams[0]?._meta).toBeUndefined();
 
-    // 2. Receiving native update_steps renders HUD + plan card + supports read-only /todo & warns on mutating /todo
+    // 2. Receiving native update_steps renders HUD + collapsible in-turn todo row + supports read-only /todo & warns on mutating /todo
     await controller.submitInput('Track with native update_steps');
     await waitFor(() => promptResolver !== null);
     const activeSessionId = controller.store.getState().sessionId;
@@ -13043,9 +13048,25 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(
       () =>
         replayWire().has('dock.activity.todo') &&
-        replayWire().get('main.plan')?.p['target'] === '1/2',
+        replayWire().get('main.t0-tc-native-steps')?.p['target'] === '1/2',
     );
+    expect(replayWire().has('main.plan')).toBe(false);
+    const nativeStepsNode = replayWire().get('main.t0-tc-native-steps');
+    expect(nativeStepsNode?.p['role']).toBe('omp.tool.todo');
+    expect(nativeStepsNode?.p['status']).toBe('done');
+    expect(nativeStepsNode?.p['collapsed']).toBe(true);
+    expect(nativeStepsNode?.p['frame']).toBe('inline');
     expect(controller.store.transcript.getToolById('tc-native-steps')?.target).toBe('1/2');
+
+    host.input.emitTspEvent({
+      ev: 'toggle',
+      sf: 'oma',
+      id: 'main.t0-tc-native-steps',
+      collapsed: false,
+    });
+    await waitFor(() => replayWire().get('main.t0-tc-native-steps')?.p['collapsed'] === false);
+    expect(replayWire().get('main.t0-tc-native-steps')?.p['frame']).toBe('card');
+    expect(replayWire().get('main.t0-tc-native-steps.checklist')?.p['mode']).toBe('full');
 
     await controller.submitInput('/todo');
     const latestNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
@@ -13316,7 +13337,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     promptResolver!({ stopReason: 'end_turn' });
     promptResolver = null;
     await waitFor(() => !controller.store.getState().isStreaming);
-    await waitFor(() => replayWire().get('main.plan')?.p['target'] === '1/2');
+    await waitFor(() => replayWire().get('main.t1-tc-resumed-native-steps')?.p['target'] === '1/2');
+    expect(replayWire().has('main.plan')).toBe(false);
     expect(controller.store.transcript.getToolById('tc-resumed-native-steps')?.target).toBe('1/2');
 
     const hudPhases = replayWire().get('dock.activity.todo')?.p['phases'] as Array<{
@@ -13478,7 +13500,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       });
       promptResolver!({ stopReason: 'end_turn' });
       promptResolver = null;
-      await waitFor(() => replayWireFor(host).has('dock.activity.todo') && replayWireFor(host).has('main.plan'));
+      await waitFor(() => replayWireFor(host).has('dock.activity.todo'));
+      expect(replayWireFor(host).has('main.plan')).toBe(false);
 
       await controller.submitInput('/settings interface');
       await waitFor(() => Boolean(findTodoProviderRow(replayWireFor(host))));

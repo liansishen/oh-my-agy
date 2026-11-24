@@ -145,7 +145,6 @@ export function buildAppView(props: AppViewProps): ViewInput {
     <TranscriptView
       state={state}
       turns={transcriptTurns ?? turns}
-      plan={plan}
       version={version}
       toolPreviewLines={toolPreviewLines}
       evictedNodeIds={evictedNodeIds}

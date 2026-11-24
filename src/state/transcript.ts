@@ -163,6 +163,10 @@ export interface ToolCallItem {
     readonly isError: boolean;
     readonly text: string;
   };
+  /** True when the tool call targets agy's native `update_steps` tool. */
+  isUpdateSteps?: boolean;
+  /** Structured checklist entries captured from a native `update_steps` tool call. */
+  updateStepsEntries?: readonly PlanItemState[];
 }
 
 export type SubagentTspStatus =
@@ -507,7 +511,7 @@ export function mapToolDisplayMeta(
   kind?: string,
   rawName?: string,
 ): { displayName: string; targetKind: TspToolTargetKind } {
-  if (isOmaTodoToolName(rawName)) {
+  if (isOmaTodoToolName(rawName) || isUpdateStepsToolName(rawName)) {
     return { displayName: 'todo', targetKind: 'text' };
   }
 
@@ -4017,9 +4021,14 @@ export class TranscriptStore {
   }
 
   private syncUpdateStepsToolState(turn: TranscriptTurn, tool: ToolCallItem): void {
-    if (!isUpdateStepsToolName(tool.rawName, tool.title)) {
+    if (!tool.isUpdateSteps && !isUpdateStepsToolName(tool.rawName, tool.title)) {
       return;
     }
+    tool.isUpdateSteps = true;
+    tool.displayName = 'todo';
+    tool.targetKind = 'text';
+    tool.title = 'Todo';
+    tool.intent = undefined;
     if (tool.acpStatus === 'failed') {
       return;
     }
@@ -4043,6 +4052,8 @@ export class TranscriptStore {
       return;
     }
     if (rawSteps.length === 0) {
+      tool.updateStepsEntries = [];
+      tool.target = undefined;
       if (this._plan?.source === 'acp') {
         this._plan = null;
       }
@@ -4062,6 +4073,7 @@ export class TranscriptStore {
       });
     }
     if (entries.length > 0) {
+      tool.updateStepsEntries = entries;
       const doneCount = entries.filter(e => e.status === 'done').length;
       const skippedCount = entries.filter(e => e.status === 'dropped').length;
       const failedCount = entries.filter(e => e.status === 'blocked').length;

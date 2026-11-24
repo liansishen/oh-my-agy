@@ -2960,7 +2960,15 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
         ],
       },
     });
-    expect(realShapeStore.getToolById('tc-real-update-steps-arr')?.target).toBe('1/2');
+    const arrStepsTool = realShapeStore.getToolById('tc-real-update-steps-arr');
+    expect(arrStepsTool?.isUpdateSteps).toBe(true);
+    expect(arrStepsTool?.displayName).toBe('todo');
+    expect(arrStepsTool?.title).toBe('Todo');
+    expect(arrStepsTool?.target).toBe('1/2');
+    expect(arrStepsTool?.updateStepsEntries).toEqual([
+      { id: 'plan-0', text: 'Check payload', status: 'done' },
+      { id: 'plan-1', text: 'Apply fix', status: 'active' },
+    ]);
     expect(realShapeStore.plan?.source).toBe('acp');
     expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
       'Check payload:done',
@@ -2983,6 +2991,41 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
       'Check payload:done',
       'Apply fix:done',
+    ]);
+
+    // Streaming `tool_call` (no `name`, no `rawInput`) followed by `tool_call_update` keeps `isUpdateSteps`
+    realShapeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-real-update-steps-stream',
+      title: 'Run update_steps',
+      status: 'in_progress',
+    });
+    const streamingStepsTool = realShapeStore.getToolById('tc-real-update-steps-stream');
+    expect(streamingStepsTool?.isUpdateSteps).toBe(true);
+    expect(streamingStepsTool?.displayName).toBe('todo');
+    expect(streamingStepsTool?.title).toBe('Todo');
+
+    realShapeStore.applySessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tc-real-update-steps-stream',
+      status: 'completed',
+      rawInput: {
+        steps: [
+          { title: 'Stream step 1', status: 'done' },
+          { title: 'Stream step 2', status: 'done' },
+        ],
+      },
+    });
+    expect(streamingStepsTool?.isUpdateSteps).toBe(true);
+    expect(streamingStepsTool?.title).toBe('Todo');
+    expect(streamingStepsTool?.target).toBe('2/2');
+    expect(streamingStepsTool?.updateStepsEntries).toEqual([
+      { id: 'plan-0', text: 'Stream step 1', status: 'done' },
+      { id: 'plan-1', text: 'Stream step 2', status: 'done' },
+    ]);
+    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
+      'Stream step 1:done',
+      'Stream step 2:done',
     ]);
   });
 });
