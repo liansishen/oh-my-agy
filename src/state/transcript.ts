@@ -17,6 +17,7 @@ import {
   extractToolExitCode,
   extractToolOutputText,
   isKnownSessionUpdate,
+  isToolRawOutputTimedOut,
   mapAcpToolStatusToTsp,
   mapPlanStatusToChecklist,
   type AvailableCommand,
@@ -47,6 +48,7 @@ import type {
 } from './session_metrics';
 import {
   applyTodoOperation,
+  areAllTodosFinished,
   cloneTodoPhases,
   extractUserTodoSyncReminderFromText,
   isOmaTodoToolName,
@@ -58,6 +60,78 @@ import {
 
 export const LONG_RUNNING_TOOL_THRESHOLD_MS = 10_000;
 const MAX_PENDING_TODO_SNAPSHOTS = 32;
+const FALLBACK_FAILED_TODO_TEXT = 'Todo tool call failed.';
+const MUTATING_TODO_OPS = new Set<string>(['init', 'start', 'done', 'rm', 'drop', 'append']);
+
+function parseTodoInputRecord(raw: unknown): Record<string, unknown> | undefined {
+  if (typeof raw === 'string') {
+    try {
+      return asRecord(JSON.parse(raw)) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return asRecord(raw) ?? undefined;
+}
+
+function extractRawTodoOp(raw: unknown): string | undefined {
+  const op = parseTodoInputRecord(raw)?.op;
+  return typeof op === 'string' && op.trim().length > 0 ? op.trim().toLowerCase() : undefined;
+}
+
+function sortJsonKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonKeys);
+  const rec = asRecord(value);
+  if (!rec) return value;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(rec).sort()) {
+    if (rec[key] !== undefined) out[key] = sortJsonKeys(rec[key]);
+  }
+  return out;
+}
+
+function canonicalTodoArgsKey(raw: unknown): string | undefined {
+  const rec = parseTodoInputRecord(raw);
+  return rec ? JSON.stringify(sortJsonKeys(rec)) : undefined;
+}
+
+function getEffectiveTodoToolRawInput(tool: ToolCallItem): unknown {
+  const recRaw = parseTodoInputRecord(tool.rawInput);
+  if (recRaw && Object.keys(recRaw).length > 0) return tool.rawInput;
+  const recArgs = parseTodoInputRecord(tool.args);
+  if (recArgs && Object.keys(recArgs).length > 0) return tool.args;
+  return tool.rawInput ?? tool.args;
+}
+
+function scoreTodoSnapshotMatch(
+  snap: { readonly rawOp?: string; readonly argsKey?: string; readonly isError: boolean },
+  tool: ToolCallItem,
+): number {
+  if (!snap.isError && tool.acpStatus === 'failed') return 0;
+  const toolRaw = getEffectiveTodoToolRawInput(tool);
+  const toolArgsKey = canonicalTodoArgsKey(toolRaw);
+  if (snap.argsKey !== undefined && toolArgsKey !== undefined) {
+    return snap.argsKey === toolArgsKey ? 2 : 0;
+  }
+  const toolRawOp = extractRawTodoOp(toolRaw);
+  if (snap.rawOp !== undefined && toolRawOp !== undefined) {
+    return snap.rawOp === toolRawOp ? 1 : 0;
+  }
+  return 0;
+}
+
+function normalizeTodoOpName(rawArgs: unknown): TodoOp {
+  const raw = extractRawTodoOp(rawArgs);
+  return raw && (raw === 'view' || MUTATING_TODO_OPS.has(raw)) ? (raw as TodoOp) : 'view';
+}
+
+function mergeDistinctDiagnosticText(primary: string, secondary: string): string {
+  const a = primary.trim();
+  const b = secondary.trim();
+  if (!b || a.includes(b)) return a;
+  if (!a || b.includes(a)) return b;
+  return `${a}\n${b}`;
+}
 
 // ---------------------------------------------------------------------------
 // Data Models
@@ -131,7 +205,10 @@ export interface ToolCallItem {
   rawInput?: unknown;
   rawOutput?: unknown;
   exitCode?: number;
+  timedOut?: boolean;
   outputText: string;
+  /** Accumulated output text strictly from `failed` status updates onward. */
+  failureOutputText?: string;
   diffs: ToolDiffItem[];
   locations: ToolCallLocation[];
   readonly startedAt: number;
@@ -139,6 +216,8 @@ export interface ToolCallItem {
   tookMs?: number;
   /** True when reconstructed during `session/load` replay. */
   readonly replayed?: boolean;
+  /** Monotonic event sequence assigned when this tool call is first created. */
+  readonly eventSeq: number;
   collapsed: boolean;
   userToggled?: boolean;
   awaitingPermission: boolean;
@@ -159,6 +238,10 @@ export interface ToolCallItem {
     readonly isError: boolean;
     readonly text: string;
   };
+  /** True when the tool call targets agy's native `update_steps` tool. */
+  isUpdateSteps?: boolean;
+  /** Structured checklist entries captured from a native `update_steps` tool call. */
+  updateStepsEntries?: readonly PlanItemState[];
 }
 
 export type SubagentTspStatus =
@@ -189,6 +272,7 @@ export interface SubagentEntry {
 export interface AssistantSegment {
   readonly id: string;
   text: string;
+  readonly startedAt?: number;
 }
 
 export interface NoticeItem {
@@ -296,6 +380,10 @@ export interface TranscriptTurn {
   endedAt?: number;
   /** True when reconstructed during `session/load` replay where original turn duration is unknown. */
   readonly replayed?: boolean;
+  /** Replayed `<system-reminder>` todo phases checkpoint attached to this historical turn. */
+  replayedUserTodoPhases?: TodoPhase[];
+  /** Replay sequence of `replayedUserTodoPhases` for plan ownership comparison. */
+  replayedUserTodoSeq?: number;
   /** Monotonic per-turn mutation counter used for reliable view-level memo invalidation. */
   revision: number;
   /** Marked via `surface.settle('main.turn-<index>')`. */
@@ -411,6 +499,33 @@ export interface ApplySessionUpdateOptions {
   readonly expandAllTools?: boolean;
 }
 
+type PlanTimelineEvent =
+  | {
+      readonly phaseRank: 0 | 2;
+      readonly seq: number;
+      readonly kind: 'direct_plan';
+      readonly op: 'set' | 'clear' | 'remove';
+      readonly entries: readonly PlanItemState[];
+      readonly updatedAt: number;
+    }
+  | {
+      readonly phaseRank: 0 | 1 | 2;
+      readonly seq: number;
+      readonly kind: 'todo_mutation';
+      readonly source: 'todo_tool' | 'user';
+      readonly phases: readonly TodoPhase[];
+      readonly updatedAt: number;
+      readonly isRestoredAnchor?: boolean;
+    }
+  | {
+      readonly phaseRank: 0 | 2;
+      readonly seq: number;
+      readonly kind: 'update_steps';
+      readonly entries: readonly PlanItemState[];
+      readonly turn: TranscriptTurn;
+      readonly updatedAt: number;
+    };
+
 export interface TranscriptUpdateOutcome {
   readonly handled: boolean;
   readonly unknownUpdateType?: string;
@@ -466,6 +581,20 @@ function formatTimeLabel(timestamp: number): string {
   return formatTurnTime(timestamp, false);
 }
 
+function isUpdateStepsToolName(rawName?: string, title?: string): boolean {
+  const n = rawName?.trim().toLowerCase() ?? '';
+  if (n === 'update_steps' || n === 'default_api:update_steps') {
+    return true;
+  }
+  const t = title?.trim().toLowerCase() ?? '';
+  return (
+    t === 'update_steps' ||
+    t === 'run update_steps' ||
+    t === 'default_api:update_steps' ||
+    t === 'run default_api:update_steps'
+  );
+}
+
 /**
  * Estimate token count from raw text using a lightweight CJK-aware heuristic
  * (~4 chars/token for ASCII, ~1.5 chars/token for non-ASCII / CJK).
@@ -488,7 +617,7 @@ export function mapToolDisplayMeta(
   kind?: string,
   rawName?: string,
 ): { displayName: string; targetKind: TspToolTargetKind } {
-  if (isOmaTodoToolName(rawName)) {
+  if (isOmaTodoToolName(rawName) || isUpdateStepsToolName(rawName)) {
     return { displayName: 'todo', targetKind: 'text' };
   }
 
@@ -649,6 +778,33 @@ export function extractToolDurationFromOutput(outputText: string): number | unde
   const delta = completedMs - createdMs;
   if (delta < 0 || delta > 24 * 60 * 60 * 1000) return undefined;
   return delta;
+}
+
+/**
+ * Extract leading `agy` shell summary status (`Command exited with code N` or
+ * `Command timed out`) after optional `Created At:` / `Completed At:` headers.
+ */
+export function extractLeadingBashExitStatus(outputText: string): {
+  readonly exitCode?: number;
+  readonly timedOut?: boolean;
+} {
+  if (!outputText) return {};
+  const lines = outputText.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (/^(?:Created|Completed)\s+At:/i.test(trimmed)) continue;
+    const exitMatch = /^Command\s+exited\s+with\s+code\s+(-?\d+)\b/i.exec(trimmed);
+    if (exitMatch?.[1]) {
+      const code = Number(exitMatch[1]);
+      return Number.isFinite(code) ? { exitCode: code } : {};
+    }
+    if (/^Command\s+timed\s+out\b/i.test(trimmed)) {
+      return { timedOut: true };
+    }
+    return {};
+  }
+  return {};
 }
 
 function mapToolStatusToAgentStatus(status: TspToolStatus): SubagentTspStatus {
@@ -1615,13 +1771,21 @@ export class TranscriptStore {
   private _replayedTodoPhases: TodoPhase[] = [];
   private _todoToolCallCount = 0;
   private readonly _countedTodoToolIds = new Set<string>();
+  private _todoRevision = 0;
+  private _eventSeq = 0;
+  private _restoredAnchorMaxCount: number | null = null;
+  private _userTodoAnchorFloor = 0;
   private _hasUserTodoOverride = false;
+  private _hasLiveTodoMutation = false;
+  private _replayedTodoEvents: PlanTimelineEvent[] = [];
+  private _planEvents: PlanTimelineEvent[] = [];
   private readonly _pendingTodoSnapshots: Array<{
     readonly phases: TodoPhase[];
     readonly op: TodoOp;
     readonly isError: boolean;
     readonly text: string;
     readonly rawOp?: string;
+    readonly argsKey?: string;
   }> = [];
   private _activeTurnIndex: number | null = null;
 
@@ -1633,10 +1797,16 @@ export class TranscriptStore {
   private _compactedBeforeTurnIndex: number | null = null;
   private _showCompactedHistory = false;
   private _lastAppliedCheckpointStepIndex: number | null = null;
+  private _preferNativeSteps: boolean;
   private _idSeq = 1;
 
-  constructor(options: { now?: () => number } = {}) {
+  constructor(options: { now?: () => number; preferNativeSteps?: boolean } = {}) {
     this._now = options.now ?? (() => Date.now());
+    this._preferNativeSteps = options.preferNativeSteps ?? false;
+  }
+
+  setPreferNativeSteps(prefer: boolean): void {
+    this._preferNativeSteps = prefer;
   }
 
   get turns(): readonly TranscriptTurn[] {
@@ -1655,6 +1825,16 @@ export class TranscriptStore {
     return this._todoToolCallCount;
   }
 
+  get persistedTodoToolCallCount(): number {
+    return this._hasUserTodoOverride
+      ? Math.max(this._todoToolCallCount, this._userTodoAnchorFloor)
+      : this._todoToolCallCount;
+  }
+
+  get todoRevision(): number {
+    return this._todoRevision;
+  }
+
   get hasPersistedTodoState(): boolean {
     return (
       this._todoPhases.length > 0 ||
@@ -1663,40 +1843,80 @@ export class TranscriptStore {
     );
   }
 
+  get hasUserTodoOverride(): boolean {
+    return this._hasUserTodoOverride;
+  }
+
+  get replayedTodoPhases(): readonly TodoPhase[] {
+    return this._replayedTodoPhases;
+  }
+
   setTodoPhases(
     phases: readonly TodoPhase[],
-    options: { readonly source?: 'todo_tool' | 'user' } = {},
+    options: {
+      readonly source?: 'todo_tool' | 'user';
+      readonly isRestoringSessionAnchor?: boolean;
+      readonly restoredAnchorToolCallCount?: number;
+    } = {},
   ): void {
-    if (options.source === 'user') {
-      this._hasUserTodoOverride = true;
-    }
-    const cloned = cloneTodoPhases(phases).filter((phase) => phase.tasks.length > 0);
-    this._todoPhases = cloned;
-    if (cloned.length === 0) {
-      if (this._plan?.source === 'todo_tool') {
-        this._plan = null;
+    const source = options.source ?? 'todo_tool';
+    const cleaned = cloneTodoPhases(phases).filter((phase) => phase.tasks.length > 0);
+    const isRestoringAnchor =
+      options.isRestoringSessionAnchor === true ||
+      options.restoredAnchorToolCallCount !== undefined;
+
+    if (isRestoringAnchor) {
+      const maxCount = options.restoredAnchorToolCallCount ?? this._todoToolCallCount;
+      this._planEvents = this._planEvents.filter(
+        (e) => !(e.kind === 'todo_mutation' && e.isRestoredAnchor),
+      );
+      if (this._todoToolCallCount > maxCount) {
+        this._restoredAnchorMaxCount = null;
+        this.recomputeReplayedTodos();
+        return;
       }
+      this._restoredAnchorMaxCount = source === 'user' ? maxCount : null;
+      this._hasUserTodoOverride = source === 'user';
+      this._userTodoAnchorFloor =
+        source === 'user'
+          ? Math.max(this._userTodoAnchorFloor, maxCount, this._todoToolCallCount)
+          : 0;
+      this._todoPhases = cleaned;
+      this._todoRevision += 1;
+      this._planEvents.push({
+        phaseRank: 1,
+        seq: ++this._eventSeq,
+        kind: 'todo_mutation',
+        source,
+        phases: cleaned,
+        updatedAt: this._now(),
+        isRestoredAnchor: true,
+      });
+      this.deriveEffectivePlan();
       return;
     }
 
-    const checklistPhases = mapTodoPhasesToChecklist(cloned);
-    const entries: PlanItemState[] = checklistPhases.flatMap((phase) =>
-      phase.items.map((item) => ({
-        id: item.id,
-        text: item.text,
-        ...(item.note !== undefined ? { note: item.note } : {}),
-        status: item.status,
-      })),
-    );
-    this._plan = {
-      entries,
-      phases: checklistPhases,
-      source: 'todo_tool',
+    this._hasLiveTodoMutation = true;
+    this._restoredAnchorMaxCount = null;
+    this._hasUserTodoOverride = source === 'user';
+    this._userTodoAnchorFloor =
+      source === 'user' ? Math.max(this._userTodoAnchorFloor, this._todoToolCallCount) : 0;
+    this._todoPhases = cleaned;
+    this._todoRevision += 1;
+    this._planEvents.push({
+      phaseRank: 2,
+      seq: ++this._eventSeq,
+      kind: 'todo_mutation',
+      source,
+      phases: cleaned,
       updatedAt: this._now(),
-    };
+    });
+    this.deriveEffectivePlan();
   }
 
   applyLiveTodoToolResult(event: TodoServerUpdateEvent): void {
+    const rawOp = extractRawTodoOp(event.rawArgs);
+    const argsKey = canonicalTodoArgsKey(event.rawArgs);
     const snapshot = {
       phases: cloneTodoPhases(event.phases),
       op: event.op,
@@ -1707,14 +1927,26 @@ export class TranscriptStore {
       this.setTodoPhases(snapshot.phases, { source: 'todo_tool' });
     }
 
+    const candidate = { rawOp, argsKey, isError: event.isError };
     let matchedTool: { turn: TranscriptTurn; tool: ToolCallItem } | undefined;
-    for (let i = this._turns.length - 1; i >= 0 && !matchedTool; i--) {
+    let bestScore = 0;
+    for (let i = 0; i < this._turns.length && bestScore < 2; i++) {
       const turn = this._turns[i]!;
-      for (let j = turn.toolCalls.length - 1; j >= 0; j--) {
+      for (let j = 0; j < turn.toolCalls.length; j++) {
         const tool = turn.toolCalls[j]!;
-        if ((tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title)) && !tool.todoSnapshot) {
-          matchedTool = { turn, tool };
-          break;
+        if (
+          !tool.replayed &&
+          (tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title)) &&
+          !tool.todoSnapshot
+        ) {
+          const score = scoreTodoSnapshotMatch(candidate, tool);
+          if (score > bestScore) {
+            bestScore = score;
+            matchedTool = { turn, tool };
+            if (score === 2) {
+              break;
+            }
+          }
         }
       }
     }
@@ -1724,12 +1956,10 @@ export class TranscriptStore {
       return;
     }
 
-    const argRec = asRecord(event.rawArgs);
-    const rawOp = typeof argRec?.op === 'string' ? argRec.op.trim().toLowerCase() : undefined;
     if (this._pendingTodoSnapshots.length >= MAX_PENDING_TODO_SNAPSHOTS) {
       this._pendingTodoSnapshots.shift();
     }
-    this._pendingTodoSnapshots.push({ ...snapshot, rawOp });
+    this._pendingTodoSnapshots.push({ ...snapshot, rawOp, argsKey });
   }
 
   addInfoNotice(text: string, level: NoticeItem['level'] = 'info'): void {
@@ -2230,7 +2460,11 @@ export class TranscriptStore {
     const now = this._now();
     this._detachedBgTasks.clear();
     this._settledTranscriptTaskIds.clear();
+    let hasAnyReplayedTodoState = false;
     for (const turn of this._turns) {
+      if (turn.replayedUserTodoPhases !== undefined) {
+        hasAnyReplayedTodoState = true;
+      }
       if (turn.status === 'streaming') {
         turn.status = 'done';
         turn.endedAt = turn.endedAt ?? now;
@@ -2265,19 +2499,25 @@ export class TranscriptStore {
           }
           this.syncSubagentsForTool(turn, tool);
         }
-        if (tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title)) {
-          this.recordTodoToolCall(tool.toolCallId);
+        if (tool.replayed && (tool.isOmaTodo || isOmaTodoToolName(tool.rawName, tool.title))) {
+          hasAnyReplayedTodoState = true;
           tool.isOmaTodo = true;
           tool.displayName = 'todo';
           tool.targetKind = 'text';
           tool.title = 'Todo';
           tool.intent = undefined;
-          if (!tool.todoSnapshot && (tool.rawInput !== undefined || tool.args !== undefined)) {
-            this.applyReplayedTodoTool(turn, tool);
-          }
         }
       }
       this.bumpTurn(turn);
+    }
+    this._hasLiveTodoMutation = false;
+    this._restoredAnchorMaxCount = null;
+    this._userTodoAnchorFloor = 0;
+    this._planEvents = this._planEvents.filter((e) => e.phaseRank === 0);
+    if (hasAnyReplayedTodoState) {
+      this.recomputeReplayedTodos();
+    } else {
+      this.deriveEffectivePlan();
     }
     this._activeTurnIndex = null;
   }
@@ -2340,9 +2580,10 @@ export class TranscriptStore {
             const extracted = extractUserTodoSyncReminderFromText(activeUser.text);
             if (extracted.hasReminder) {
               activeUser.text = extracted.strippedText;
-              if (extracted.phases !== undefined) {
-                this._replayedTodoPhases = cloneTodoPhases(extracted.phases);
-                this.setTodoPhases(extracted.phases, { source: 'user' });
+              if (extracted.phases !== undefined && this.activeTurn) {
+                this.activeTurn.replayedUserTodoPhases = cloneTodoPhases(extracted.phases);
+                this.activeTurn.replayedUserTodoSeq = ++this._eventSeq;
+                this.recomputeReplayedTodos();
               }
             }
           }
@@ -2430,6 +2671,7 @@ export class TranscriptStore {
           const seg: AssistantSegment = {
             id: `msg-${this._idSeq++}`,
             text: chunkText,
+            startedAt: this._now(),
           };
           turn.assistantSegments.push(seg);
           turn.timeline.push({ kind: 'assistant', id: seg.id });
@@ -2460,21 +2702,33 @@ export class TranscriptStore {
           });
         }
         const entries = update.entries ?? [];
-        this._plan = {
+        this._planEvents.push({
+          phaseRank: isReplaying ? 0 : 2,
+          seq: ++this._eventSeq,
+          kind: 'direct_plan',
+          op: entries.length === 0 ? 'clear' : 'set',
           entries: entries.map((e, idx) => ({
             id: `plan-${idx}`,
             text: e.content,
             ...(e.priority !== undefined ? { priority: e.priority } : {}),
             status: mapPlanStatusToChecklist(e.status),
           })),
-          source: 'acp',
           updatedAt: now,
-        };
+        });
+        this.deriveEffectivePlan();
         return { handled: true };
       }
 
       case 'plan_removed': {
-        this._plan = null;
+        this._planEvents.push({
+          phaseRank: isReplaying ? 0 : 2,
+          seq: ++this._eventSeq,
+          kind: 'direct_plan',
+          op: 'remove',
+          entries: [],
+          updatedAt: this._now(),
+        });
+        this.deriveEffectivePlan();
         return { handled: true };
       }
 
@@ -2657,6 +2911,9 @@ export class TranscriptStore {
     tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
       awaitingPermission: true,
       cancelled: tool.cancelled,
+      exitCode: tool.exitCode,
+      timedOut: tool.timedOut,
+      backgroundRunning: tool.backgroundRunning,
     });
 
     const entry = this._toolIndex.get(tool.toolCallId);
@@ -2696,6 +2953,9 @@ export class TranscriptStore {
         tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
           awaitingPermission: false,
           cancelled: tool.cancelled,
+          exitCode: tool.exitCode,
+          timedOut: tool.timedOut,
+          backgroundRunning: tool.backgroundRunning,
         });
       }
     }
@@ -3510,7 +3770,14 @@ export class TranscriptStore {
     this._replayedTodoPhases = [];
     this._todoToolCallCount = 0;
     this._countedTodoToolIds.clear();
+    this._todoRevision = 0;
+    this._eventSeq = 0;
+    this._restoredAnchorMaxCount = null;
+    this._userTodoAnchorFloor = 0;
     this._hasUserTodoOverride = false;
+    this._hasLiveTodoMutation = false;
+    this._replayedTodoEvents = [];
+    this._planEvents = [];
     this._pendingTodoSnapshots.length = 0;
     this._activeTurnIndex = null;
     this._toolIndex.clear();
@@ -3678,18 +3945,24 @@ export class TranscriptStore {
         tool.intent = nextIntent;
       }
 
+      let deltaRawOutText = '';
       if (fields.rawOutput !== undefined) {
         tool.rawOutput = fields.rawOutput;
         const exitCode = extractToolExitCode(fields.rawOutput);
         if (exitCode !== undefined) {
           tool.exitCode = exitCode;
         }
+        if (isToolRawOutputTimedOut(fields.rawOutput)) {
+          tool.timedOut = true;
+        }
         const rawOutText = extractToolOutputText(fields.rawOutput);
         if (rawOutText !== undefined && rawOutText.length > 0) {
+          deltaRawOutText = rawOutText.trim();
           tool.outputText = rawOutText;
         }
       }
 
+      let deltaContentText = '';
       if (fields.content !== undefined) {
         const diffs = extractDiffItems(fields.content);
         if (diffs.length > 0) {
@@ -3697,13 +3970,26 @@ export class TranscriptStore {
         }
         const contentText = extractToolContentText(fields.content);
         if (contentText.length > 0) {
+          deltaContentText = contentText.trim();
           tool.outputText =
             tool.outputText.length > 0 && !tool.outputText.includes(contentText)
               ? `${tool.outputText}\n${contentText}`
               : contentText;
         }
       }
+      const deltaOutputText = mergeDistinctDiagnosticText(deltaContentText, deltaRawOutText);
 
+      if (tool.displayName === 'bash' && tool.outputText.length > 0) {
+        const leadingStatus = extractLeadingBashExitStatus(tool.outputText);
+        if (tool.exitCode === undefined && leadingStatus.exitCode !== undefined) {
+          tool.exitCode = leadingStatus.exitCode;
+        }
+        if (leadingStatus.timedOut) {
+          tool.timedOut = true;
+        }
+      }
+
+      const prevAcpStatus = tool.acpStatus;
       if (fields.status !== undefined) {
         tool.acpStatus = fields.status;
         if (fields.status === 'completed' || fields.status === 'failed') {
@@ -3719,10 +4005,25 @@ export class TranscriptStore {
           }
         }
       }
+      if (tool.acpStatus === 'failed') {
+        if (prevAcpStatus !== 'failed') {
+          tool.failureOutputText = deltaOutputText;
+        } else if (deltaOutputText.length > 0) {
+          tool.failureOutputText = mergeDistinctDiagnosticText(
+            tool.failureOutputText ?? '',
+            deltaOutputText,
+          );
+        }
+      } else if (prevAcpStatus === 'failed') {
+        tool.failureOutputText = undefined;
+      }
 
       tool.status = mapAcpToolStatusToTsp(tool.acpStatus, {
         awaitingPermission: tool.awaitingPermission,
         cancelled: tool.cancelled,
+        exitCode: tool.exitCode,
+        timedOut: tool.timedOut,
+        backgroundRunning: tool.backgroundRunning,
       });
 
       if (existingTurn) {
@@ -3730,7 +4031,8 @@ export class TranscriptStore {
         if (!isReplaying) {
           this.syncBackgroundTaskForTool(existingTurn.index, tool);
         }
-        this.syncTodoToolState(existingTurn, tool, isReplaying);
+        this.syncTodoToolState(existingTurn, tool, isReplaying, { deltaOutputText });
+        this.syncUpdateStepsToolState(tool);
       }
       return tool;
     }
@@ -3749,10 +4051,22 @@ export class TranscriptStore {
       path: normalizeDisplayPath(loc.path),
     }));
     const acpStatus: ToolCallStatus = fields.status ?? 'pending';
-    const exitCode = extractToolExitCode(fields.rawOutput);
+    let exitCode = extractToolExitCode(fields.rawOutput);
+    let timedOut = isToolRawOutputTimedOut(fields.rawOutput);
     const contentText = extractToolContentText(fields.content);
     const rawOutText = extractToolOutputText(fields.rawOutput) ?? '';
     const outputText = contentText || rawOutText;
+    const initialFailureText =
+      acpStatus === 'failed' ? mergeDistinctDiagnosticText(contentText, rawOutText) : '';
+    if (meta.displayName === 'bash' && outputText.length > 0) {
+      const leadingStatus = extractLeadingBashExitStatus(outputText);
+      if (exitCode === undefined && leadingStatus.exitCode !== undefined) {
+        exitCode = leadingStatus.exitCode;
+      }
+      if (leadingStatus.timedOut) {
+        timedOut = true;
+      }
+    }
     const diffs = extractDiffItems(fields.content);
     const title = normalizeDisplayPath(fields.title || fields.name || meta.displayName);
     const target = extractToolTarget(
@@ -3775,7 +4089,7 @@ export class TranscriptStore {
     const tool: ToolCallItem = {
       toolCallId: fields.toolCallId,
       acpStatus,
-      status: mapAcpToolStatusToTsp(acpStatus),
+      status: mapAcpToolStatusToTsp(acpStatus, { exitCode, timedOut }),
       ...(fields.kind !== undefined ? { kind: fields.kind } : {}),
       ...(fields.name !== undefined ? { rawName: fields.name } : {}),
       displayName: meta.displayName,
@@ -3787,7 +4101,9 @@ export class TranscriptStore {
       ...(fields.rawInput !== undefined ? { rawInput: fields.rawInput } : {}),
       ...(fields.rawOutput !== undefined ? { rawOutput: fields.rawOutput } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(timedOut ? { timedOut: true } : {}),
       outputText,
+      ...(initialFailureText.length > 0 ? { failureOutputText: initialFailureText } : {}),
       diffs,
       locations,
       startedAt: now,
@@ -3802,6 +4118,7 @@ export class TranscriptStore {
           }
         : {}),
       ...(isReplaying ? { replayed: true } : {}),
+      eventSeq: ++this._eventSeq,
       collapsed: options.defaultCollapsed ?? true,
       awaitingPermission: false,
       cancelled: false,
@@ -3814,7 +4131,10 @@ export class TranscriptStore {
     if (!isReplaying) {
       this.syncBackgroundTaskForTool(turn.index, tool);
     }
-    this.syncTodoToolState(turn, tool, isReplaying);
+    this.syncTodoToolState(turn, tool, isReplaying, {
+      deltaOutputText: initialFailureText || outputText.trim(),
+    });
+    this.syncUpdateStepsToolState(tool);
 
     return tool;
   }
@@ -3823,6 +4143,12 @@ export class TranscriptStore {
     if (!this._countedTodoToolIds.has(toolCallId)) {
       this._countedTodoToolIds.add(toolCallId);
       this._todoToolCallCount += 1;
+    }
+  }
+
+  private unrecordTodoToolCall(toolCallId: string): void {
+    if (this._countedTodoToolIds.delete(toolCallId)) {
+      this._todoToolCallCount = Math.max(0, this._todoToolCallCount - 1);
     }
   }
 
@@ -3836,7 +4162,11 @@ export class TranscriptStore {
       readonly text: string;
     },
   ): void {
-    this.recordTodoToolCall(tool.toolCallId);
+    if (!snapshot.isError && MUTATING_TODO_OPS.has(snapshot.op) && tool.acpStatus !== 'failed') {
+      this.recordTodoToolCall(tool.toolCallId);
+    } else {
+      this.unrecordTodoToolCall(tool.toolCallId);
+    }
     tool.isOmaTodo = true;
     tool.displayName = 'todo';
     tool.targetKind = 'text';
@@ -3857,29 +4187,229 @@ export class TranscriptStore {
     this.bumpTurn(turn);
   }
 
-  private applyReplayedTodoTool(turn: TranscriptTurn, tool: ToolCallItem): void {
-    const rawArgs = tool.rawInput ?? tool.args;
-    if (rawArgs === undefined) return;
-    const outcome = applyTodoOperation(this._replayedTodoPhases, rawArgs);
-    if (!outcome.isError && outcome.op !== 'view' && tool.acpStatus !== 'failed') {
-      this._replayedTodoPhases = cloneTodoPhases(outcome.phases);
-      this.setTodoPhases(outcome.phases, { source: 'todo_tool' });
+  private buildTodoPlanState(phases: readonly TodoPhase[], updatedAt: number): PlanState {
+    const checklistPhases = mapTodoPhasesToChecklist(phases);
+    const entries: PlanItemState[] = checklistPhases.flatMap((phase) =>
+      phase.items.map((item) => ({
+        id: item.id,
+        text: item.text,
+        ...(item.note !== undefined ? { note: item.note } : {}),
+        status: item.status,
+      })),
+    );
+    return {
+      entries,
+      phases: checklistPhases,
+      source: 'todo_tool',
+      updatedAt,
+    };
+  }
+
+  private arePlansStructurallyEqual(a: PlanState | null, b: PlanState | null): boolean {
+    if (a === b) return true;
+    if (!a || !b || a.source !== b.source) return false;
+    return (
+      JSON.stringify(a.entries) === JSON.stringify(b.entries) &&
+      JSON.stringify(a.phases ?? null) === JSON.stringify(b.phases ?? null)
+    );
+  }
+
+  private deriveEffectivePlan(): void {
+    const events: PlanTimelineEvent[] = [...this._replayedTodoEvents, ...this._planEvents];
+    for (const turn of this._turns) {
+      for (const tool of turn.toolCalls) {
+        if (
+          tool.isUpdateSteps &&
+          tool.acpStatus === 'completed' &&
+          tool.updateStepsEntries !== undefined
+        ) {
+          events.push({
+            phaseRank: tool.replayed ? 0 : 2,
+            seq: tool.eventSeq,
+            kind: 'update_steps',
+            entries: tool.updateStepsEntries,
+            turn,
+            updatedAt: tool.endedAt ?? tool.startedAt,
+          });
+        }
+      }
     }
-    this.assignTodoSnapshotToTool(turn, tool, {
-      phases: outcome.phases,
-      op: outcome.op,
-      isError: outcome.isError,
-      text: outcome.text,
-    });
+    events.sort((a, b) => (a.phaseRank !== b.phaseRank ? a.phaseRank - b.phaseRank : a.seq - b.seq));
+
+    let nextPlan: PlanState | null = null;
+    let runningTodoPhases: readonly TodoPhase[] = [];
+
+    for (const ev of events) {
+      if (ev.kind === 'todo_mutation') {
+        runningTodoPhases = ev.phases;
+        if (ev.phases.length > 0) {
+          nextPlan = this.buildTodoPlanState(ev.phases, ev.updatedAt);
+        } else if (ev.source === 'todo_tool' || nextPlan?.source === 'todo_tool') {
+          nextPlan = null;
+        }
+      } else if (ev.kind === 'direct_plan') {
+        if (ev.op === 'remove') {
+          nextPlan = null;
+        } else if (ev.op === 'clear') {
+          if (nextPlan?.source === 'acp') {
+            nextPlan = null;
+          }
+        } else {
+          nextPlan = {
+            entries: ev.entries.map((e) => ({ ...e })),
+            source: 'acp',
+            updatedAt: ev.updatedAt,
+          };
+        }
+      } else if (ev.entries.length === 0) {
+        if (nextPlan?.source === 'acp') {
+          nextPlan = null;
+        }
+      } else {
+        const turnHasActiveOmaTodo = ev.turn.toolCalls.some((t) => {
+          if (!t.isOmaTodo || t.acpStatus === 'failed' || t.todoSnapshot?.isError) return false;
+          const op = t.todoSnapshot?.op ?? extractRawTodoOp(getEffectiveTodoToolRawInput(t));
+          return op !== 'view';
+        });
+        const canTakeOverPlan =
+          nextPlan?.source !== 'todo_tool' ||
+          (!turnHasActiveOmaTodo &&
+            (this._preferNativeSteps || areAllTodosFinished(runningTodoPhases)));
+        if (canTakeOverPlan) {
+          nextPlan = {
+            entries: ev.entries.map((e) => ({ ...e })),
+            source: 'acp',
+            updatedAt: ev.updatedAt,
+          };
+        }
+      }
+    }
+
+    if (!this.arePlansStructurallyEqual(this._plan, nextPlan)) {
+      this._plan = nextPlan;
+    }
+  }
+
+  private recomputeReplayedTodos(): void {
+    let phases: TodoPhase[] = [];
+    const replayedEvents: PlanTimelineEvent[] = [];
+    for (const id of [...this._countedTodoToolIds]) {
+      const entry = this._toolIndex.get(id);
+      if (!entry || entry.tool.replayed) {
+        this.unrecordTodoToolCall(id);
+      }
+    }
+
+    for (const turn of this._turns) {
+      if (turn.replayedUserTodoPhases !== undefined) {
+        phases = cloneTodoPhases(turn.replayedUserTodoPhases);
+        const cleaned = cloneTodoPhases(phases).filter((p) => p.tasks.length > 0);
+        replayedEvents.push({
+          phaseRank: 0,
+          seq: turn.replayedUserTodoSeq ?? 0,
+          kind: 'todo_mutation',
+          source: 'user',
+          phases: cleaned,
+          updatedAt: turn.createdAt,
+        });
+      }
+      for (const tool of turn.toolCalls) {
+        if (!tool.replayed) continue;
+        if (!tool.isOmaTodo && !isOmaTodoToolName(tool.rawName, tool.title)) continue;
+        tool.isOmaTodo = true;
+        tool.displayName = 'todo';
+        tool.targetKind = 'text';
+        tool.title = 'Todo';
+        tool.intent = undefined;
+        if (!tool.userToggled) {
+          tool.collapsed = false;
+        }
+
+        const rawArgs = getEffectiveTodoToolRawInput(tool);
+        if (tool.acpStatus === 'failed') {
+          this.assignTodoSnapshotToTool(turn, tool, {
+            phases: [],
+            op: normalizeTodoOpName(rawArgs),
+            isError: true,
+            text: tool.failureOutputText?.trim() || FALLBACK_FAILED_TODO_TEXT,
+          });
+        } else if (tool.acpStatus === 'completed') {
+          if (rawArgs === undefined) {
+            tool.todoSnapshot = undefined;
+            tool.target = undefined;
+            this.bumpTurn(turn);
+          } else {
+            const outcome = applyTodoOperation(phases, rawArgs);
+            if (!outcome.isError && MUTATING_TODO_OPS.has(outcome.op)) {
+              phases = cloneTodoPhases(outcome.phases);
+              const cleaned = cloneTodoPhases(phases).filter((p) => p.tasks.length > 0);
+              replayedEvents.push({
+                phaseRank: 0,
+                seq: tool.eventSeq,
+                kind: 'todo_mutation',
+                source: 'todo_tool',
+                phases: cleaned,
+                updatedAt: tool.endedAt ?? tool.startedAt,
+              });
+            }
+            this.assignTodoSnapshotToTool(turn, tool, {
+              phases: outcome.phases,
+              op: outcome.op,
+              isError: outcome.isError,
+              text: outcome.text,
+            });
+          }
+        } else {
+          tool.todoSnapshot = undefined;
+          tool.target = undefined;
+        }
+      }
+    }
+
+    this._replayedTodoEvents = replayedEvents;
+    this._replayedTodoPhases = cloneTodoPhases(phases);
+
+    if (this._hasLiveTodoMutation) {
+      this.deriveEffectivePlan();
+      return;
+    }
+
+    if (this._restoredAnchorMaxCount !== null) {
+      if (this._todoToolCallCount <= this._restoredAnchorMaxCount) {
+        this._userTodoAnchorFloor = Math.max(
+          this._userTodoAnchorFloor,
+          this._restoredAnchorMaxCount,
+          this._todoToolCallCount,
+        );
+        this.deriveEffectivePlan();
+        return;
+      }
+      this._restoredAnchorMaxCount = null;
+      this._planEvents = this._planEvents.filter(
+        (e) => !(e.kind === 'todo_mutation' && e.isRestoredAnchor),
+      );
+    }
+
+    const nextCleaned = cloneTodoPhases(phases).filter((phase) => phase.tasks.length > 0);
+    if (
+      JSON.stringify(nextCleaned) !== JSON.stringify(this._todoPhases) ||
+      this._hasUserTodoOverride
+    ) {
+      this._todoPhases = nextCleaned;
+      this._todoRevision += 1;
+    }
+    this._hasUserTodoOverride = false;
+    this._userTodoAnchorFloor = 0;
+    this.deriveEffectivePlan();
   }
 
   private syncTodoToolState(
     turn: TranscriptTurn,
     tool: ToolCallItem,
     isReplaying: boolean,
+    options: { readonly deltaOutputText?: string } = {},
   ): void {
     if (!tool.isOmaTodo && !isOmaTodoToolName(tool.rawName, tool.title)) return;
-    this.recordTodoToolCall(tool.toolCallId);
     tool.isOmaTodo = true;
     tool.displayName = 'todo';
     tool.targetKind = 'text';
@@ -3888,7 +4418,45 @@ export class TranscriptStore {
     if (!tool.userToggled) {
       tool.collapsed = false;
     }
+
+    if (isReplaying || tool.replayed) {
+      this.recomputeReplayedTodos();
+      return;
+    }
+
     if (tool.todoSnapshot) {
+      if (tool.acpStatus === 'failed') {
+        this.unrecordTodoToolCall(tool.toolCallId);
+        const failedErrText =
+          tool.failureOutputText?.trim() || options.deltaOutputText?.trim() || '';
+        if (!tool.todoSnapshot.isError) {
+          tool.todoSnapshot = {
+            phases: [],
+            op: tool.todoSnapshot.op,
+            isError: true,
+            text: failedErrText || FALLBACK_FAILED_TODO_TEXT,
+          };
+          this.bumpTurn(turn);
+        } else {
+          const nextOp =
+            tool.todoSnapshot.op === 'view'
+              ? normalizeTodoOpName(getEffectiveTodoToolRawInput(tool))
+              : tool.todoSnapshot.op;
+          const shouldUpgradeText =
+            failedErrText.length > 0 && failedErrText !== tool.todoSnapshot.text;
+          if (shouldUpgradeText || nextOp !== tool.todoSnapshot.op) {
+            tool.todoSnapshot = {
+              phases: [],
+              op: nextOp,
+              isError: true,
+              text: shouldUpgradeText ? failedErrText : tool.todoSnapshot.text,
+            };
+            this.bumpTurn(turn);
+          }
+        }
+        tool.target = undefined;
+        return;
+      }
       const total = tool.todoSnapshot.phases.reduce((sum, p) => sum + p.tasks.length, 0);
       const done = tool.todoSnapshot.phases.reduce(
         (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
@@ -3898,26 +4466,109 @@ export class TranscriptStore {
       return;
     }
 
-    if (isReplaying) {
-      if (tool.acpStatus === 'completed' || tool.acpStatus === 'failed') {
-        this.applyReplayedTodoTool(turn, tool);
+    if (!tool.replayed && this._pendingTodoSnapshots.length > 0) {
+      let matchIdx = -1;
+      let bestScore = 0;
+      for (let i = 0; i < this._pendingTodoSnapshots.length; i++) {
+        const snap = this._pendingTodoSnapshots[i]!;
+        const score = scoreTodoSnapshotMatch(snap, tool);
+        if (score > bestScore) {
+          bestScore = score;
+          matchIdx = i;
+          if (score === 2) {
+            break;
+          }
+        }
       }
-      return;
-    }
-
-    if (this._pendingTodoSnapshots.length > 0) {
-      const argRec = asRecord(tool.rawInput) ?? asRecord(tool.args);
-      const opVal = typeof argRec?.op === 'string' ? argRec.op.trim().toLowerCase() : undefined;
-      const matchIdx = opVal
-        ? this._pendingTodoSnapshots.findIndex((s) => s.rawOp === opVal)
-        : tool.acpStatus === 'completed' || tool.acpStatus === 'failed'
-          ? 0
-          : -1;
       if (matchIdx >= 0) {
         const pending = this._pendingTodoSnapshots.splice(matchIdx, 1)[0];
         if (pending) {
           this.assignTodoSnapshotToTool(turn, tool, pending);
+          return;
         }
+      }
+    }
+
+    if (tool.acpStatus === 'failed') {
+      this.unrecordTodoToolCall(tool.toolCallId);
+      tool.target = undefined;
+    }
+  }
+
+  private syncUpdateStepsToolState(tool: ToolCallItem): void {
+    if (!tool.isUpdateSteps && !isUpdateStepsToolName(tool.rawName, tool.title)) {
+      return;
+    }
+    tool.isUpdateSteps = true;
+    tool.displayName = 'todo';
+    tool.targetKind = 'text';
+    tool.title = 'Todo';
+    tool.intent = undefined;
+    if (tool.acpStatus === 'failed') {
+      tool.target = undefined;
+      tool.updateStepsEntries = undefined;
+      this.deriveEffectivePlan();
+      return;
+    }
+    const parseRawSteps = (source: unknown): unknown[] | undefined => {
+      let rec = asRecord(source);
+      if (!rec && typeof source === 'string') {
+        try {
+          rec = asRecord(JSON.parse(source));
+        } catch {
+          return undefined;
+        }
+      }
+      let candidate: unknown = rec?.steps;
+      if (typeof candidate === 'string') {
+        try {
+          candidate = JSON.parse(candidate);
+        } catch {
+          return undefined;
+        }
+      }
+      return Array.isArray(candidate) ? candidate : undefined;
+    };
+    const rawSteps = parseRawSteps(tool.rawInput) ?? parseRawSteps(tool.args);
+    if (!rawSteps) {
+      return;
+    }
+    if (rawSteps.length === 0) {
+      tool.updateStepsEntries = [];
+      tool.target = undefined;
+      if (tool.acpStatus === 'completed') {
+        this.deriveEffectivePlan();
+      }
+      return;
+    }
+    const entries: PlanItemState[] = [];
+    for (let idx = 0; idx < rawSteps.length; idx++) {
+      const step = asRecord(rawSteps[idx]);
+      if (!step) continue;
+      const title = typeof step.title === 'string' ? step.title.trim() : '';
+      const status = typeof step.status === 'string' ? step.status.trim() : '';
+      if (!title || !status) continue;
+      entries.push({
+        id: `plan-${idx}`,
+        text: title,
+        status: mapPlanStatusToChecklist(status),
+      });
+    }
+    if (entries.length > 0) {
+      tool.updateStepsEntries = entries;
+      const doneCount = entries.filter((e) => e.status === 'done').length;
+      const skippedCount = entries.filter((e) => e.status === 'dropped').length;
+      const failedCount = entries.filter((e) => e.status === 'blocked').length;
+      const extraParts = [
+        skippedCount > 0 ? `${skippedCount} skipped` : '',
+        failedCount > 0 ? `${failedCount} failed` : '',
+      ].filter(Boolean);
+      tool.target =
+        extraParts.length > 0
+          ? `${doneCount}/${entries.length} (${extraParts.join(', ')})`
+          : `${doneCount}/${entries.length}`;
+      if (tool.acpStatus === 'completed') {
+        this.deriveEffectivePlan();
       }
     }
   }

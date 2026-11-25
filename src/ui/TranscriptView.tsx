@@ -4,14 +4,13 @@ import type { ToolDisplayMode } from '../config/config';
 import type { ApprovalAction } from '../state/approval';
 import type { AppState } from '../state/store';
 import { WELCOME_LOGO_HEIGHT, WELCOME_LOGO_WIDTH } from './assets';
-import { isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
+import { isChecklistStatusFinished, isTodoTaskFinished, mapTodoPhasesToChecklist } from '../state/todo';
 import {
   estimateTokensFromText,
   formatFullLocalTime,
   formatTurnTime,
   type ActiveQuestionCard,
   type NoticeItem,
-  type PlanState,
   type SubagentEntry,
   type ToolCallItem,
   type ToolDiffItem,
@@ -54,7 +53,6 @@ export interface TranscriptCallbacks {
 export interface TranscriptViewProps {
   readonly state: AppState;
   readonly turns: readonly TranscriptTurn[];
-  readonly plan: PlanState | null;
   readonly version: string;
   readonly toolPreviewLines: number;
   readonly evictedNodeIds?: ReadonlySet<string>;
@@ -444,7 +442,9 @@ function renderBashRunBody(
           ? 'cancelled'
           : tool.exitCode !== undefined
             ? `exit ${tool.exitCode}`
-            : tool.status;
+            : tool.timedOut
+              ? 'timed out'
+              : tool.status;
   const stateStyle = isBgRunning
     ? 'warning mono'
     : tool.status === 'error' || (tool.exitCode !== undefined && tool.exitCode !== 0)
@@ -675,53 +675,60 @@ function renderToolItem(
   if (tool.isOmaTodo) {
     const snap = tool.todoSnapshot;
     const status = snap?.isError ? 'error' : isToolRunning ? 'running' : effectiveStatus;
+    const nonEmptyPhases = snap && !snap.isError ? snap.phases.filter(p => p.tasks.length > 0) : [];
+    const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
+    const done = nonEmptyPhases.reduce(
+      (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+      0
+    );
+    const rawRec =
+      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
+        ? (tool.rawInput as Record<string, unknown>)
+        : tool.args;
+    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
+    const failedText =
+      tool.acpStatus === 'failed' ? (tool.failureOutputText?.trim() ?? '') : '';
+    const target = snap
+      ? !snap.isError && total > 0
+        ? `${done}/${total}`
+        : undefined
+      : tool.acpStatus === 'failed'
+        ? undefined
+        : inFlightOp;
+    const collapsed = snap
+      ? false
+      : tool.acpStatus === 'failed' && failedText.length > 0
+        ? false
+        : undefined;
+    const errText = snap?.isError
+      ? failedText || snap.text || 'Todo operation failed'
+      : tool.acpStatus === 'failed'
+        ? failedText
+        : '';
 
-    if (snap?.isError) {
-      return (
-        <tool
-          key={nodeKey}
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          status={status}
-          age={toolAge}
-          took={toolTook}
-          frame="card"
-          preview="none"
-          collapsed={false}
-        >
-          <text
-            key="err"
-            spans={[{ t: snap.text || 'Todo operation failed', s: 'error' }]}
-            wrap="word"
-          />
-        </tool>
-      );
-    }
-
-    if (snap) {
-      const nonEmptyPhases = snap.phases.filter(p => p.tasks.length > 0);
-      const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
-      const done = nonEmptyPhases.reduce(
-        (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
-        0
-      );
-      return (
-        <tool
-          key={nodeKey}
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          target={total > 0 ? `${done}/${total}` : undefined}
-          targetKind={total > 0 ? 'text' : undefined}
-          status={status}
-          age={toolAge}
-          took={toolTook}
-          frame="card"
-          preview="none"
-          collapsed={false}
-        >
-          {total === 0 ? (
+    return (
+      <tool
+        key={nodeKey}
+        role="omp.tool.todo"
+        name="todo"
+        title="Todo"
+        target={target}
+        targetKind={target ? 'text' : undefined}
+        status={status}
+        age={toolAge}
+        took={toolTook}
+        frame="card"
+        preview="none"
+        collapsed={collapsed}
+        confirm={isAsk ? 'card' : undefined}
+        ask={isAsk ? tool.ask : undefined}
+        approved={tool.approved}
+        onAction={approvalHandlers}
+      >
+        {errText ? (
+          <text key="err" spans={[{ t: errText, s: 'error' }]} wrap="word" />
+        ) : snap ? (
+          total === 0 ? (
             <text
               key="empty"
               spans={[{ t: snap.text || 'No todos', s: 'muted' }]}
@@ -733,34 +740,82 @@ function renderToolItem(
               mode="full"
               phases={mapTodoPhasesToChecklist(nonEmptyPhases)}
             />
-          )}
-        </tool>
-      );
-    }
+          )
+        ) : undefined}
+      </tool>
+    );
+  }
 
-    const rawRec =
-      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
-        ? (tool.rawInput as Record<string, unknown>)
-        : tool.args;
-    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
+  if (tool.isUpdateSteps) {
+    const isFailedCall = tool.acpStatus === 'failed';
+    const entries = isFailedCall ? undefined : tool.updateStepsEntries;
+    const hasEntries = Boolean(entries && entries.length > 0);
+    const failedCount = entries ? entries.filter(e => e.status === 'blocked').length : 0;
+    const allFinished = hasEntries && entries!.every(e => isChecklistStatusFinished(e.status));
+    const status = isToolRunning
+      ? 'running'
+      : effectiveStatus === 'error' || (allFinished && failedCount > 0)
+        ? 'error'
+        : effectiveStatus;
+    const errorText = isFailedCall
+      ? (tool.failureOutputText?.trim() ?? '')
+      : status === 'error' && !hasEntries
+        ? tool.outputText.trim()
+        : '';
+    const effectiveCollapsed = isAsk
+      ? false
+      : tool.userToggled
+        ? tool.collapsed
+        : isFailedCall && errorText.length > 0
+          ? false
+          : !expandAllTools;
+    const hasBody = hasEntries || errorText.length > 0;
+    const frame = isAsk || (hasBody && !effectiveCollapsed) ? 'card' : 'inline';
+
     return (
       <tool
         key={nodeKey}
         role="omp.tool.todo"
         name="todo"
         title="Todo"
-        target={inFlightOp}
-        targetKind={inFlightOp ? 'text' : undefined}
+        target={tool.target}
+        targetKind={tool.target ? 'text' : undefined}
         status={status}
         age={toolAge}
         took={toolTook}
-        frame="card"
+        frame={frame}
+        collapsible={hasBody && !isAsk}
+        collapsed={effectiveCollapsed}
         preview="none"
         confirm={isAsk ? 'card' : undefined}
         ask={isAsk ? tool.ask : undefined}
         approved={tool.approved}
+        onToggle={ev =>
+          callbacks.onToggleTool(tool.toolCallId, ev.collapsed ?? !effectiveCollapsed)
+        }
         onAction={approvalHandlers}
-      />
+      >
+        {hasEntries && entries ? (
+          <checklist
+            key="checklist"
+            mode="full"
+            phases={[
+              {
+                id: 'plan',
+                title: 'Plan',
+                items: entries.map(e => ({
+                  id: e.id,
+                  text: e.text,
+                  status: e.status,
+                  note: e.priority ? `[${e.priority}]` : undefined,
+                })),
+              },
+            ]}
+          />
+        ) : errorText ? (
+          <text key="err" spans={[{ t: errorText, s: 'error' }]} wrap="word" />
+        ) : null}
+      </tool>
     );
   }
 
@@ -877,8 +932,34 @@ function renderNotice(
   );
 }
 
+function renderQuestionMetaBanner(
+  card: ActiveQuestionCard,
+  queuedQuestionCount: number
+): JSX.Element | null {
+  if (card.mode !== 'form') return null;
+  const trimmedMessage = card.message?.trim() ?? '';
+  const firstPrompt = card.items[0]?.prompt?.trim() ?? '';
+  const showMessage = trimmedMessage.length > 0 && trimmedMessage !== firstPrompt;
+  if (!showMessage && queuedQuestionCount <= 0) return null;
+
+  return (
+    <row key="questions-meta" role="oma.questions.meta" gap="sm" align="center">
+      <icon key="icon" name="question" tone="info" />
+      {showMessage ? (
+        <text key="msg" spans={[{ t: trimmedMessage, s: 'muted' }]} wrap="word" grow={1} shrink={1} />
+      ) : (
+        <text key="msg" spans={[{ t: 'Additional questions pending', s: 'muted' }]} wrap="word" grow={1} shrink={1} />
+      )}
+      {queuedQuestionCount > 0 ? (
+        <badge key="queued" text={`+${queuedQuestionCount} queued`} tone="warning" />
+      ) : null}
+    </row>
+  );
+}
+
 function renderQuestionCard(
   card: ActiveQuestionCard,
+  queuedQuestionCount: number,
   callbacks: TranscriptCallbacks
 ): JSX.Element {
   if (card.mode === 'url') {
@@ -888,6 +969,11 @@ function renderQuestionCard(
         head={card.message || 'External Action Required'}
         icon="globe"
         tone="warning"
+        end={
+          queuedQuestionCount > 0 ? (
+            <badge key="queued" text={`+${queuedQuestionCount} queued`} tone="warning" />
+          ) : undefined
+        }
       >
         <col key="body" gap="sm">
           {card.url ? (
@@ -1286,7 +1372,7 @@ function renderTurnFooterNodes(
  * - Individual top-level nodes are settled via `RenderScheduler.settleTurn()` and filtered on `GoneEvent`.
  */
 export function TranscriptView(props: TranscriptViewProps): JSX.Element {
-  const { state, turns, plan, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
+  const { state, turns, version, toolPreviewLines, evictedNodeIds, callbacks } = props;
   const hasCompactedHistory = Boolean(props.hasCompactedHistory);
   const compactedHistoryExpanded = Boolean(props.compactedHistoryExpanded);
   const hiddenCompactedTurnCount = props.hiddenCompactedTurnCount ?? 0;
@@ -1743,37 +1829,12 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
         return turnNodes;
       })}
 
-      {plan && plan.entries.length > 0 && plan.source !== 'todo_tool' ? (
-        <tool
-          key="plan"
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          target={`${plan.entries.filter(e => e.status === 'done').length}/${plan.entries.length}`}
-          targetKind="text"
-          status={plan.entries.every(e => e.status === 'done') ? 'done' : 'running'}
-          frame="card"
-        >
-          <checklist
-            key="checklist"
-            mode="full"
-            phases={[
-              {
-                id: 'plan',
-                title: 'Plan',
-                items: plan.entries.map(e => ({
-                  id: e.id,
-                  text: e.text,
-                  status: e.status,
-                  note: e.priority ? `[${e.priority}]` : undefined,
-                })),
-              },
-            ]}
-          />
-        </tool>
-      ) : null}
-
-      {state.activeQuestion ? renderQuestionCard(state.activeQuestion, callbacks) : null}
+      {state.activeQuestion
+        ? renderQuestionMetaBanner(state.activeQuestion, state.queuedQuestionCount)
+        : null}
+      {state.activeQuestion
+        ? renderQuestionCard(state.activeQuestion, state.queuedQuestionCount, callbacks)
+        : null}
 
       {state.authRequired ? (
         <card

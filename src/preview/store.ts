@@ -13,6 +13,7 @@ export interface SessionPreviewTurn {
 export interface PersistedSessionTodoState {
   readonly phases: readonly TodoPhase[];
   readonly toolCallCount: number;
+  readonly source?: 'auto' | 'user';
 }
 
 export interface SessionAnchorRecord {
@@ -49,6 +50,11 @@ export interface ResolvedSessionRef {
   readonly source: 'file' | 'id' | 'missing-file';
   readonly filePath?: string;
 }
+
+export type SessionPreviewLoadResult =
+  | { readonly status: 'found'; readonly record: SessionAnchorRecord }
+  | { readonly status: 'missing' }
+  | { readonly status: 'error' };
 
 const MAX_PREVIEW_ENTRIES = 6; // Recent 3 user/assistant turns
 const MAX_PREVIEW_TEXT_CHARS = 500;
@@ -215,9 +221,14 @@ function normalizePersistedTodoState(raw: unknown): PersistedSessionTodoState | 
     }
   }
 
+  const rawSource = rec['source'];
+  const source: 'auto' | 'user' | undefined =
+    rawSource === 'auto' || rawSource === 'user' ? rawSource : undefined;
+
   return {
     phases,
     toolCallCount: Math.floor(rawCount),
+    ...(source !== undefined ? { source } : {}),
   };
 }
 
@@ -465,6 +476,33 @@ export async function loadSessionPreview(
 }
 
 /**
+ * Loads a cached session preview while distinguishing missing files (`ENOENT`)
+ * from read or JSON parse errors.
+ */
+export async function loadSessionPreviewDetailed(
+  sessionId: string,
+  options: DataPathOptions = {},
+): Promise<SessionPreviewLoadResult> {
+  let filePath: string;
+  try {
+    filePath = getSessionFilePath(sessionId, options);
+  } catch {
+    return { status: 'error' };
+  }
+  try {
+    const content = await readFile(filePath, 'utf8');
+    const record = parseSessionAnchorJson(JSON.parse(content));
+    return record ? { status: 'found', record } : { status: 'error' };
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === 'ENOENT') {
+      return { status: 'missing' };
+    }
+    return { status: 'error' };
+  }
+}
+
+/**
  * Loads cached previews into a `Map<sessionId, SessionAnchorRecord>` for left-joining
  * with `session/list`. When `sessionIds` is omitted, scans all `.json` files in
  * the sessions directory.
@@ -549,6 +587,10 @@ export class PreviewStore {
 
   load(sessionId: string): Promise<SessionAnchorRecord | null> {
     return loadSessionPreview(sessionId, this.#options);
+  }
+
+  loadDetailed(sessionId: string): Promise<SessionPreviewLoadResult> {
+    return loadSessionPreviewDetailed(sessionId, this.#options);
   }
 
   loadMap(sessionIds?: readonly string[]): Promise<Map<string, SessionAnchorRecord>> {

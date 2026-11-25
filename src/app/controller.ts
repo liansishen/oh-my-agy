@@ -68,10 +68,15 @@ import {
 import {
   DEFAULT_CONFIG,
   getConfigPath,
+  isSemverAtLeast,
   loadConfig,
+  normalizeTodoProvider,
   normalizeToolDisplayMode,
+  resolveEffectiveTodoProvider,
   saveConfig,
+  supportsNativeUpdateSteps,
   type OmaConfig,
+  type TodoProvider,
   type ToolDisplayMode,
 } from '../config/config';
 import {
@@ -92,6 +97,7 @@ import { EmbeddedTodoMcpServer, type TodoServerUpdateEvent } from '../mcp/todo_s
 import {
   getDataDir,
   PreviewStore,
+  type PersistedSessionTodoState,
   type SessionAnchorRecord,
 } from '../preview/store';
 import type { ApprovalAction } from '../state/approval';
@@ -138,6 +144,7 @@ import {
   formatPhaseDisplayTitle,
   formatTodoMarkdown,
   formatUserTodoSyncReminder,
+  isChecklistStatusFinished,
   isOmaTodoToolName,
   normalizeSingleInProgress,
   OMA_TODO_SYSTEM_PROMPT_APPEND,
@@ -149,6 +156,7 @@ import {
 import {
   buildElicitationContent,
   type AttachmentItem,
+  type PlanState,
 } from '../state/transcript';
 import {
   loadSwarmBoard,
@@ -196,22 +204,7 @@ const DEFAULT_REPLAY_DRAIN_MAX_MS = 10_000;
 const GIT_PROBE_MIN_INTERVAL_MS = 1500;
 const TPS_FLUSH_MIN_INTERVAL_MS = 120;
 
-export function isSemverAtLeast(
-  rawVersion: string | undefined,
-  major: number,
-  minor: number,
-  patch: number,
-): boolean {
-  if (!rawVersion) return false;
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/i.exec(rawVersion.trim());
-  if (!m) return false;
-  const curMajor = Number.parseInt(m[1]!, 10);
-  const curMinor = Number.parseInt(m[2]!, 10);
-  const curPatch = Number.parseInt(m[3]!, 10);
-  if (curMajor !== major) return curMajor > major;
-  if (curMinor !== minor) return curMinor > minor;
-  return curPatch >= patch;
-}
+export { isSemverAtLeast } from '../config/config';
 
 export interface ClipboardService {
   readImage(): Promise<ClipboardImage | null>;
@@ -291,6 +284,8 @@ export interface AppControllerOptions {
   readonly workspaceSkillsDir?: string;
   /** Optional override for global skills dir (for offline deterministic tests). */
   readonly globalSkillsDir?: string;
+  /** Optional override for `~/.agents/skills` global skills dir (for offline deterministic tests). */
+  readonly agentsGlobalSkillsDir?: string;
   /** Optional override for data dir used by default `/export` & `/log` paths. */
   readonly dataDir?: string;
   /** Optional git subprocess executor override for offline deterministic tests. */
@@ -321,6 +316,7 @@ function cloneConfig(config: OmaConfig): OmaConfig {
       collapse_compacted: config.ui.collapse_compacted,
       tool_display: normalizeToolDisplayMode(config.ui.tool_display),
       tool_preview_lines: config.ui.tool_preview_lines,
+      todo_provider: normalizeTodoProvider(config.ui.todo_provider),
       osc_7501: config.ui.osc_7501,
       reopen_anchor: config.ui.reopen_anchor,
     },
@@ -328,6 +324,54 @@ function cloneConfig(config: OmaConfig): OmaConfig {
       auto_allow_tools: [...(config.approval.auto_allow_tools ?? [])],
     },
   };
+}
+
+/** Converts an active ACP / `update_steps` plan into read-only display phases for `/todo`. */
+function buildDisplayPhasesFromAcpPlan(plan: PlanState | null): TodoPhase[] {
+  if (!plan || plan.source !== 'acp') return [];
+  const toTodoStatus = (status: string) =>
+    status === 'done'
+      ? 'completed'
+      : status === 'active'
+        ? 'in_progress'
+        : status === 'dropped' || status === 'blocked'
+          ? 'abandoned'
+          : 'pending';
+  if (plan.phases && plan.phases.length > 0) {
+    return plan.phases
+      .filter(p => p.items.length > 0)
+      .map(phase => ({
+        name: phase.title,
+        tasks: phase.items.map(item => ({
+          content: item.text,
+          status: toTodoStatus(item.status),
+          ...(item.note
+            ? { note: item.note }
+            : item.status === 'dropped'
+              ? { note: 'skipped' }
+              : item.status === 'blocked'
+                ? { note: 'failed' }
+                : {}),
+        })),
+      }));
+  }
+  if (plan.entries.length === 0) return [];
+  return [
+    {
+      name: 'Plan',
+      tasks: plan.entries.map(entry => ({
+        content: entry.text,
+        status: toTodoStatus(entry.status),
+        ...(entry.priority
+          ? { note: `[${entry.priority}]` }
+          : entry.status === 'dropped'
+            ? { note: 'skipped' }
+            : entry.status === 'blocked'
+              ? { note: 'failed' }
+              : {}),
+      })),
+    },
+  ];
 }
 
 function guessMimeType(filePath: string): string {
@@ -484,13 +528,52 @@ interface ResumeAnchorHint {
   readonly model?: string;
   readonly thoughtLevel?: string;
   readonly mode?: string;
+  readonly todoState?: PersistedSessionTodoState;
 }
 
 interface InitialSessionOutcome {
   readonly kind: 'new' | 'resumed';
   readonly epoch: number;
+  readonly todoProvider: TodoProvider;
   readonly anchorHint?: ResumeAnchorHint;
 }
+
+interface CommittedSessionSnapshot {
+  readonly sessionId: string;
+  readonly cwd: string;
+  readonly title?: string;
+  readonly todoProvider: TodoProvider;
+}
+
+interface BufferedServerRequest {
+  readonly epoch: number;
+  readonly sessionId: string;
+  readonly req: AcpIncomingRequest;
+}
+
+type SessionLifecycle =
+  | { readonly phase: 'idle'; readonly epoch: number }
+  | {
+      readonly phase: 'creating';
+      readonly epoch: number;
+      provider: TodoProvider | null;
+      readonly bufferedUpdates: SessionUpdateParams[];
+      readonly carryOver: SessionControlCarryOver | null;
+      snapshotApplied: boolean;
+    }
+  | {
+      readonly phase: 'replaying';
+      readonly epoch: number;
+      readonly targetSessionId: string;
+      provider: TodoProvider | null;
+      readonly bufferedRequests: BufferedServerRequest[];
+    }
+  | {
+      readonly phase: 'ready';
+      readonly epoch: number;
+      readonly sessionId: string;
+      readonly provider: TodoProvider;
+    };
 
 export class AppController {
   readonly store: AppStore;
@@ -520,6 +603,7 @@ export class AppController {
   readonly #agySettingsPath: string;
   readonly #workspaceSkillsDir?: string;
   readonly #globalSkillsDir?: string;
+  readonly #agentsGlobalSkillsDir?: string;
   readonly #dataDir?: string;
   readonly #gitExec?: GitExecFn;
   readonly #backgroundDoneGraceMs: number;
@@ -528,7 +612,7 @@ export class AppController {
   readonly #replayDrainActiveQuietMs: number;
   readonly #hasExplicitReplayDrainQuietMs: boolean;
   readonly #todoAutoClearDelayMs: number;
-  readonly #enableTodoMcp: boolean;
+  readonly #enableTodoMcpOverride?: boolean;
   readonly #editTodoExternal?: (initialMarkdown: string) => Promise<string | null>;
   readonly #metricsTracker: SessionMetricsTracker;
 
@@ -538,6 +622,11 @@ export class AppController {
   #todoHudDismissed = false;
   #todoAutoClearTimer: ReturnType<typeof setTimeout> | undefined = undefined;
   #pendingTodoSyncReminder: string | null = null;
+  #hasRestoredUserAnchor = false;
+  #preservedAnchorTodoState: {
+    readonly sessionId: string;
+    readonly todoState: PersistedSessionTodoState;
+  } | null = null;
   #swarmWatcher: SwarmBoardWatcher | null = null;
   #swarmWatcherSessionId: string | null = null;
   #lastTpsStoreFlushAt = 0;
@@ -560,23 +649,17 @@ export class AppController {
   #activePromptTask: Promise<void> | null = null;
   #promptSubmitting = false;
   #acpClientAlive = false;
-  #sessionEpoch = 0;
-  #lastCommittedSessionId: string | null = null;
-  #lastCommittedCwd: string | null = null;
-  #replayingSessionId: string | null = null;
-  #replayingSessionEpoch: number | null = null;
-  #pendingReplayedServerRequests: Array<{
-    readonly epoch: number;
-    readonly sessionId: string;
-    readonly req: AcpIncomingRequest;
-  }> = [];
-  #creatingSessionEpoch: number | null = null;
-  #pendingNewSessionUpdates: SessionUpdateParams[] = [];
-  #pendingCarryOverControls: SessionControlCarryOver | null = null;
+  #logoutInFlightClient: AcpClient | null = null;
+  #reconnectInFlight: Promise<void> | null = null;
+  #reconnectSeq = 0;
+  #bootstrapSeq = 0;
+  #lifecycle: SessionLifecycle = { phase: 'idle', epoch: 0 };
+  #lastCommittedSession: CommittedSessionSnapshot | null = null;
   #suppressedMentionPaths = new Set<string>();
   #configWriteBlockedReason: string | null = null;
   #configVerifiedWritable = false;
   #configSaveChain: Promise<void> = Promise.resolve();
+  #anchorSaveChains = new Map<string, Promise<void>>();
   #pickerLoadToken = 0;
   #attachmentSeq = 0;
   #shutdownPromise: Promise<void> | null = null;
@@ -624,6 +707,7 @@ export class AppController {
     this.#agySettingsPath = options.agySettingsPath ?? getAgySettingsPath();
     this.#workspaceSkillsDir = options.workspaceSkillsDir;
     this.#globalSkillsDir = options.globalSkillsDir;
+    this.#agentsGlobalSkillsDir = options.agentsGlobalSkillsDir;
     this.#dataDir = options.dataDir;
     this.#gitExec = options.gitExec;
     this.#backgroundDoneGraceMs = Math.max(
@@ -647,7 +731,7 @@ export class AppController {
       options.todoAutoClearDelayMs !== undefined
         ? options.todoAutoClearDelayMs
         : TODO_AUTO_CLEAR_DELAY_MS;
-    this.#enableTodoMcp = options.enableTodoMcp ?? true;
+    this.#enableTodoMcpOverride = options.enableTodoMcp;
     this.#editTodoExternal = options.editTodoExternal;
     this.#metricsTracker = new SessionMetricsTracker({
       ...(this.#baseBrainDir ? { baseBrainDir: this.#baseBrainDir } : {}),
@@ -692,6 +776,7 @@ export class AppController {
     if (initialBeeBlobs) {
       this.store.setBeeBlobs(initialBeeBlobs);
     }
+    this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
     const ready = Promise.withResolvers<void>();
     this.readyPromise = ready.promise;
@@ -828,7 +913,7 @@ export class AppController {
   #syncSwarmFxStylesheet(features: readonly string[] = this.session.caps.features): void {
     const supportsStyles = features.includes('styles');
     const state = this.store.getState();
-    const orbitBees = supportsStyles && state.hasSwarm ? resolveOrbitSwarmBees(state) : [];
+    const orbitBees = supportsStyles ? resolveOrbitSwarmBees(state) : [];
 
     if (orbitBees.length > 0) {
       const nextSig = orbitBees.map(b => (b.isWorking ? 'W' : 'S')).join(',');
@@ -854,6 +939,14 @@ export class AppController {
 
   get exitCode(): number {
     return this.#exitCode;
+  }
+
+  get activeTodoRouteSessionId(): string | null {
+    return this.#todoServer?.committedSessionId ?? null;
+  }
+
+  get committedSessionTodoProvider(): TodoProvider | null {
+    return this.#lifecycle.phase === 'ready' ? this.#lifecycle.provider : null;
   }
 
   /**
@@ -953,7 +1046,7 @@ export class AppController {
         for (const perm of cancelledPerms) {
           this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
         }
-        this.store.cancelActiveQuestion();
+        this.store.cancelAllQuestions();
 
         // 2. Clean user-initiated exit clears reopen anchor and OSC 7501 status
         if (options.cleanExit) {
@@ -973,8 +1066,9 @@ export class AppController {
         if (this.#activePromptTask) {
           await this.#activePromptTask.catch(() => {});
         }
-        // Wait for any accepted serialized config writes before exiting
+        // Wait for any accepted serialized config and session anchor writes before exiting
         await this.#configSaveChain.catch(() => {});
+        await Promise.all([...this.#anchorSaveChains.values()]);
 
         // 4. Stop background schedulers/indexers
         this.scheduler.dispose();
@@ -1009,28 +1103,43 @@ export class AppController {
       }
     }
 
-    return new AcpClient({
+    const client = new AcpClient({
       agyBin: this.#resolveAgyBin(),
       extraArgs,
       cwd: this.store.getState().cwd,
       ...(this.#env ? { env: this.#env } : {}),
       spawn: this.#acpSpawn,
       closeTimeoutMs: 500,
-      onUpdate: params => this.#handleAcpUpdate(params),
-      onServerRequest: req => this.#handleAcpServerRequest(req),
-      onTraffic: ev => this.#handleAcpTraffic(ev),
+      onUpdate: params => {
+        if (this.#acpClient !== client) return;
+        this.#handleAcpUpdate(params);
+      },
+      onServerRequest: req => {
+        if (this.#acpClient !== client) return;
+        this.#handleAcpServerRequest(req);
+      },
+      onTraffic: ev => {
+        if (this.#acpClient !== client) return;
+        this.#handleAcpTraffic(ev);
+      },
       onStderr: line => {
+        if (this.#acpClient !== client) return;
         this.store.traffic.recordStderr(line);
       },
-      onExit: info => this.#handleAcpExit(info),
+      onExit: info => this.#handleAcpExit(info, client),
     });
+    return client;
   }
 
   #isAcpClientLive(client: AcpClient): boolean {
+    const status = this.store.getState().connectionStatus;
     return (
       this.#acpClient === client &&
       this.#acpClientAlive &&
-      this.store.getState().connectionStatus !== 'crashed'
+      this.#logoutInFlightClient !== client &&
+      status !== 'crashed' &&
+      status !== 'auth_required' &&
+      status !== 'closing'
     );
   }
 
@@ -1071,19 +1180,40 @@ export class AppController {
     }
   }
 
+  #resetLifecycleToIdle(
+    options: {
+      readonly advanceEpoch?: boolean;
+      readonly abortError?: Error;
+      readonly resetStore?: boolean;
+    } = {}
+  ): number {
+    this.#cancelReplayDrain(options.abortError);
+    this.#cancelPendingReplayedServerRequests();
+    const nextEpoch = options.advanceEpoch ? this.#lifecycle.epoch + 1 : this.#lifecycle.epoch;
+    this.#lifecycle = { phase: 'idle', epoch: nextEpoch };
+    this.#todoServer?.revokeSessionRoute();
+    if (options.resetStore) {
+      this.store.resetSessionState({ keepCommands: true });
+    }
+    this.store.setSessionPhase('none');
+    if (this.scheduler.suspended) {
+      this.scheduler.resumeAfterReplay(false);
+    }
+    return nextEpoch;
+  }
+
   /**
    * Atomically begin a single-epoch session transition (`creating` for `/new` or
    * initial `session/new`, `replaying` for `/resume` or `session/load`).
    * Cancels any in-flight replay drain, clears stale creation/replay state, and
-   * resets session UI state under one unified epoch so interleaved `/resume` and
-   * `/new` calls can never inherit old replay chunks, wipe a newer command buffer,
-   * or leave the scheduler suspended.
+   * resets session UI state under one unified epoch.
    */
   #beginSessionTransition(
     mode: 'creating' | 'replaying',
-    replaySessionId?: string
+    replaySessionId?: string,
+    carryOver: SessionControlCarryOver | null = null
   ): number {
-    const epoch = ++this.#sessionEpoch;
+    const epoch = this.#lifecycle.epoch + 1;
     this.#cancelReplayDrain(new Error('Superseded by session switch'));
     this.#cancelPendingReplayedServerRequests();
     this.#stopSwarmWatcher();
@@ -1094,7 +1224,9 @@ export class AppController {
     this.#todoExpanded = false;
     this.#todoHudDismissed = false;
     this.#pendingTodoSyncReminder = null;
-    this.#todoServer?.setActiveSessionId(null);
+    this.#hasRestoredUserAnchor = false;
+    this.#preservedAnchorTodoState = null;
+    this.#todoServer?.revokeSessionRoute();
     this.#metricsTracker.setSession(null);
     this.#lastTpsStoreFlushAt = 0;
     this.#pendingBackgroundDone = false;
@@ -1106,18 +1238,24 @@ export class AppController {
     this.#deferredSettleTurnIndex = null;
     this.#workingStartedAt = undefined;
     this.#activePromptTask = null;
-    this.#pendingNewSessionUpdates = [];
-    this.#pendingCarryOverControls = null;
 
-    if (mode === 'replaying') {
-      this.#creatingSessionEpoch = null;
-      this.#replayingSessionId = replaySessionId ?? null;
-      this.#replayingSessionEpoch = epoch;
-    } else {
-      this.#replayingSessionId = null;
-      this.#replayingSessionEpoch = null;
-      this.#creatingSessionEpoch = epoch;
-    }
+    this.#lifecycle =
+      mode === 'replaying'
+        ? {
+            phase: 'replaying',
+            epoch,
+            targetSessionId: replaySessionId ?? '',
+            provider: null,
+            bufferedRequests: [],
+          }
+        : {
+            phase: 'creating',
+            epoch,
+            provider: null,
+            bufferedUpdates: [],
+            carryOver,
+            snapshotApplied: false,
+          };
 
     this.store.resetSessionState({ keepCommands: true });
     this.#syncSwarmFxStylesheet();
@@ -1125,9 +1263,9 @@ export class AppController {
 
     if (mode === 'replaying') {
       this.scheduler.suspendForReplay();
-      this.store.setReplaying(true);
+      this.store.setSessionPhase('replaying');
     } else {
-      this.store.setReplaying(false);
+      this.store.setSessionPhase('creating');
       if (this.scheduler.suspended) {
         this.scheduler.resumeAfterReplay(false);
       }
@@ -1137,11 +1275,13 @@ export class AppController {
   }
 
   #drainPendingNewSessionUpdates(sessionId: string, epoch: number): void {
-    const queued = this.#pendingNewSessionUpdates;
-    this.#pendingNewSessionUpdates = [];
-    if (queued.length === 0) return;
+    if (this.#lifecycle.phase !== 'creating' || this.#lifecycle.epoch !== epoch) {
+      return;
+    }
+    this.#lifecycle.snapshotApplied = true;
+    const queued = this.#lifecycle.bufferedUpdates.splice(0);
     for (const params of queued) {
-      if (this.#shuttingDown || epoch !== this.#sessionEpoch) return;
+      if (this.#shuttingDown || epoch !== this.#lifecycle.epoch) return;
       const sid =
         typeof params.sessionId === 'string' && params.sessionId.trim().length > 0
           ? params.sessionId.trim()
@@ -1166,6 +1306,12 @@ export class AppController {
     const client = this.#createAcpClient();
     this.#acpClient = client;
     this.#acpClientAlive = true;
+    const bootstrapSeq = ++this.#bootstrapSeq;
+    const isBootstrapActive = (): boolean =>
+      !this.#shuttingDown &&
+      bootstrapSeq === this.#bootstrapSeq &&
+      this.#isAcpClientLive(client) &&
+      this.store.getState().connectionStatus === 'initializing';
 
     try {
       client.start();
@@ -1179,24 +1325,57 @@ export class AppController {
           },
         },
       });
-      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
+      if (!isBootstrapActive()) return;
       this.#authMethods = initRes.authMethods ?? [];
       this.store.setAgentInitializeInfo(
         initRes.agentInfo,
         initRes.agentCapabilities?.promptCapabilities,
         { supportsLogout: client.supportsLogout }
       );
+      this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
-      const initialOutcome = await this.#openInitialSession(client, retrySessionId);
-      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
+      const initialOutcome = await this.#openInitialSession(
+        client,
+        retrySessionId,
+        isBootstrapActive
+      );
+      if (
+        !initialOutcome ||
+        !isBootstrapActive() ||
+        initialOutcome.epoch !== this.#lifecycle.epoch
+      ) {
+        return;
+      }
 
-      await this.#applyInitialPreferences(client, initialOutcome, Boolean(retrySessionId));
-      if (this.#shuttingDown || !this.#isAcpClientLive(client)) return;
+      if (initialOutcome.kind === 'new') {
+        await this.#applyInitialPreferences(client, initialOutcome, Boolean(retrySessionId));
+        if (!isBootstrapActive() || initialOutcome.epoch !== this.#lifecycle.epoch) {
+          return;
+        }
+        const readySessionId = this.store.getState().sessionId;
+        if (!readySessionId) return;
+        this.#commitActiveTodoSessionRoute(
+          initialOutcome.epoch,
+          readySessionId,
+          client,
+          initialOutcome.todoProvider
+        );
+      } else if (!this.store.getState().sessionId) {
+        return;
+      }
 
-      this.store.setConnectionStatus('ready');
+      this.store.markSessionReady();
       this.#restoreOscAfterBlock();
       this.osc.setWorkingDirectory(this.store.getState().cwd);
       await this.#persistSessionAnchorAndOsc();
+      if (
+        this.#shuttingDown ||
+        bootstrapSeq !== this.#bootstrapSeq ||
+        !this.#isAcpClientLive(client) ||
+        initialOutcome.epoch !== this.#lifecycle.epoch
+      ) {
+        return;
+      }
 
       // Flush ready frame (`sendable={true} typeahead={false}`)
       this.scheduler.renderNow();
@@ -1210,11 +1389,19 @@ export class AppController {
         }
       }
     } catch (err) {
-      if (this.#shuttingDown) return;
-      // Preserve crash state already set by `#handleAcpExit` when the child exited mid-bootstrap/replay
-      if (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed') {
+      const curStatus = this.store.getState().connectionStatus;
+      if (
+        this.#shuttingDown ||
+        bootstrapSeq !== this.#bootstrapSeq ||
+        this.#acpClient !== client ||
+        this.#logoutInFlightClient === client ||
+        curStatus === 'auth_required' ||
+        curStatus === 'closing' ||
+        (!this.#acpClientAlive && curStatus === 'crashed')
+      ) {
         return;
       }
+      this.#resetLifecycleToIdle();
       if (err instanceof AcpRpcError && err.isAuthRequired()) {
         this.osc.setStatusBlocked('auth');
         this.store.setAuthRequired({
@@ -1237,20 +1424,32 @@ export class AppController {
 
   async #openInitialSession(
     client: AcpClient,
-    retrySessionId?: string
-  ): Promise<InitialSessionOutcome> {
+    retrySessionId: string | undefined,
+    isBootstrapActive: () => boolean
+  ): Promise<InitialSessionOutcome | null> {
     const cwd = this.store.getState().cwd;
 
     if (retrySessionId) {
       try {
-        const loaded = await this.#loadSessionWithReplay(client, retrySessionId, cwd);
-        if (loaded) {
-          return { kind: 'resumed', epoch: this.#sessionEpoch };
+        const loadedProvider = await this.#loadSessionWithReplay(
+          client,
+          retrySessionId,
+          cwd,
+          undefined,
+          undefined,
+          { startupPreferences: { preferSavedOverCli: true, isBootstrapActive } }
+        );
+        if (!isBootstrapActive() || !loadedProvider) {
+          return null;
         }
+        return { kind: 'resumed', epoch: this.#lifecycle.epoch, todoProvider: loadedProvider };
       } catch (err) {
-        if (!this.#isAcpClientLive(client)) throw err;
+        if (!isBootstrapActive()) return null;
+        if (err instanceof AcpRpcError && err.isAuthRequired()) {
+          throw err;
+        }
         if (err instanceof AcpRpcError && err.isSessionNotFound()) {
-          void this.#previewStore.delete(retrySessionId).catch(() => {});
+          void this.#deleteSessionAnchor(retrySessionId).catch(() => {});
         }
         // Fallback to new session if previous session cannot be reloaded
       }
@@ -1267,33 +1466,41 @@ export class AppController {
 
       if (target.sessionId) {
         const targetCwd = target.cwd || cwd;
+        const anchorHint: ResumeAnchorHint = {
+          ...(target.model ? { model: target.model } : {}),
+          ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
+          ...(target.mode ? { mode: target.mode } : {}),
+          ...(target.todoState ? { todoState: target.todoState } : {}),
+        };
         try {
-          const loaded = await this.#loadSessionWithReplay(
+          const loadedProvider = await this.#loadSessionWithReplay(
             client,
             target.sessionId,
             targetCwd,
-            target.title
-          );
-          if (loaded) {
-            const anchorHint: ResumeAnchorHint = {
-              ...(target.model ? { model: target.model } : {}),
-              ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
-              ...(target.mode ? { mode: target.mode } : {}),
-            };
-            return {
-              kind: 'resumed',
-              epoch: this.#sessionEpoch,
+            target.title,
+            undefined,
+            {
               ...(Object.keys(anchorHint).length > 0 ? { anchorHint } : {}),
-            };
+              startupPreferences: { preferSavedOverCli: false, isBootstrapActive },
+            }
+          );
+          if (!isBootstrapActive() || !loadedProvider) {
+            return null;
           }
+          return {
+            kind: 'resumed',
+            epoch: this.#lifecycle.epoch,
+            todoProvider: loadedProvider,
+            ...(Object.keys(anchorHint).length > 0 ? { anchorHint } : {}),
+          };
         } catch (err) {
-          if (!this.#isAcpClientLive(client)) throw err;
+          if (!isBootstrapActive()) return null;
           if (err instanceof AcpRpcError && err.isAuthRequired()) {
             throw err;
           }
           const isNotFound = err instanceof AcpRpcError && err.isSessionNotFound();
           if (isNotFound) {
-            void this.#previewStore.delete(target.sessionId).catch(() => {});
+            void this.#deleteSessionAnchor(target.sessionId).catch(() => {});
           }
           this.store.pushToast(
             isNotFound
@@ -1311,21 +1518,25 @@ export class AppController {
     } else if (this.#cli.continue) {
       try {
         const sessions = await client.listAllSessions({ cwd });
+        if (!isBootstrapActive()) return null;
         sessions.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
         const latest = sessions[0];
         if (latest) {
-          const loaded = await this.#loadSessionWithReplay(
+          const loadedProvider = await this.#loadSessionWithReplay(
             client,
             latest.sessionId,
             cwd,
-            latest.title ?? undefined
+            latest.title ?? undefined,
+            undefined,
+            { startupPreferences: { preferSavedOverCli: false, isBootstrapActive } }
           );
-          if (loaded) {
-            return { kind: 'resumed', epoch: this.#sessionEpoch };
+          if (!isBootstrapActive() || !loadedProvider) {
+            return null;
           }
+          return { kind: 'resumed', epoch: this.#lifecycle.epoch, todoProvider: loadedProvider };
         }
       } catch (err) {
-        if (!this.#isAcpClientLive(client)) throw err;
+        if (!isBootstrapActive()) return null;
         if (err instanceof AcpRpcError && err.isAuthRequired()) {
           throw err;
         }
@@ -1333,14 +1544,21 @@ export class AppController {
       }
     }
 
+    if (!isBootstrapActive()) return null;
     const createEpoch = this.#beginSessionTransition('creating');
+    const { todoProvider: sessionTodoProvider, ...bootstrapOptions } =
+      this.#buildSessionBootstrapOptions(createEpoch, client);
+    if (this.#lifecycle.phase === 'creating' && this.#lifecycle.epoch === createEpoch) {
+      this.#lifecycle.provider = sessionTodoProvider;
+    }
+    this.store.transcript.setPreferNativeSteps(sessionTodoProvider === 'native');
     try {
       const created = await client.newSession({
         cwd,
-        ...this.#buildSessionBootstrapOptions(),
+        ...bootstrapOptions,
       });
-      if (this.#shuttingDown || !this.#isAcpClientLive(client) || createEpoch !== this.#sessionEpoch) {
-        throw new Error('ACP connection closed while creating session');
+      if (!isBootstrapActive() || createEpoch !== this.#lifecycle.epoch) {
+        return null;
       }
       const createdTier = client.currentTier ?? extractSessionTier(created._meta);
       this.store.applySessionSnapshot({
@@ -1351,22 +1569,19 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
-      this.#todoServer?.setActiveSessionId(created.sessionId);
-      this.#lastCommittedSessionId = created.sessionId;
-      this.#lastCommittedCwd = cwd;
-      if (this.#creatingSessionEpoch === createEpoch) {
-        this.#creatingSessionEpoch = null;
-      }
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
-      return { kind: 'new', epoch: createEpoch };
-    } finally {
-      if (this.#creatingSessionEpoch === createEpoch) {
-        this.#creatingSessionEpoch = null;
-        this.#pendingNewSessionUpdates = [];
+      return { kind: 'new', epoch: createEpoch, todoProvider: sessionTodoProvider };
+    } catch (err) {
+      if (createEpoch === this.#lifecycle.epoch) {
+        this.#resetLifecycleToIdle();
       }
+      if (!isBootstrapActive() || createEpoch !== this.#lifecycle.epoch) {
+        return null;
+      }
+      throw err;
     }
   }
 
@@ -1446,58 +1661,58 @@ export class AppController {
     options?: {
       readonly restoreSavedControls?: boolean;
       readonly anchorHint?: ResumeAnchorHint;
+      readonly startupPreferences?: {
+        readonly preferSavedOverCli: boolean;
+        readonly isBootstrapActive: () => boolean;
+      };
+      readonly todoProviderOverride?: TodoProvider;
     }
-  ): Promise<boolean> {
+  ): Promise<TodoProvider | null> {
     const loadEpoch =
       existingEpoch !== undefined
         ? existingEpoch
         : this.#beginSessionTransition('replaying', sessionId);
+    const { todoProvider: sessionTodoProvider, ...bootstrapOptions } =
+      this.#buildSessionBootstrapOptions(loadEpoch, client, options?.todoProviderOverride);
+    if (this.#lifecycle.phase === 'replaying' && this.#lifecycle.epoch === loadEpoch) {
+      this.#lifecycle.provider = sessionTodoProvider;
+    }
+    this.store.transcript.setPreferNativeSteps(sessionTodoProvider === 'native');
+    const isLoadAborted = (): boolean =>
+      this.#shuttingDown ||
+      loadEpoch !== this.#lifecycle.epoch ||
+      (options?.startupPreferences !== undefined &&
+        !options.startupPreferences.isBootstrapActive());
+    const abortLoadIfNeeded = (): boolean => {
+      if (!isLoadAborted()) return false;
+      if (loadEpoch === this.#lifecycle.epoch) {
+        this.#resetLifecycleToIdle();
+      }
+      return true;
+    };
 
     try {
       const loaded = await client.loadSession({
         sessionId,
         cwd,
-        ...this.#buildSessionBootstrapOptions(),
+        ...bootstrapOptions,
       });
 
-      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
-        return false;
+      if (abortLoadIfNeeded()) {
+        return null;
       }
       if (!this.#isAcpClientLive(client)) {
         throw new Error('ACP connection closed during session load');
       }
 
       await this.#waitForReplayDrain();
-      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
-        return false;
+      if (abortLoadIfNeeded()) {
+        return null;
       }
       if (!this.#isAcpClientLive(client)) {
         throw new Error('ACP connection closed during session replay');
       }
 
-      this.store.transcript.finalizeReplayedTurns();
-      const storedTodoAnchor = await this.#previewStore.load(loaded.sessionId).catch(() => null);
-      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) {
-        return false;
-      }
-      if (
-        storedTodoAnchor?.todoState &&
-        storedTodoAnchor.todoState.toolCallCount >= this.store.transcript.todoToolCallCount &&
-        JSON.stringify(storedTodoAnchor.todoState.phases) !==
-          JSON.stringify(this.store.transcript.todoPhases)
-      ) {
-        this.store.transcript.setTodoPhases(storedTodoAnchor.todoState.phases, {
-          source: 'user',
-        });
-        this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
-          'resumed session todo state',
-          storedTodoAnchor.todoState.phases,
-          storedTodoAnchor.todoState.phases.length === 0
-        );
-      }
-      this.#todoServer?.setActiveSessionId(loaded.sessionId);
-      this.#todoServer?.seedSession(loaded.sessionId, this.store.transcript.todoPhases);
-      this.#scheduleTodoAutoClearIfDone();
       const loadedTier = client.currentTier ?? extractSessionTier(loaded._meta);
       this.store.applySessionSnapshot({
         sessionId: loaded.sessionId,
@@ -1508,11 +1723,71 @@ export class AppController {
         modes: loaded.modes,
         ...(loadedTier ? { tier: loadedTier } : {}),
       });
-      this.#lastCommittedSessionId = loaded.sessionId;
-      this.#lastCommittedCwd = cwd;
 
       this.#bindSessionMetrics(loaded.sessionId, false);
       await this.#syncSessionMetricsFromTranscript();
+      if (abortLoadIfNeeded()) return null;
+      if (!this.#isAcpClientLive(client)) {
+        throw new Error('ACP connection closed during session restore');
+      }
+
+      if (options?.startupPreferences) {
+        await this.#applyInitialPreferences(
+          client,
+          {
+            kind: 'resumed',
+            epoch: loadEpoch,
+            todoProvider: sessionTodoProvider,
+            ...(options.anchorHint ? { anchorHint: options.anchorHint } : {}),
+          },
+          options.startupPreferences.preferSavedOverCli
+        );
+        if (abortLoadIfNeeded()) return null;
+        if (!this.#isAcpClientLive(client)) {
+          throw new Error('ACP connection closed during session restore');
+        }
+      } else if (options?.restoreSavedControls) {
+        const savedControls = await this.#resolveResumedSessionControls(
+          loaded.sessionId,
+          options.anchorHint
+        );
+        if (abortLoadIfNeeded()) return null;
+        if (!this.#isAcpClientLive(client)) {
+          throw new Error('ACP connection closed during session restore');
+        }
+        if (savedControls) {
+          await this.#applySessionControls(client, loaded.sessionId, savedControls, loadEpoch, {
+            clampInvalidThought: true,
+            toastFailurePrefix: 'Failed to carry over',
+          });
+          if (abortLoadIfNeeded()) return null;
+          if (!this.#isAcpClientLive(client)) {
+            throw new Error('ACP connection closed during session restore');
+          }
+        }
+      }
+
+      const pendingAnchorSave = this.#anchorSaveChains.get(loaded.sessionId);
+      if (pendingAnchorSave) {
+        await pendingAnchorSave;
+        if (abortLoadIfNeeded()) {
+          return null;
+        }
+        if (!this.#isAcpClientLive(client)) {
+          throw new Error('ACP connection closed during session restore');
+        }
+      }
+      const storedAnchorResult = await this.#previewStore
+        .loadDetailed(loaded.sessionId)
+        .catch(() => ({ status: 'error' as const }));
+      if (abortLoadIfNeeded()) {
+        return null;
+      }
+      if (!this.#isAcpClientLive(client)) {
+        throw new Error('ACP connection closed during session restore');
+      }
+
+      this.store.transcript.finalizeReplayedTurns();
       this.#metricsTracker.markTranscriptBackgroundBaseline();
       const terminalBgRecords = this.#metricsTracker
         .getTranscriptBackgroundTasks()
@@ -1520,28 +1795,63 @@ export class AppController {
       if (terminalBgRecords.length > 0) {
         this.store.transcript.syncTranscriptBackgroundTasks(terminalBgRecords);
       }
-      if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
-      if (!this.#isAcpClientLive(client)) {
-        throw new Error('ACP connection closed during session restore');
-      }
-      if (options?.restoreSavedControls) {
-        const savedControls = await this.#resolveResumedSessionControls(
-          loaded.sessionId,
-          options.anchorHint
-        );
-        if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
-        if (!this.#isAcpClientLive(client)) {
-          throw new Error('ACP connection closed during session restore');
-        }
-        if (savedControls) {
-          await this.#applyCarryOverControls(client, loaded.sessionId, savedControls, loadEpoch);
-          if (this.#shuttingDown || loadEpoch !== this.#sessionEpoch) return false;
-          if (!this.#isAcpClientLive(client)) {
-            throw new Error('ACP connection closed during session restore');
+
+      const effectiveTodoAnchor =
+        storedAnchorResult.status === 'found'
+          ? storedAnchorResult.record
+          : storedAnchorResult.status === 'missing'
+            ? options?.anchorHint
+            : undefined;
+      const storedTodoState = effectiveTodoAnchor?.todoState;
+      const candidateUserAnchor =
+        storedTodoState?.source === 'user' &&
+        storedTodoState.toolCallCount >= this.store.transcript.todoToolCallCount
+          ? storedTodoState
+          : undefined;
+      this.#preservedAnchorTodoState = null;
+      this.#hasRestoredUserAnchor = false;
+      if (candidateUserAnchor !== undefined) {
+        if (sessionTodoProvider === 'mcp') {
+          const phasesDiffer =
+            JSON.stringify(candidateUserAnchor.phases) !==
+            JSON.stringify(this.store.transcript.todoPhases);
+          this.store.transcript.setTodoPhases(candidateUserAnchor.phases, {
+            source: 'user',
+            isRestoringSessionAnchor: true,
+            restoredAnchorToolCallCount: candidateUserAnchor.toolCallCount,
+          });
+          this.#hasRestoredUserAnchor = true;
+          if (phasesDiffer) {
+            this.#pendingTodoSyncReminder = formatUserTodoSyncReminder(
+              'resumed session todo state',
+              candidateUserAnchor.phases,
+              candidateUserAnchor.phases.length === 0
+            );
           }
+        } else {
+          this.#preservedAnchorTodoState = {
+            sessionId: loaded.sessionId,
+            todoState: {
+              phases: cloneTodoPhases(candidateUserAnchor.phases),
+              toolCallCount: candidateUserAnchor.toolCallCount,
+              source: 'user',
+            },
+          };
         }
       }
+      this.#scheduleTodoAutoClearIfDone();
       void this.#refreshGitStatus({ force: true });
+
+      const bufferedRequests =
+        this.#lifecycle.phase === 'replaying' && this.#lifecycle.epoch === loadEpoch
+          ? this.#lifecycle.bufferedRequests.splice(0)
+          : [];
+      this.#commitActiveTodoSessionRoute(
+        loadEpoch,
+        loaded.sessionId,
+        client,
+        sessionTodoProvider
+      );
 
       this.store.setReplaying(false);
       this.scheduler.resumeAfterReplay(true);
@@ -1561,28 +1871,15 @@ export class AppController {
       if (settledAny) {
         this.osc.reassertCursorHidden();
       }
-      if (this.#replayingSessionEpoch === loadEpoch) {
-        this.#replayingSessionId = null;
-        this.#replayingSessionEpoch = null;
-      }
-      this.#drainPendingReplayedServerRequests(loaded.sessionId, loadEpoch);
+      this.#drainPendingReplayedServerRequests(bufferedRequests, loaded.sessionId, loadEpoch);
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
-      return true;
+      return sessionTodoProvider;
     } catch (err) {
-      if (loadEpoch !== this.#sessionEpoch) {
-        // Superseded by a newer `/new` or `/resume` transition; do not touch the newer epoch's state
-        return false;
+      if (loadEpoch !== this.#lifecycle.epoch) {
+        return null;
       }
-      this.#cancelReplayDrain();
-      this.#cancelPendingReplayedServerRequests();
-      this.store.setReplaying(false);
-      this.scheduler.resumeAfterReplay(false);
+      this.#resetLifecycleToIdle();
       throw err;
-    } finally {
-      if (this.#replayingSessionEpoch === loadEpoch) {
-        this.#replayingSessionId = null;
-        this.#replayingSessionEpoch = null;
-      }
     }
   }
 
@@ -1591,56 +1888,21 @@ export class AppController {
     outcome: InitialSessionOutcome,
     preferSavedOverCli = false
   ): Promise<void> {
-    const state = this.store.getState();
-    const sessionId = state.sessionId;
+    const sessionId = this.store.getState().sessionId;
     if (!sessionId) return;
 
-    const applyModelAndThoughtPreference = async (
-      desiredModel: string,
-      desiredThought: string
-    ): Promise<void> => {
-      if (desiredModel) {
-        const curState = this.store.getState();
-        const resolved = resolveModelSelection(desiredModel, {
-          configOptions: [...curState.configOptions],
-          models: curState.models,
-          modes: curState.modes,
-        });
-        if (resolved) {
-          try {
-            const applied = await applyModelSelection(
-              client,
-              sessionId,
-              resolved,
-              desiredThought || undefined
-            );
-            if (applied.configOptions) {
-              this.store.updateConfigOptions(applied.configOptions);
-            } else {
-              this.store.updateCurrentModelId(applied.appliedModelId);
-            }
-          } catch (err) {
-            this.store.pushToast(
-              `Failed to apply initial model "${desiredModel}": ${err instanceof Error ? err.message : String(err)}`,
-              'warning'
-            );
-          }
-        }
-      } else if (desiredThought) {
-        await this.#applyThoughtLevel(desiredThought, true);
-      }
-    };
-
     if (outcome.kind === 'new') {
-      const desiredModel = this.#cli.model?.trim() || this.#config.default_model?.trim() || '';
-      const desiredThought =
-        this.#cli.thought?.trim() || this.#config.default_thought?.trim() || '';
-      const desiredMode = this.#cli.mode?.trim() || this.#config.default_mode?.trim() || '';
-
-      await applyModelAndThoughtPreference(desiredModel, desiredThought);
-      if (desiredMode) {
-        await this.#applyMode(desiredMode, true);
-      }
+      await this.#applySessionControls(
+        client,
+        sessionId,
+        {
+          modelId: this.#cli.model?.trim() || this.#config.default_model?.trim() || null,
+          thoughtLevel: this.#cli.thought?.trim() || this.#config.default_thought?.trim() || null,
+          modeId: this.#cli.mode?.trim() || this.#config.default_mode?.trim() || null,
+        },
+        outcome.epoch,
+        { allowFuzzyModel: true, toastFailurePrefix: 'Failed to apply initial' }
+      );
       return;
     }
 
@@ -1648,7 +1910,7 @@ export class AppController {
     if (
       this.#shuttingDown ||
       !this.#isAcpClientLive(client) ||
-      outcome.epoch !== this.#sessionEpoch
+      outcome.epoch !== this.#lifecycle.epoch
     ) {
       return;
     }
@@ -1658,32 +1920,41 @@ export class AppController {
     const cliMode = preferSavedOverCli ? '' : (this.#cli.mode?.trim() || '');
 
     if (cliModel) {
-      await applyModelAndThoughtPreference(
-        cliModel,
-        cliThought || this.#config.default_thought?.trim() || ''
-      );
-    } else if (saved?.modelId || saved?.thoughtLevel) {
-      await this.#applyCarryOverControls(
+      await this.#applySessionControls(
         client,
         sessionId,
         {
-          modelId: saved.modelId,
-          thoughtLevel: cliThought || saved.thoughtLevel,
-          modeId: null,
+          modelId: cliModel,
+          thoughtLevel: cliThought || this.#config.default_thought?.trim() || null,
         },
-        outcome.epoch
+        outcome.epoch,
+        { allowFuzzyModel: true, toastFailurePrefix: 'Failed to apply initial' }
+      );
+    } else if (saved?.modelId || saved?.thoughtLevel) {
+      await this.#applySessionControls(
+        client,
+        sessionId,
+        { modelId: saved.modelId, thoughtLevel: cliThought || saved.thoughtLevel },
+        outcome.epoch,
+        { clampInvalidThought: true, toastFailurePrefix: 'Failed to carry over' }
       );
     } else {
-      await applyModelAndThoughtPreference(
-        this.#config.default_model?.trim() || '',
-        cliThought || this.#config.default_thought?.trim() || ''
+      await this.#applySessionControls(
+        client,
+        sessionId,
+        {
+          modelId: this.#config.default_model?.trim() || null,
+          thoughtLevel: cliThought || this.#config.default_thought?.trim() || null,
+        },
+        outcome.epoch,
+        { allowFuzzyModel: true, toastFailurePrefix: 'Failed to apply initial' }
       );
     }
 
     if (
       this.#shuttingDown ||
       !this.#isAcpClientLive(client) ||
-      outcome.epoch !== this.#sessionEpoch
+      outcome.epoch !== this.#lifecycle.epoch
     ) {
       return;
     }
@@ -1691,11 +1962,12 @@ export class AppController {
     if (cliMode) {
       await this.#applyMode(cliMode, true);
     } else if (saved?.modeId) {
-      await this.#applyCarryOverControls(
+      await this.#applySessionControls(
         client,
         sessionId,
-        { modelId: null, thoughtLevel: null, modeId: saved.modeId },
-        outcome.epoch
+        { modeId: saved.modeId },
+        outcome.epoch,
+        { clampInvalidThought: true, toastFailurePrefix: 'Failed to carry over' }
       );
     } else if (this.#config.default_mode?.trim()) {
       await this.#applyMode(this.#config.default_mode.trim(), true);
@@ -1727,13 +1999,11 @@ export class AppController {
         ? params.sessionId.trim()
         : undefined;
 
-    // While `session/new` is in flight, buffer incoming notifications and replay ONLY
-    // those whose `sessionId` matches the newly created session (so early new-session
-    // notifications like `available_commands_update` are preserved while stale old-session
-    // chunks are discarded).
-    if (this.#creatingSessionEpoch !== null && !this.#replayingSessionId) {
-      if (incomingSessionId && this.#pendingNewSessionUpdates.length < 256) {
-        this.#pendingNewSessionUpdates.push(params);
+    // While `session/new` RPC is still in flight, buffer incoming notifications and replay ONLY
+    // those whose `sessionId` matches the newly created session.
+    if (this.#lifecycle.phase === 'creating' && !this.#lifecycle.snapshotApplied) {
+      if (incomingSessionId && this.#lifecycle.bufferedUpdates.length < 256) {
+        this.#lifecycle.bufferedUpdates.push(params);
       } else {
         this.store.traffic.recordSystem(
           `ignored session/update without sessionId during session creation`,
@@ -1743,7 +2013,10 @@ export class AppController {
       return;
     }
 
-    const expectedSessionId = this.#replayingSessionId ?? this.store.getState().sessionId;
+    const expectedSessionId =
+      this.#lifecycle.phase === 'replaying'
+        ? this.#lifecycle.targetSessionId
+        : this.store.getState().sessionId;
     if (incomingSessionId && (!expectedSessionId || incomingSessionId !== expectedSessionId)) {
       this.store.traffic.recordSystem(
         `ignored stale session/update for ${incomingSessionId} (active: ${expectedSessionId ?? 'none'})`,
@@ -1761,6 +2034,11 @@ export class AppController {
       !isReplayingBefore && params.update.sessionUpdate === 'usage_update'
         ? (this.store.getState().usage?.used ?? 0)
         : 0;
+    const prevPlanRef = !isReplayingBefore ? this.store.transcript.plan : null;
+    const prevTodoRevision = !isReplayingBefore ? this.store.transcript.todoRevision : 0;
+    const prevTodoToolCallCount = !isReplayingBefore
+      ? this.store.transcript.todoToolCallCount
+      : 0;
     const outcome = this.store.applySessionUpdate(params.update);
     if (!outcome.handled && outcome.unknownUpdateType) {
       this.store.traffic.recordSystem(
@@ -1774,6 +2052,63 @@ export class AppController {
     const update = params.update;
 
     if (!isReplaying) {
+      const todoRevisionChanged = this.store.transcript.todoRevision !== prevTodoRevision;
+      const todoCountChanged =
+        this.store.transcript.todoToolCallCount !== prevTodoToolCallCount;
+      const nextPlan = this.store.transcript.plan;
+      const planChanged = nextPlan !== prevPlanRef;
+      if (todoRevisionChanged || todoCountChanged) {
+        const activeSessionId = this.store.getState().sessionId;
+        if (!this.store.transcript.hasUserTodoOverride) {
+          this.#hasRestoredUserAnchor = false;
+          if (todoRevisionChanged) {
+            this.#pendingTodoSyncReminder = null;
+          }
+        } else if (this.#hasRestoredUserAnchor) {
+          const restoredPhases = this.store.transcript.todoPhases;
+          const replayedCleaned = this.store.transcript.replayedTodoPhases.filter(
+            phase => phase.tasks.length > 0
+          );
+          this.#pendingTodoSyncReminder =
+            JSON.stringify(restoredPhases) !== JSON.stringify(replayedCleaned)
+              ? formatUserTodoSyncReminder(
+                  'resumed session todo state',
+                  restoredPhases,
+                  restoredPhases.length === 0
+                )
+              : null;
+        }
+        if (todoRevisionChanged) {
+          if (activeSessionId && this.committedSessionTodoProvider === 'mcp') {
+            this.#todoServer?.seedSession(activeSessionId, this.store.transcript.todoPhases);
+          }
+          if (!planChanged) {
+            if (this.store.transcript.todoPhases.length === 0) {
+              this.#clearTodoAutoClearTimer();
+            } else {
+              this.#scheduleTodoAutoClearIfDone();
+            }
+          }
+        }
+        void this.#persistSessionAnchorAndOsc().catch(() => {});
+      }
+      if (
+        (update.sessionUpdate === 'plan' ||
+          update.sessionUpdate === 'plan_update' ||
+          update.sessionUpdate === 'tool_call' ||
+          update.sessionUpdate === 'tool_call_update') &&
+        planChanged
+      ) {
+        this.#todoHudDismissed = false;
+        if (nextPlan === null) {
+          this.#clearTodoAutoClearTimer();
+        } else {
+          this.#scheduleTodoAutoClearIfDone();
+        }
+      } else if (update.sessionUpdate === 'plan_removed') {
+        this.#clearTodoAutoClearTimer();
+        this.#todoHudDismissed = false;
+      }
       if (update.sessionUpdate === 'usage_update') {
         const nextUsageUsed = this.store.getState().usage?.used ?? 0;
         if (prevUsageUsed >= 1_000 && nextUsageUsed > 0 && nextUsageUsed <= prevUsageUsed * 0.7) {
@@ -1820,7 +2155,9 @@ export class AppController {
           rawTitle.includes('swarm_wait');
         const isSwarmTool =
           rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle);
-        if (isSwarmTool || isSwarmWait) {
+        const isPostMessage = rawName === 'post_message' || rawTitle === 'post_message';
+        if (isSwarmTool || isSwarmWait || isPostMessage) {
+          this.#syncSwarmFxStylesheet();
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
         if (isSwarmWait) {
@@ -1968,8 +2305,8 @@ export class AppController {
   }
 
   #cancelPendingReplayedServerRequests(): void {
-    const queued = this.#pendingReplayedServerRequests;
-    this.#pendingReplayedServerRequests = [];
+    const queued =
+      this.#lifecycle.phase === 'replaying' ? this.#lifecycle.bufferedRequests.splice(0) : [];
     if (queued.length === 0) return;
     const client = this.#acpClient;
     if (!client?.isRunning) return;
@@ -1986,16 +2323,18 @@ export class AppController {
     }
   }
 
-  #drainPendingReplayedServerRequests(sessionId: string, epoch: number): void {
-    const queued = this.#pendingReplayedServerRequests;
-    this.#pendingReplayedServerRequests = [];
+  #drainPendingReplayedServerRequests(
+    queued: readonly BufferedServerRequest[],
+    sessionId: string,
+    epoch: number
+  ): void {
     if (queued.length === 0) return;
     const client = this.#acpClient;
     for (const item of queued) {
       const canMount =
         !this.#shuttingDown &&
         item.epoch === epoch &&
-        epoch === this.#sessionEpoch &&
+        epoch === this.#lifecycle.epoch &&
         item.sessionId === sessionId &&
         this.store.getState().sessionId === sessionId;
       if (canMount) {
@@ -2022,19 +2361,15 @@ export class AppController {
       req.params && typeof (req.params as { sessionId?: unknown }).sessionId === 'string'
         ? ((req.params as { sessionId: string }).sessionId.trim() || undefined)
         : undefined;
-    const isReplayingTargetSession = Boolean(
-      reqSessionId &&
-        this.#replayingSessionId !== null &&
-        reqSessionId === this.#replayingSessionId &&
-        this.#replayingSessionEpoch === this.#sessionEpoch
-    );
     if (
-      isReplayingTargetSession &&
+      reqSessionId &&
+      this.#lifecycle.phase === 'replaying' &&
+      reqSessionId === this.#lifecycle.targetSessionId &&
       (isRequestPermissionRequest(req) || isElicitationCreateRequest(req))
     ) {
-      this.#pendingReplayedServerRequests.push({
-        epoch: this.#sessionEpoch,
-        sessionId: reqSessionId!,
+      this.#lifecycle.bufferedRequests.push({
+        epoch: this.#lifecycle.epoch,
+        sessionId: reqSessionId,
         req,
       });
       this.store.traffic.recordSystem(
@@ -2047,8 +2382,8 @@ export class AppController {
     const activeSessionId = this.store.getState().sessionId;
     const isStaleRequestSession = Boolean(
       reqSessionId &&
-        (this.#creatingSessionEpoch !== null ||
-          this.#replayingSessionId !== null ||
+        (this.#lifecycle.phase === 'creating' ||
+          this.#lifecycle.phase === 'replaying' ||
           !activeSessionId ||
           reqSessionId !== activeSessionId)
     );
@@ -2121,23 +2456,30 @@ export class AppController {
         void client.respondToServerRequest(req.id, { action: 'cancel' }).catch(() => {});
         return;
       }
-      this.store.transcript.finalizeActiveThoughts({
-        autoCollapseThought: this.store.autoCollapseThought,
-        expandAllTools: this.store.getState().expandAllTools,
-      });
+      const hadActiveQuestion = this.store.getState().activeQuestion !== null;
+      if (!hadActiveQuestion) {
+        this.store.transcript.finalizeActiveThoughts({
+          autoCollapseThought: this.store.autoCollapseThought,
+          expandAllTools: this.store.getState().expandAllTools,
+        });
+      }
       const card = this.store.openQuestion(req.id, req.params, response => {
         void client.respondToServerRequest(req.id, response).catch(() => {});
       });
-      const firstQ = card.items[0];
-      if (firstQ && (!firstQ.choices || firstQ.choices.length === 0) && firstQ.other) {
-        this.store.setQuestionFocusedOther(firstQ.id);
+      if (!hadActiveQuestion) {
+        const firstQ = card.items[0];
+        if (firstQ && (!firstQ.choices || firstQ.choices.length === 0) && firstQ.other) {
+          this.store.setQuestionFocusedOther(firstQ.id);
+        }
+        this.osc.setStatusBlocked('question');
+        this.scheduler.renderNow();
+        if (this.surface && this.session.caps.features.includes('scroll')) {
+          this.surface.reveal('main.questions', 'end');
+        }
+        this.syncFocus();
+      } else {
+        this.scheduler.renderNow();
       }
-      this.osc.setStatusBlocked('question');
-      this.scheduler.renderNow();
-      if (this.surface && this.session.caps.features.includes('scroll')) {
-        this.surface.reveal('main.questions', 'end');
-      }
-      this.syncFocus();
       return;
     }
 
@@ -2147,21 +2489,21 @@ export class AppController {
       .catch(() => {});
   }
 
-  #handleAcpExit(info: AcpExitInfo): void {
+  #handleAcpExit(info: AcpExitInfo, client?: AcpClient): void {
     if (this.#shuttingDown || info.expected) return;
+    if (client && this.#acpClient !== client) return;
+    const curStatus = this.store.getState().connectionStatus;
+    if (curStatus === 'auth_required' || curStatus === 'closing') {
+      this.#acpClientAlive = false;
+      return;
+    }
 
     this.#acpClientAlive = false;
     const crashMessage =
       info.error?.message ||
       `agy acp exited unexpectedly${info.code !== null ? ` (exit code ${info.code})` : ''}.`;
 
-    this.#cancelReplayDrain(new Error(crashMessage));
-    this.#cancelPendingReplayedServerRequests();
-    this.#replayingSessionId = null;
-    this.#replayingSessionEpoch = null;
-    this.#creatingSessionEpoch = null;
-    this.#pendingNewSessionUpdates = [];
-    this.store.setReplaying(false);
+    this.#resetLifecycleToIdle({ abortError: new Error(crashMessage) });
     this.#stopSwarmWatcher();
     this.#clearBackgroundDoneTimer();
     this.#pendingBackgroundDone = false;
@@ -2178,27 +2520,27 @@ export class AppController {
     for (const perm of cancelledPerms) {
       this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
     }
-    this.store.cancelActiveQuestion();
-
-    if (this.store.getState().isStreaming || this.store.transcript.activeTurn !== undefined) {
+    const wasStreaming = this.store.getState().isStreaming;
+    if (wasStreaming || this.store.transcript.activeTurn !== undefined) {
       this.store.transcript.finishActiveTurn(undefined, 'error', undefined, {
         autoCollapseThought: this.store.autoCollapseThought,
         expandAllTools: this.store.getState().expandAllTools,
       });
-      if (this.#metricsTracker.isStreaming) {
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
-      }
-      this.store.setStreaming(false);
     }
 
-    this.#syncSwarmFxStylesheet();
     this.osc.setStatusError();
     this.store.setCrashError({
       message: crashMessage,
       stderrTail: info.stderrTail,
       exitCode: info.code,
     });
+    this.store.cancelAllQuestions();
+    if (this.#metricsTracker.isStreaming) {
+      const endedSnap = this.#metricsTracker.endStreamTurn();
+      this.#applySessionMetricsSnapshot(endedSnap);
+    }
+
+    this.#syncSwarmFxStylesheet();
     if (this.scheduler.suspended) {
       this.scheduler.resumeAfterReplay(false);
     } else {
@@ -3433,6 +3775,16 @@ export class AppController {
   ): void {
     const resolved = this.store.resolveActiveQuestion(result);
     if (!resolved) return;
+    if (this.store.getState().activeQuestion) {
+      this.#syncQuestionAutoFocus();
+      this.#restoreOscAfterBlock();
+      this.scheduler.renderNow();
+      if (this.surface && this.session.caps.features.includes('scroll')) {
+        this.surface.reveal('main.questions', 'end');
+      }
+      this.syncFocus();
+      return;
+    }
     this.#restoreOscAfterBlock();
     this.scheduler.renderNow();
     this.syncFocus();
@@ -3722,6 +4074,30 @@ export class AppController {
     };
   }
 
+  #abortStreamingTurn(status: 'cancelled' | 'error', message: string): void {
+    const state = this.store.getState();
+    this.store.transcript.finishActiveTurn(undefined, status, message, {
+      autoCollapseThought: this.store.autoCollapseThought,
+      expandAllTools: state.expandAllTools,
+    });
+    const endedSnap = this.#metricsTracker.endStreamTurn();
+    this.#applySessionMetricsSnapshot(endedSnap);
+    this.store.setStreaming(false);
+    this.#syncToolWatchTimer();
+    if (!this.store.isBusy) {
+      this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#backgroundResumeAnchorStepSeq = 0;
+      this.#backgroundWaitLastProgressAt = 0;
+      this.#deferredSettleTurnIndex = null;
+      this.#workingStartedAt = undefined;
+      this.#clearBackgroundDoneTimer();
+      if (status === 'cancelled' && state.connectionStatus === 'ready') {
+        this.osc.setStatusIdle();
+      }
+    }
+  }
+
   async #sendPromptToAcp(
     text: string,
     attachments: readonly AttachmentItem[],
@@ -3732,7 +4108,15 @@ export class AppController {
     const state = this.store.getState();
 
     if (!client || !this.#isAcpClientLive(client) || !state.isReady || !state.sessionId) {
-      this.store.pushToast('Session is not ready yet', 'warning');
+      this.store.pushToast(
+        state.connectionStatus === 'ready' &&
+          !state.sessionId &&
+          !state.isReplaying &&
+          !state.isCreatingSession
+          ? 'No active session — use /new or /resume'
+          : 'Session is not ready yet',
+        'warning'
+      );
       this.scheduler.renderNow();
       return;
     }
@@ -3747,7 +4131,7 @@ export class AppController {
     // submit triggers cannot race into two overlapping `session/prompt` RPCs.
     this.#promptSubmitting = true;
     const sessionId = state.sessionId;
-    const promptEpoch = this.#sessionEpoch;
+    const promptEpoch = this.#lifecycle.epoch;
     const isCompactPrompt = /^\/compact(?:\s|$)/i.test(text.trim());
     const isLeadingSlashPrompt = /^\/[^\s]+/.test(text.trim());
     const suppressedMentions = preserveDraft
@@ -3778,7 +4162,7 @@ export class AppController {
       const postSyncState = this.store.getState();
       if (
         this.#shuttingDown ||
-        promptEpoch !== this.#sessionEpoch ||
+        promptEpoch !== this.#lifecycle.epoch ||
         !this.#isAcpClientLive(client) ||
         !postSyncState.isReady ||
         postSyncState.sessionId !== sessionId
@@ -3809,11 +4193,23 @@ export class AppController {
           const preSendState = this.store.getState();
           if (
             this.#shuttingDown ||
-            promptEpoch !== this.#sessionEpoch ||
+            promptEpoch !== this.#lifecycle.epoch ||
             !this.#isAcpClientLive(client) ||
             !preSendState.isReady ||
             preSendState.sessionId !== sessionId
           ) {
+            if (
+              !this.#shuttingDown &&
+              promptEpoch === this.#lifecycle.epoch &&
+              preSendState.sessionId === sessionId
+            ) {
+              const reason =
+                this.#logoutInFlightClient === client
+                  ? 'Prompt cancelled because sign-out is in progress'
+                  : 'Prompt cancelled before dispatch';
+              this.#abortStreamingTurn('cancelled', reason);
+              this.scheduler.renderNow();
+            }
             return;
           }
 
@@ -3829,158 +4225,139 @@ export class AppController {
             prompt: outboundPrompt,
           });
 
-          if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
-            this.#pendingTodoSyncReminder = null;
-          }
-
-        if (
-          this.#shuttingDown ||
-          promptEpoch !== this.#sessionEpoch ||
-          this.store.getState().sessionId !== sessionId
-        ) {
-          return;
-        }
-        if (result.stopReason === 'end_turn') {
-          await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
           if (
             this.#shuttingDown ||
-            promptEpoch !== this.#sessionEpoch ||
+            promptEpoch !== this.#lifecycle.epoch ||
             this.store.getState().sessionId !== sessionId
           ) {
             return;
           }
-        }
-        const finishedTurn = this.store.transcript.finishActiveTurn(
-          result.stopReason,
-          undefined,
-          undefined,
-          {
-            autoCollapseThought: this.store.autoCollapseThought,
-            expandAllTools: this.store.getState().expandAllTools,
-            preserveInFlightBackgroundTools: true,
+          if (!isCompactPrompt) {
+            this.#hasRestoredUserAnchor = false;
+            if (reminderToSend && this.#pendingTodoSyncReminder === reminderToSend) {
+              this.#pendingTodoSyncReminder = null;
+            }
           }
-        );
-        if (
-          result.stopReason === 'end_turn' &&
-          isCompactPrompt &&
-          finishedTurn &&
-          !finishedTurn.notices.some(n => n.kind === 'compaction')
-        ) {
-          this.store.transcript.markCompactionCompleted(finishedTurn.index);
-        }
-        this.store.setStreaming(false);
-
-        const hasBgTools = this.store.hasActiveBackgroundTasks();
-        const swarmActive = this.store.isSwarmWorking;
-        const needSwarmReply =
-          this.#awaitingSwarmCoordinatorReply ||
-          (swarmActive && !this.#swarmCoordinatorReplied);
-        const stillBusy =
-          hasBgTools ||
-          swarmActive ||
-          needSwarmReply ||
-          (this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking());
-
-        const promptOutputTokens =
-          typeof result.usage?.outputTokens === 'number' &&
-          Number.isFinite(result.usage.outputTokens) &&
-          result.usage.outputTokens > 0
-            ? result.usage.outputTokens
-            : undefined;
-
-        if (!stillBusy) {
-          const endedSnap = this.#metricsTracker.endStreamTurn(
-            promptOutputTokens !== undefined
-              ? { authoritativeOutputTokens: promptOutputTokens }
-              : undefined
+          if (result.stopReason === 'end_turn') {
+            await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
+            if (
+              this.#shuttingDown ||
+              promptEpoch !== this.#lifecycle.epoch ||
+              this.store.getState().sessionId !== sessionId
+            ) {
+              return;
+            }
+          }
+          const finishedTurn = this.store.transcript.finishActiveTurn(
+            result.stopReason,
+            undefined,
+            undefined,
+            {
+              autoCollapseThought: this.store.autoCollapseThought,
+              expandAllTools: this.store.getState().expandAllTools,
+              preserveInFlightBackgroundTools: true,
+            }
           );
-          this.#applySessionMetricsSnapshot(endedSnap);
-          this.#pendingBackgroundDone = false;
-          this.#awaitingPostToolWakeup = false;
-          this.#backgroundResumeAnchorStepSeq = 0;
-          this.#backgroundWaitLastProgressAt = 0;
-          this.#awaitingSwarmCoordinatorReply = false;
-          this.#swarmCoordinatorReplied = false;
-          this.#deferredSettleTurnIndex = null;
-          this.#workingStartedAt = undefined;
-          this.#clearBackgroundDoneTimer();
-        } else {
-          // Keep OSC 7501 `working`, continuous elapsed timer & unsettled turn while
-          // detached/in-flight background tools or swarm workers remain active; defer
-          // `done` and turn settlement until the actual user-facing completion.
-          this.#metricsTracker.pauseForTools();
-          // Keep "waiting for coordinator reply" and "waiting for workers to go idle after
-          // visible reply" distinct so a lagged worker snapshot never suppresses `state=done`.
-          this.#awaitingSwarmCoordinatorReply = needSwarmReply;
-          this.#pendingBackgroundDone =
-            hasBgTools || (!needSwarmReply && this.#swarmCoordinatorReplied);
-          this.#awaitingPostToolWakeup = false;
-          if (this.#pendingBackgroundDone) {
-            this.#backgroundResumeAnchorStepSeq =
-              this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
-            this.#backgroundWaitLastProgressAt = this.#now();
+          if (
+            result.stopReason === 'end_turn' &&
+            isCompactPrompt &&
+            finishedTurn &&
+            !finishedTurn.notices.some(n => n.kind === 'compaction')
+          ) {
+            this.store.transcript.markCompactionCompleted(finishedTurn.index);
           }
-          if (finishedTurn) {
-            this.#deferredSettleTurnIndex = finishedTurn.index;
+          this.store.setStreaming(false);
+
+          const hasBgTools = this.store.hasActiveBackgroundTasks();
+          const swarmActive = this.store.isSwarmWorking;
+          const needSwarmReply =
+            this.#awaitingSwarmCoordinatorReply ||
+            (swarmActive && !this.#swarmCoordinatorReplied);
+          const stillBusy =
+            hasBgTools ||
+            swarmActive ||
+            needSwarmReply ||
+            (this.#pendingBackgroundDone && this.#isSwarmCoordinatorWorking());
+
+          const promptOutputTokens =
+            typeof result.usage?.outputTokens === 'number' &&
+            Number.isFinite(result.usage.outputTokens) &&
+            result.usage.outputTokens > 0
+              ? result.usage.outputTokens
+              : undefined;
+
+          if (!stillBusy) {
+            const endedSnap = this.#metricsTracker.endStreamTurn(
+              promptOutputTokens !== undefined
+                ? { authoritativeOutputTokens: promptOutputTokens }
+                : undefined
+            );
+            this.#applySessionMetricsSnapshot(endedSnap);
+            this.#pendingBackgroundDone = false;
+            this.#awaitingPostToolWakeup = false;
+            this.#backgroundResumeAnchorStepSeq = 0;
+            this.#backgroundWaitLastProgressAt = 0;
+            this.#awaitingSwarmCoordinatorReply = false;
+            this.#swarmCoordinatorReplied = false;
+            this.#deferredSettleTurnIndex = null;
+            this.#workingStartedAt = undefined;
+            this.#clearBackgroundDoneTimer();
+          } else {
+            // Keep OSC 7501 `working`, continuous elapsed timer & unsettled turn while
+            // detached/in-flight background tools or swarm workers remain active; defer
+            // `done` and turn settlement until the actual user-facing completion.
+            this.#metricsTracker.pauseForTools();
+            this.#awaitingSwarmCoordinatorReply = needSwarmReply;
+            this.#pendingBackgroundDone =
+              hasBgTools || (!needSwarmReply && this.#swarmCoordinatorReplied);
+            this.#awaitingPostToolWakeup = false;
+            if (this.#pendingBackgroundDone) {
+              this.#backgroundResumeAnchorStepSeq =
+                this.#metricsTracker.getLatestTurnActivity()?.latestStepSeq ?? 0;
+              this.#backgroundWaitLastProgressAt = this.#now();
+            }
+            if (finishedTurn) {
+              this.#deferredSettleTurnIndex = finishedTurn.index;
+            }
+            this.#clearDoneIdleTimer();
+            this.#clearBackgroundDoneTimer();
           }
-          this.#clearDoneIdleTimer();
-          this.#clearBackgroundDoneTimer();
-        }
 
-        // Flush final non-streaming frame & settle turn BEFORE emitting OSC 7501 `state=done`
-        // so the user never receives a completion notification ahead of the final reply.
-        this.scheduler.renderNow();
-        if (!stillBusy && finishedTurn) {
-          this.scheduler.settleTurn(finishedTurn.index);
-          this.osc.reassertCursorHidden();
-        }
+          // Flush final non-streaming frame & settle turn BEFORE emitting OSC 7501 `state=done`
+          this.scheduler.renderNow();
+          if (!stillBusy && finishedTurn) {
+            this.scheduler.settleTurn(finishedTurn.index);
+            this.osc.reassertCursorHidden();
+          }
 
-        if (stillBusy) {
-          this.osc.setStatusWorking();
-        } else {
-          this.osc.setStatusDone();
-          this.#scheduleDoneToIdle();
-        }
+          if (stillBusy) {
+            this.osc.setStatusWorking();
+          } else {
+            this.osc.setStatusDone();
+            this.#scheduleDoneToIdle();
+          }
 
-        // Authoritatively calibrate post-turn TPS + cumulative tokens from transcript.jsonl and refresh git
-        this.#syncToolWatchTimer();
-        void this.#syncSessionMetricsFromTranscript();
-        void this.#refreshGitStatus();
-        void this.#persistSessionAnchorAndOsc().catch(() => {});
-      } catch (err) {
-        if (
-          this.#shuttingDown ||
-          promptEpoch !== this.#sessionEpoch ||
-          this.store.getState().sessionId !== sessionId
-        ) {
-          return;
+          this.#syncToolWatchTimer();
+          void this.#syncSessionMetricsFromTranscript();
+          void this.#refreshGitStatus();
+          void this.#persistSessionAnchorAndOsc().catch(() => {});
+        } catch (err) {
+          if (
+            this.#shuttingDown ||
+            promptEpoch !== this.#lifecycle.epoch ||
+            this.store.getState().sessionId !== sessionId
+          ) {
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          this.#abortStreamingTurn('error', msg);
+          this.store.pushToast(`Prompt failed: ${msg}`, 'error');
+          this.osc.setStatusError();
+          this.scheduler.renderNow();
+          void this.#syncSessionMetricsFromTranscript();
+          void this.#refreshGitStatus();
         }
-        const msg = err instanceof Error ? err.message : String(err);
-        this.store.transcript.finishActiveTurn(undefined, 'error', msg, {
-          autoCollapseThought: this.store.autoCollapseThought,
-          expandAllTools: this.store.getState().expandAllTools,
-        });
-        const endedSnap = this.#metricsTracker.endStreamTurn();
-        this.#applySessionMetricsSnapshot(endedSnap);
-        this.store.setStreaming(false);
-        this.#syncToolWatchTimer();
-        if (!this.store.isBusy) {
-          this.#pendingBackgroundDone = false;
-          this.#awaitingPostToolWakeup = false;
-          this.#backgroundResumeAnchorStepSeq = 0;
-          this.#backgroundWaitLastProgressAt = 0;
-          this.#deferredSettleTurnIndex = null;
-          this.#workingStartedAt = undefined;
-          this.#clearBackgroundDoneTimer();
-        }
-
-        this.store.pushToast(`Prompt failed: ${msg}`, 'error');
-        this.osc.setStatusError();
-        this.scheduler.renderNow();
-        void this.#syncSessionMetricsFromTranscript();
-        void this.#refreshGitStatus();
-      }
-    };
+      };
 
       const task = runPrompt().finally(() => {
         if (this.#activePromptTask === task) {
@@ -4132,7 +4509,7 @@ export class AppController {
     for (const perm of cancelledPerms) {
       this.store.transcript.resolvePermissionOnTool(perm.toolCallId, 'cancelled');
     }
-    const cancelledQ = this.store.cancelActiveQuestion();
+    const cancelledQ = this.store.cancelAllQuestions() > 0;
 
     const state = this.store.getState();
     const hadBackgroundBusy = state.hasActiveBackgroundTasks || state.isSwarmWorking;
@@ -4246,12 +4623,12 @@ export class AppController {
     const pathOpts = this.#getSwarmPathOptions();
     const watcher = watchSwarmBoard(
       sid,
-      snapshot => {
+      (snapshot, meta) => {
         if (this.#shuttingDown || this.#swarmWatcher !== watcher) {
           watcher.stop();
           return;
         }
-        this.#applySwarmSnapshot(snapshot);
+        this.#applySwarmSnapshot(snapshot, { fromInitialLoad: !meta.changed });
       },
       {
         ...pathOpts,
@@ -4372,7 +4749,10 @@ export class AppController {
     }
   }
 
-  #applySwarmSnapshot(snapshot: SwarmBoardSnapshot | null): void {
+  #applySwarmSnapshot(
+    snapshot: SwarmBoardSnapshot | null,
+    options: { fromInitialLoad?: boolean } = {}
+  ): void {
     const prevState = this.store.getState();
     const prevBusy = prevState.isBusy;
 
@@ -4393,7 +4773,7 @@ export class AppController {
       }
     }
 
-    this.store.setSwarmSnapshot(snapshot);
+    this.store.setSwarmSnapshot(snapshot, { fromInitialLoad: options.fromInitialLoad });
     this.#syncSwarmFxStylesheet();
     this.#reconcileBackgroundActivity(prevBusy);
 
@@ -4428,7 +4808,7 @@ export class AppController {
       const sessionId = this.store.getState().sessionId ?? '';
       const snapshot = await loadSwarmBoard(sessionId, this.#getSwarmPathOptions());
       if (!this.#shuttingDown && snapshot !== null) {
-        this.#applySwarmSnapshot(snapshot);
+        this.#applySwarmSnapshot(snapshot, { fromInitialLoad: true });
       }
     }
   }
@@ -4449,7 +4829,7 @@ export class AppController {
     const sessionId = state.sessionId ?? '';
     const snapshot = await loadSwarmBoard(sessionId, this.#getSwarmPathOptions());
     if (this.#shuttingDown) return;
-    this.#applySwarmSnapshot(snapshot);
+    this.#applySwarmSnapshot(snapshot, { fromInitialLoad: true });
   }
 
   #toggleSwarmFollow(): void {
@@ -4789,6 +5169,9 @@ export class AppController {
       const scanned = await scanLocalSkills(this.store.getState().cwd, acpCmds, {
         ...(this.#workspaceSkillsDir ? { workspaceSkillsDir: this.#workspaceSkillsDir } : {}),
         ...(this.#globalSkillsDir ? { globalSkillsDir: this.#globalSkillsDir } : {}),
+        ...(this.#agentsGlobalSkillsDir
+          ? { agentsGlobalSkillsDir: this.#agentsGlobalSkillsDir }
+          : {}),
       });
       if (isStale()) return;
       const mapped: SkillItem[] = scanned.map(s => ({
@@ -5051,43 +5434,141 @@ export class AppController {
     }
   }
 
+  async #recoverPreviousSessionAfterFailure(
+    client: AcpClient,
+    previous: {
+      readonly sessionId: string | null;
+      readonly cwd: string;
+      readonly title?: string;
+      readonly todoProvider?: TodoProvider;
+    },
+    failedSessionId: string | null,
+    expectedEpoch: number
+  ): Promise<'restored' | 'failed' | 'superseded'> {
+    if (
+      this.#shuttingDown ||
+      expectedEpoch !== this.#lifecycle.epoch ||
+      !this.#isAcpClientLive(client)
+    ) {
+      return 'superseded';
+    }
+    if (!previous.sessionId || previous.sessionId === failedSessionId) {
+      this.#lastCommittedSession = null;
+      this.#resetLifecycleToIdle({ resetStore: true });
+      return 'failed';
+    }
+    const recoveryEpoch = this.#beginSessionTransition('replaying', previous.sessionId);
+    try {
+      const restored = await this.#loadSessionWithReplay(
+        client,
+        previous.sessionId,
+        previous.cwd,
+        previous.title,
+        recoveryEpoch,
+        {
+          restoreSavedControls: true,
+          ...(previous.todoProvider ? { todoProviderOverride: previous.todoProvider } : {}),
+        }
+      );
+      if (
+        !restored ||
+        this.#shuttingDown ||
+        recoveryEpoch !== this.#lifecycle.epoch ||
+        !this.#isAcpClientLive(client)
+      ) {
+        return 'superseded';
+      }
+      this.#restoreOscAfterBlock();
+      this.osc.setWorkingDirectory(this.store.getState().cwd);
+      await this.#persistSessionAnchorAndOsc();
+      if (this.#shuttingDown || recoveryEpoch !== this.#lifecycle.epoch) {
+        return 'superseded';
+      }
+      return 'restored';
+    } catch {
+      if (
+        this.#shuttingDown ||
+        recoveryEpoch !== this.#lifecycle.epoch ||
+        !this.#isAcpClientLive(client)
+      ) {
+        return 'superseded';
+      }
+      this.#lastCommittedSession = null;
+      this.#resetLifecycleToIdle({ resetStore: true });
+      return 'failed';
+    }
+  }
+
   async #switchToSession(
     sessionId: string,
     meta?: ResumeSessionEntry
   ): Promise<void> {
     const client = this.#acpClient;
-    if (!client) return;
-
     const state = this.store.getState();
+    if (state.connectionStatus === 'initializing') {
+      this.store.pushToast('Session is still initializing; please wait a moment.', 'info', {
+        ttl: 2000,
+      });
+      this.scheduler.renderNow();
+      this.syncFocus();
+      return;
+    }
+    if (!client || !this.#isAcpClientLive(client)) return;
+
     const oldSessionId = state.sessionId;
+    const desiredTodoProvider: TodoProvider = this.#isTodoMcpEnabled()
+      ? 'mcp'
+      : this.#getEffectiveTodoProvider();
+    if (
+      oldSessionId &&
+      oldSessionId === sessionId &&
+      this.#lifecycle.phase === 'ready' &&
+      this.#lifecycle.provider === desiredTodoProvider &&
+      this.#isAcpClientLive(client)
+    ) {
+      this.store.pushToast(
+        `Already in session ${meta?.title || state.sessionTitle || sessionId.slice(0, 8)}`,
+        'info',
+        { ttl: 2000 }
+      );
+      this.scheduler.renderNow();
+      this.syncFocus();
+      return;
+    }
     const wasStreaming = state.isStreaming;
+    const isSameSessionReload = Boolean(oldSessionId && oldSessionId === sessionId);
+    const previous =
+      oldSessionId && this.#lifecycle.phase === 'ready'
+        ? {
+            sessionId: oldSessionId,
+            cwd: state.cwd,
+            ...(state.sessionTitle ? { title: state.sessionTitle } : {}),
+            todoProvider: this.#lifecycle.provider,
+          }
+        : (this.#lastCommittedSession ?? { sessionId: null, cwd: state.cwd });
     const targetCwd =
       meta?.cwd && !sameDir(meta.cwd, state.cwd) ? normalizeDisplayPath(meta.cwd) : state.cwd;
 
     const switchEpoch = this.#beginSessionTransition('replaying', sessionId);
     try {
-      if (oldSessionId && oldSessionId !== sessionId) {
+      if (oldSessionId) {
         if (wasStreaming) {
           await client.cancel(oldSessionId).catch(() => {});
         }
-        await client.closeSession(oldSessionId).catch(() => {});
-        this.#todoServer?.clearSession(oldSessionId);
+        if (oldSessionId !== sessionId) {
+          await client.closeSession(oldSessionId).catch(() => {});
+        }
       }
 
-      if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) {
+      if (this.#shuttingDown || switchEpoch !== this.#lifecycle.epoch) {
         return;
       }
+      if (oldSessionId && oldSessionId !== sessionId) {
+        this.#todoServer?.clearSession(oldSessionId);
+      }
       if (!this.#isAcpClientLive(client)) {
-        if (this.#replayingSessionEpoch === switchEpoch) {
-          this.#replayingSessionId = null;
-          this.#replayingSessionEpoch = null;
-        }
-        this.store.setReplaying(false);
-        if (this.scheduler.suspended) {
-          this.scheduler.resumeAfterReplay(false);
-        } else {
-          this.scheduler.renderNow(true);
-        }
+        this.#resetLifecycleToIdle();
+        this.scheduler.renderNow(true);
         return;
       }
 
@@ -5102,7 +5583,7 @@ export class AppController {
       if (
         !applied ||
         this.#shuttingDown ||
-        switchEpoch !== this.#sessionEpoch ||
+        switchEpoch !== this.#lifecycle.epoch ||
         !this.#isAcpClientLive(client)
       ) {
         return;
@@ -5110,7 +5591,7 @@ export class AppController {
       this.#restoreOscAfterBlock();
       this.osc.setWorkingDirectory(this.store.getState().cwd);
       await this.#persistSessionAnchorAndOsc();
-      if (this.#shuttingDown || switchEpoch !== this.#sessionEpoch) return;
+      if (this.#shuttingDown || switchEpoch !== this.#lifecycle.epoch) return;
       this.store.pushToast(
         `Loaded session ${meta?.title || sessionId.slice(0, 8)}`,
         'success',
@@ -5119,32 +5600,41 @@ export class AppController {
       this.scheduler.renderNow();
       this.syncFocus();
     } catch (err) {
-      if (switchEpoch !== this.#sessionEpoch) {
+      if (this.#shuttingDown || switchEpoch !== this.#lifecycle.epoch) {
         return;
       }
-      if (this.#replayingSessionEpoch === switchEpoch) {
-        this.#replayingSessionId = null;
-        this.#replayingSessionEpoch = null;
-      }
-      this.store.setReplaying(false);
-      if (this.scheduler.suspended) {
-        this.scheduler.resumeAfterReplay(false);
-      }
+      this.#resetLifecycleToIdle();
       if (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed') {
         this.scheduler.renderNow(true);
         return;
       }
       const isNotFound = err instanceof AcpRpcError && err.isSessionNotFound();
       if (isNotFound) {
-        void this.#previewStore.delete(sessionId).catch(() => {});
+        void this.#deleteSessionAnchor(sessionId).catch(() => {});
       }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const recovery = await this.#recoverPreviousSessionAfterFailure(
+        client,
+        previous,
+        isSameSessionReload && !isNotFound ? null : sessionId,
+        switchEpoch
+      );
+      if (recovery === 'superseded') {
+        return;
+      }
+      const label = meta?.title || sessionId.slice(0, 8);
       this.store.pushToast(
-        isNotFound
-          ? `Session ${meta?.title || sessionId.slice(0, 8)} not found (may have been deleted).`
-          : `Failed to load session: ${err instanceof Error ? err.message : String(err)}`,
+        recovery === 'restored'
+          ? isNotFound
+            ? `Session ${label} not found (may have been deleted); restored previous session.`
+            : `Failed to load session: ${errMsg}; restored previous session.`
+          : isNotFound
+            ? `Session ${label} not found (may have been deleted). Use /new or /resume to continue.`
+            : `Failed to load session: ${errMsg}. Use /new or /resume to continue.`,
         'error'
       );
       this.scheduler.renderNow();
+      this.syncFocus();
     }
   }
 
@@ -5205,189 +5695,231 @@ export class AppController {
       : null;
   }
 
-  async #applyCarryOverControls(
+  async #applySessionControls(
     client: AcpClient,
     sessionId: string,
-    carryOver: SessionControlCarryOver,
-    createEpoch: number
+    desired: {
+      readonly modelId?: string | null;
+      readonly thoughtLevel?: string | null;
+      readonly modeId?: string | null;
+    },
+    epoch: number,
+    options: {
+      readonly allowFuzzyModel?: boolean;
+      readonly clampInvalidThought?: boolean;
+      readonly toastFailurePrefix?: string;
+    } = {}
   ): Promise<void> {
     const isStale = (): boolean =>
-      this.#shuttingDown || createEpoch !== this.#sessionEpoch || !this.#isAcpClientLive(client);
+      this.#shuttingDown || epoch !== this.#lifecycle.epoch || !this.#isAcpClientLive(client);
+
+    const warnFailure = (label: string, value: string, err: unknown): void => {
+      if (!options.toastFailurePrefix || isStale()) return;
+      this.store.pushToast(
+        `${options.toastFailurePrefix} ${label} "${value}": ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        'warning',
+        { ttl: 3000 }
+      );
+    };
 
     let modelRestoreFailed = false;
-    let curState = this.store.getState();
+    const desiredModel = desired.modelId?.trim() || '';
+    const desiredThought = desired.thoughtLevel?.trim() || '';
+    const desiredMode = desired.modeId?.trim() || '';
 
-    // 1. Model
-    if (
-      carryOver.modelId &&
-      carryOver.modelId !== curState.controls.currentModelId &&
-      curState.controls.availableModels.length > 0
-    ) {
-      const resolved = resolveModelSelection(carryOver.modelId, {
-        configOptions: [...curState.configOptions],
-        models: curState.models,
-        modes: curState.modes,
-      });
-      if (
-        resolved &&
-        resolved.matchKind !== 'fuzzy_config_model' &&
-        resolved.matchKind !== 'legacy_fuzzy'
-      ) {
-        try {
-          const applied = await applyModelSelection(client, sessionId, resolved);
-          if (isStale()) return;
-          if (applied.configOptions) {
-            this.store.updateConfigOptions(applied.configOptions);
-          } else {
-            this.store.updateCurrentModelId(applied.appliedModelId);
-          }
-        } catch (err) {
-          modelRestoreFailed = true;
-          if (isStale()) return;
-          this.store.pushToast(
-            `Failed to carry over model "${carryOver.modelId}": ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-            'warning',
-            { ttl: 3000 }
-          );
-        }
-      }
-    }
-
-    // 2. Thought level
-    if (!modelRestoreFailed && carryOver.thoughtLevel) {
-      curState = this.store.getState();
-      if (
-        curState.controls.supportsThoughtLevel &&
-        curState.controls.currentThoughtLevel !== carryOver.thoughtLevel
-      ) {
-        const resolvedThought = resolveThoughtLevel(carryOver.thoughtLevel, [
-          ...curState.configOptions,
-        ]);
-        const targetThought = resolvedThought.ok
-          ? resolvedThought.value
-          : resolvedThought.reason === 'invalid'
-            ? clampThoughtLevelForChoices(
-                carryOver.thoughtLevel,
-                curState.controls.availableThoughtLevels
-              )
-            : undefined;
-        if (targetThought && targetThought !== curState.controls.currentThoughtLevel) {
-          try {
-            const res = await client.setConfigOption({
-              sessionId,
-              configId: 'thought_level',
-              value: targetThought,
-            });
-            if (isStale()) return;
-            this.store.updateConfigOptions(res.configOptions);
-          } catch (err) {
-            if (isStale()) return;
-            this.store.pushToast(
-              `Failed to carry over thought level "${targetThought}": ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-              'warning',
-              { ttl: 3000 }
-            );
-          }
-        }
-      }
-    }
-
-    // 3. Mode
-    if (carryOver.modeId) {
-      curState = this.store.getState();
-      const targetModeId = carryOver.modeId;
-      if (
-        targetModeId !== curState.controls.currentModeId &&
-        curState.controls.availableModes.some(
-          m => m.value.toLowerCase() === targetModeId.toLowerCase()
-        )
-      ) {
-        const resolvedMode = resolveModeSelection(targetModeId, {
+    if (desiredModel) {
+      const curState = this.store.getState();
+      const shouldApplyModel = options.allowFuzzyModel
+        ? true
+        : desiredModel !== curState.controls.currentModelId &&
+          curState.controls.availableModels.length > 0;
+      if (shouldApplyModel) {
+        const resolved = resolveModelSelection(desiredModel, {
           configOptions: [...curState.configOptions],
           models: curState.models,
           modes: curState.modes,
         });
-        if (resolvedMode) {
+        const matchAllowed =
+          resolved !== null &&
+          (options.allowFuzzyModel ||
+            (resolved.matchKind !== 'fuzzy_config_model' &&
+              resolved.matchKind !== 'legacy_fuzzy'));
+        if (matchAllowed && resolved) {
           try {
-            if (resolvedMode.strategy === 'config_option') {
+            const applied = await applyModelSelection(
+              client,
+              sessionId,
+              resolved,
+              options.allowFuzzyModel ? desiredThought || undefined : undefined
+            );
+            if (isStale()) return;
+            if (applied.configOptions) {
+              this.store.updateConfigOptions(applied.configOptions);
+            } else {
+              this.store.updateCurrentModelId(applied.appliedModelId);
+            }
+          } catch (err) {
+            modelRestoreFailed = true;
+            warnFailure('model', desiredModel, err);
+          }
+        }
+      }
+    }
+
+    if (!modelRestoreFailed && desiredThought && !(options.allowFuzzyModel && desiredModel)) {
+      if (options.clampInvalidThought) {
+        const curState = this.store.getState();
+        if (
+          curState.controls.supportsThoughtLevel &&
+          curState.controls.currentThoughtLevel !== desiredThought
+        ) {
+          const resolvedThought = resolveThoughtLevel(desiredThought, [
+            ...curState.configOptions,
+          ]);
+          const targetThought = resolvedThought.ok
+            ? resolvedThought.value
+            : resolvedThought.reason === 'invalid'
+              ? clampThoughtLevelForChoices(
+                  desiredThought,
+                  curState.controls.availableThoughtLevels
+                )
+              : undefined;
+          if (targetThought && targetThought !== curState.controls.currentThoughtLevel) {
+            try {
               const res = await client.setConfigOption({
                 sessionId,
-                configId: 'mode',
-                value: resolvedMode.modeId,
+                configId: 'thought_level',
+                value: targetThought,
               });
               if (isStale()) return;
               this.store.updateConfigOptions(res.configOptions);
-            } else {
-              await client.setMode({ sessionId, modeId: resolvedMode.modeId });
-              if (isStale()) return;
-              this.store.updateCurrentModeId(resolvedMode.modeId);
+            } catch (err) {
+              warnFailure('thought level', targetThought, err);
             }
-          } catch (err) {
-            if (isStale()) return;
-            this.store.pushToast(
-              `Failed to carry over mode "${targetModeId}": ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-              'warning',
-              { ttl: 3000 }
-            );
           }
         }
+      } else {
+        await this.#applyThoughtLevel(desiredThought, true);
+        if (isStale()) return;
+      }
+    }
+
+    if (desiredMode) {
+      if (options.clampInvalidThought) {
+        const curState = this.store.getState();
+        if (
+          desiredMode !== curState.controls.currentModeId &&
+          curState.controls.availableModes.some(
+            m => m.value.toLowerCase() === desiredMode.toLowerCase()
+          )
+        ) {
+          const resolvedMode = resolveModeSelection(desiredMode, {
+            configOptions: [...curState.configOptions],
+            models: curState.models,
+            modes: curState.modes,
+          });
+          if (resolvedMode) {
+            try {
+              if (resolvedMode.strategy === 'config_option') {
+                const res = await client.setConfigOption({
+                  sessionId,
+                  configId: 'mode',
+                  value: resolvedMode.modeId,
+                });
+                if (isStale()) return;
+                this.store.updateConfigOptions(res.configOptions);
+              } else {
+                await client.setMode({ sessionId, modeId: resolvedMode.modeId });
+                if (isStale()) return;
+                this.store.updateCurrentModeId(resolvedMode.modeId);
+              }
+            } catch (err) {
+              warnFailure('mode', desiredMode, err);
+            }
+          }
+        }
+      } else {
+        await this.#applyMode(desiredMode, true);
       }
     }
   }
 
   async #startNewSession(): Promise<void> {
     const client = this.#acpClient;
-    if (!client) return;
     const state = this.store.getState();
+    if (state.connectionStatus === 'initializing') {
+      this.store.pushToast('Session is still initializing; please wait a moment.', 'info', {
+        ttl: 2000,
+      });
+      this.scheduler.renderNow();
+      this.syncFocus();
+      return;
+    }
+    if (!client || !this.#isAcpClientLive(client)) return;
     const oldId = state.sessionId;
     const wasStreaming = state.isStreaming;
-    const carryOver: SessionControlCarryOver = this.#pendingCarryOverControls ?? {
+    const previous =
+      oldId && this.#lifecycle.phase === 'ready'
+        ? {
+            sessionId: oldId,
+            cwd: state.cwd,
+            ...(state.sessionTitle ? { title: state.sessionTitle } : {}),
+            todoProvider: this.#lifecycle.provider,
+          }
+        : (this.#lastCommittedSession ?? { sessionId: null, cwd: state.cwd });
+    const pendingCarryOver =
+      this.#lifecycle.phase === 'creating' ? this.#lifecycle.carryOver : null;
+    const carryOver: SessionControlCarryOver = pendingCarryOver ?? {
       modelId: state.controls.currentModelId,
       thoughtLevel: state.controls.supportsThoughtLevel ? state.controls.currentThoughtLevel : null,
       modeId: state.controls.currentModeId,
     };
     const hasCarryOver = Boolean(carryOver.modelId || carryOver.thoughtLevel || carryOver.modeId);
-    const createEpoch = this.#beginSessionTransition('creating');
-    this.#pendingCarryOverControls = hasCarryOver ? carryOver : null;
+    const createEpoch = this.#beginSessionTransition(
+      'creating',
+      undefined,
+      hasCarryOver ? carryOver : null
+    );
+    this.scheduler.renderNow();
 
     if (oldId) {
       if (wasStreaming) {
         await client.cancel(oldId).catch(() => {});
       }
       await client.closeSession(oldId).catch(() => {});
-      this.#todoServer?.clearSession(oldId);
     }
 
     if (
       this.#shuttingDown ||
-      createEpoch !== this.#sessionEpoch ||
+      createEpoch !== this.#lifecycle.epoch ||
       !this.#isAcpClientLive(client)
     ) {
-      if (this.#creatingSessionEpoch === createEpoch) {
-        this.#creatingSessionEpoch = null;
-        this.#pendingNewSessionUpdates = [];
-      }
-      if (createEpoch === this.#sessionEpoch) {
-        this.#pendingCarryOverControls = null;
+      if (createEpoch === this.#lifecycle.epoch) {
+        this.#resetLifecycleToIdle();
       }
       return;
     }
+    if (oldId) {
+      this.#todoServer?.clearSession(oldId);
+    }
 
     try {
+      const { todoProvider: sessionTodoProvider, ...bootstrapOptions } =
+        this.#buildSessionBootstrapOptions(createEpoch, client);
+      if (this.#lifecycle.phase === 'creating' && this.#lifecycle.epoch === createEpoch) {
+        this.#lifecycle.provider = sessionTodoProvider;
+      }
+      this.store.transcript.setPreferNativeSteps(sessionTodoProvider === 'native');
       const created = await client.newSession({
         cwd: state.cwd,
-        ...this.#buildSessionBootstrapOptions(),
+        ...bootstrapOptions,
       });
       if (
         this.#shuttingDown ||
         !this.#isAcpClientLive(client) ||
-        createEpoch !== this.#sessionEpoch
+        createEpoch !== this.#lifecycle.epoch
       ) {
         return;
       }
@@ -5400,54 +5932,63 @@ export class AppController {
         modes: created.modes,
         ...(createdTier ? { tier: createdTier } : {}),
       });
-      this.#todoServer?.setActiveSessionId(created.sessionId);
-      this.#lastCommittedSessionId = created.sessionId;
-      this.#lastCommittedCwd = state.cwd;
-      if (this.#creatingSessionEpoch === createEpoch) {
-        this.#creatingSessionEpoch = null;
-      }
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
       if (hasCarryOver) {
-        await this.#applyCarryOverControls(client, created.sessionId, carryOver, createEpoch);
+        await this.#applySessionControls(client, created.sessionId, carryOver, createEpoch, {
+          clampInvalidThought: true,
+          toastFailurePrefix: 'Failed to carry over',
+        });
         if (
           this.#shuttingDown ||
           !this.#isAcpClientLive(client) ||
-          createEpoch !== this.#sessionEpoch
+          createEpoch !== this.#lifecycle.epoch
         ) {
           return;
         }
       }
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
+      this.#commitActiveTodoSessionRoute(
+        createEpoch,
+        created.sessionId,
+        client,
+        sessionTodoProvider
+      );
+      this.store.setCreatingSession(false);
       void this.#refreshGitStatus();
       this.osc.setStatusIdle();
       await this.#persistSessionAnchorAndOsc();
-      if (this.#shuttingDown || createEpoch !== this.#sessionEpoch) return;
+      if (this.#shuttingDown || createEpoch !== this.#lifecycle.epoch) return;
       this.store.pushToast('Started a new session', 'info', { ttl: 2000 });
       this.scheduler.renderNow();
       this.syncFocus();
     } catch (err) {
       if (
-        createEpoch !== this.#sessionEpoch ||
+        this.#shuttingDown ||
+        createEpoch !== this.#lifecycle.epoch ||
         (!this.#acpClientAlive && this.store.getState().connectionStatus === 'crashed')
       ) {
         return;
       }
+      this.#resetLifecycleToIdle();
+      const recovery = await this.#recoverPreviousSessionAfterFailure(
+        client,
+        previous,
+        null,
+        createEpoch
+      );
+      if (recovery === 'superseded') {
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
       this.store.pushToast(
-        `Failed to create session: ${err instanceof Error ? err.message : String(err)}`,
+        recovery === 'restored'
+          ? `Failed to create session: ${errMsg}; restored previous session.`
+          : `Failed to create session: ${errMsg}. Use /new or /resume to continue.`,
         'error'
       );
       this.scheduler.renderNow();
-    } finally {
-      // Only the owning epoch may clear creation state & buffered updates so an
-      // earlier superseded `/new` never wipes a newer `/new`'s early command buffer.
-      if (this.#creatingSessionEpoch === createEpoch) {
-        this.#creatingSessionEpoch = null;
-        this.#pendingNewSessionUpdates = [];
-      }
-      if (createEpoch === this.#sessionEpoch) {
-        this.#pendingCarryOverControls = null;
-      }
+      this.syncFocus();
     }
   }
 
@@ -5843,8 +6384,8 @@ export class AppController {
           'success',
           { ttl: 2000 }
         );
+        await this.#persistSessionAnchorAndOsc();
       }
-      await this.#persistSessionAnchorAndOsc();
       this.scheduler.renderNow();
     } catch (err) {
       if (!silent) {
@@ -6088,6 +6629,7 @@ export class AppController {
 
     // 3. `oma` persisted settings (`config.toml`)
     let omaUpdated = false;
+    let omaSavedToast: string | null = null;
     if (rowId === 'ui.auto_collapse_thought') {
       const next = Boolean(value);
       this.#config = {
@@ -6122,6 +6664,34 @@ export class AppController {
         };
         omaUpdated = true;
       }
+    } else if (rowId === 'ui.todo_provider') {
+      const next: TodoProvider = normalizeTodoProvider(value);
+      if (next === 'native' && !this.#supportsNativeTodo()) {
+        const ver = this.#getAgentVersion();
+        this.store.pushToast(
+          `Native update_steps requires agy >= 1.5.16${ver ? ` (detected ${ver})` : ''}.`,
+          'warning'
+        );
+        this.scheduler.renderNow();
+        return;
+      }
+      this.#config = {
+        ...this.#config,
+        ui: { ...this.#config.ui, todo_provider: next },
+      };
+      this.store.transcript.setPreferNativeSteps(
+        this.#getActiveOrPendingTodoProvider() === 'native'
+      );
+      if (next === 'off') {
+        this.#clearTodoAutoClearTimer();
+      } else {
+        this.#scheduleTodoAutoClearIfDone();
+      }
+      omaUpdated = true;
+      omaSavedToast =
+        next === 'off'
+          ? 'Saved todo_provider = off — todo HUD hidden; start a new session (/new) or reconnect to stop MCP todo'
+          : `Saved todo_provider = ${next} — start a new session (/new) or reconnect to apply`;
     } else if (rowId === 'ui.osc_7501') {
       const next = Boolean(value);
       this.#config = {
@@ -6185,7 +6755,11 @@ export class AppController {
     if (omaUpdated) {
       const ok = await this.#saveConfigSafe();
       if (ok) {
-        this.store.pushToast('Saved setting to config.toml', 'success', { ttl: 1800 });
+        this.store.pushToast(
+          omaSavedToast ?? 'Saved setting to config.toml',
+          omaSavedToast ? 'info' : 'success',
+          { ttl: omaSavedToast ? 3000 : 1800 }
+        );
       }
       this.scheduler.renderNow();
       return;
@@ -6281,6 +6855,9 @@ export class AppController {
       this.store.setAutoCollapseThought(this.#config.ui.auto_collapse_thought);
       this.store.setCollapseCompacted(this.#config.ui.collapse_compacted);
       this.store.setToolDisplayMode(this.#config.ui.tool_display);
+      this.store.transcript.setPreferNativeSteps(
+        this.#getActiveOrPendingTodoProvider() === 'native'
+      );
       this.store.approvals.setAutoAllowTools(this.#config.approval.auto_allow_tools);
       this.#recreateOscWriter();
       const ok = await this.#saveConfigSafe();
@@ -6345,9 +6922,36 @@ export class AppController {
       this.syncFocus();
       return;
     }
+    if (this.#logoutInFlightClient === client) {
+      return;
+    }
 
+    const wasInTransition =
+      this.#lifecycle.phase === 'creating' || this.#lifecycle.phase === 'replaying';
+    if (wasInTransition) {
+      this.#resetLifecycleToIdle({
+        advanceEpoch: true,
+        abortError: new Error('Signed out'),
+        resetStore: true,
+      });
+    }
+
+    this.#logoutInFlightClient = client;
     try {
       await client.logout();
+      if (this.#shuttingDown || this.#acpClient !== client) {
+        return;
+      }
+      this.#bootstrapSeq += 1;
+      this.#lastCommittedSession = null;
+      this.#stopSwarmWatcher();
+      this.#preservedAnchorTodoState = null;
+      this.#hasRestoredUserAnchor = false;
+      this.#resetLifecycleToIdle({
+        advanceEpoch: true,
+        abortError: new Error('Signed out'),
+        resetStore: true,
+      });
       this.osc.setStatusBlocked('auth');
       this.store.setAuthRequired({
         message: 'Signed out of Antigravity. Run /login or click Sign in to reconnect.',
@@ -6355,17 +6959,89 @@ export class AppController {
       });
       this.store.pushToast('Signed out of Antigravity', 'success', { ttl: 2500 });
     } catch (err) {
+      const isSameClient = !this.#shuttingDown && this.#acpClient === client;
+      const curState = this.store.getState();
+      const shouldRecoverStartup = isSameClient && curState.connectionStatus === 'initializing';
+      const shouldRecoverSwitch =
+        isSameClient && curState.connectionStatus === 'ready' && wasInTransition;
       this.store.pushToast(
         `Failed to sign out: ${err instanceof Error ? err.message : String(err)}`,
         'error'
       );
+      this.#logoutInFlightClient = null;
+      if (shouldRecoverStartup) {
+        await this.#retryAfterCrash({ forceRestart: true });
+        return;
+      }
+      if (shouldRecoverSwitch) {
+        let recovered = false;
+        if (this.#lastCommittedSession) {
+          const recovery = await this.#recoverPreviousSessionAfterFailure(
+            client,
+            this.#lastCommittedSession,
+            null,
+            this.#lifecycle.epoch
+          );
+          if (recovery === 'superseded') {
+            return;
+          }
+          recovered = recovery === 'restored';
+        }
+        if (
+          !recovered &&
+          !this.#shuttingDown &&
+          this.#isAcpClientLive(client) &&
+          this.store.getState().sessionId === null
+        ) {
+          await this.#startNewSession();
+          return;
+        }
+      }
+    } finally {
+      if (this.#logoutInFlightClient === client) {
+        this.#logoutInFlightClient = null;
+      }
     }
     this.scheduler.renderNow();
     this.syncFocus();
   }
 
-  #ensureTodoServer(): EmbeddedTodoMcpServer | null {
-    if (!this.#enableTodoMcp || this.#shuttingDown) {
+  #getAgentVersion(): string | undefined {
+    const state = this.store.getState();
+    return state.agentVersion ?? state.agentInfo?.version;
+  }
+
+  #supportsNativeTodo(): boolean {
+    return supportsNativeUpdateSteps(this.#getAgentVersion());
+  }
+
+  #getEffectiveTodoProvider(): TodoProvider {
+    return resolveEffectiveTodoProvider(this.#config.ui.todo_provider, this.#getAgentVersion());
+  }
+
+  #getActiveOrPendingTodoProvider(): TodoProvider {
+    if (this.#lifecycle.phase === 'ready') return this.#lifecycle.provider;
+    if (this.#lifecycle.phase === 'creating' || this.#lifecycle.phase === 'replaying') {
+      if (this.#lifecycle.provider) return this.#lifecycle.provider;
+    }
+    return this.#getEffectiveTodoProvider();
+  }
+
+  #isTodoMcpEnabled(): boolean {
+    if (this.#enableTodoMcpOverride !== undefined) {
+      return this.#enableTodoMcpOverride;
+    }
+    return this.#getEffectiveTodoProvider() === 'mcp';
+  }
+
+  #isTodoDisabled(): boolean {
+    return this.#enableTodoMcpOverride === undefined && this.#getEffectiveTodoProvider() === 'off';
+  }
+
+  #ensureTodoServer(forceEnable = false): EmbeddedTodoMcpServer | null {
+    if ((!forceEnable && !this.#isTodoMcpEnabled()) || this.#shuttingDown) {
+      this.#todoServer?.dispose();
+      this.#todoServer = null;
       return null;
     }
     if (this.#todoServer) {
@@ -6374,6 +7050,7 @@ export class AppController {
     try {
       this.#todoServer = new EmbeddedTodoMcpServer({
         version: OMA_VERSION,
+        requireSessionRoute: true,
         onTodoChanged: event => {
           this.#handleLiveTodoServerUpdate(event);
         },
@@ -6384,16 +7061,72 @@ export class AppController {
     }
   }
 
-  #buildSessionBootstrapOptions(): {
+  #commitActiveTodoSessionRoute(
+    epoch: number,
+    sessionId: string,
+    client: AcpClient,
+    todoProvider: TodoProvider
+  ): void {
+    const state = this.store.getState();
+    if (
+      this.#shuttingDown ||
+      epoch !== this.#lifecycle.epoch ||
+      !this.#isAcpClientLive(client) ||
+      state.authRequired !== null ||
+      state.sessionId !== sessionId
+    ) {
+      return;
+    }
+    this.#lifecycle = {
+      phase: 'ready',
+      epoch,
+      sessionId,
+      provider: todoProvider,
+    };
+    this.#lastCommittedSession = {
+      sessionId,
+      cwd: state.cwd,
+      ...(state.sessionTitle ? { title: state.sessionTitle } : {}),
+      todoProvider,
+    };
+    this.store.transcript.setPreferNativeSteps(todoProvider === 'native');
+    if (todoProvider === 'mcp') {
+      this.#todoServer?.seedSession(sessionId, this.store.transcript.todoPhases);
+      this.#todoServer?.commitSessionRoute(epoch, sessionId);
+    } else {
+      this.#todoServer?.revokeSessionRoute();
+    }
+  }
+
+  #buildSessionBootstrapOptions(
+    epoch: number,
+    client: AcpClient,
+    todoProviderOverride?: TodoProvider
+  ): {
     mcpServers: McpServerConfig[];
     _meta?: Record<string, unknown>;
+    todoProvider: TodoProvider;
   } {
-    const server = this.#ensureTodoServer();
+    const nonMcpProvider: TodoProvider =
+      todoProviderOverride && todoProviderOverride !== 'mcp'
+        ? todoProviderOverride
+        : this.#isTodoDisabled()
+          ? 'off'
+          : this.#getEffectiveTodoProvider() === 'native'
+            ? 'native'
+            : 'off';
+    if (todoProviderOverride && todoProviderOverride !== 'mcp') {
+      return { mcpServers: [], todoProvider: todoProviderOverride };
+    }
+    if (this.#shuttingDown || epoch !== this.#lifecycle.epoch || !this.#isAcpClientLive(client)) {
+      return { mcpServers: [], todoProvider: nonMcpProvider };
+    }
+    const server = this.#ensureTodoServer(todoProviderOverride === 'mcp');
     if (!server) {
-      return { mcpServers: [] };
+      return { mcpServers: [], todoProvider: nonMcpProvider };
     }
     return {
-      mcpServers: [server.getMcpServerConfig()],
+      mcpServers: [server.openSessionRoute(epoch)],
       _meta: {
         antigravity: {
           systemPrompt: {
@@ -6401,6 +7134,7 @@ export class AppController {
           },
         },
       },
+      todoProvider: 'mcp',
     };
   }
 
@@ -6413,20 +7147,55 @@ export class AppController {
 
   #scheduleTodoAutoClearIfDone(): void {
     this.#clearTodoAutoClearTimer();
-    const phases = this.store.transcript.todoPhases;
-    if (this.#todoHudDismissed || !areAllTodosFinished(phases)) {
+    const delayMs = this.#todoAutoClearDelayMs;
+    if (
+      this.#isTodoDisabled() ||
+      this.#todoHudDismissed ||
+      !Number.isFinite(delayMs) ||
+      delayMs < 0
+    ) {
       return;
     }
-    const delayMs = this.#todoAutoClearDelayMs;
-    if (!Number.isFinite(delayMs) || delayMs < 0) {
+
+    const plan = this.store.transcript.plan;
+    if (!plan) {
+      return;
+    }
+    const expectedEpoch = this.#lifecycle.epoch;
+
+    if (plan.source === 'acp') {
+      if (
+        plan.entries.length === 0 ||
+        !plan.entries.every(entry => isChecklistStatusFinished(entry.status))
+      ) {
+        return;
+      }
+      const snapshotJson = JSON.stringify(plan);
+      this.#todoAutoClearTimer = setTimeout(() => {
+        this.#todoAutoClearTimer = undefined;
+        if (this.#shuttingDown || expectedEpoch !== this.#lifecycle.epoch) return;
+        if (JSON.stringify(this.store.transcript.plan) !== snapshotJson) return;
+        this.#todoHudDismissed = true;
+        this.scheduler.renderNow();
+      }, delayMs);
+      this.#todoAutoClearTimer.unref?.();
+      return;
+    }
+
+    const phases = this.store.transcript.todoPhases;
+    if (!areAllTodosFinished(phases)) {
       return;
     }
     const snapshotJson = JSON.stringify(phases);
-    const expectedEpoch = this.#sessionEpoch;
     this.#todoAutoClearTimer = setTimeout(() => {
       this.#todoAutoClearTimer = undefined;
-      if (this.#shuttingDown || expectedEpoch !== this.#sessionEpoch) return;
-      if (JSON.stringify(this.store.transcript.todoPhases) !== snapshotJson) return;
+      if (this.#shuttingDown || expectedEpoch !== this.#lifecycle.epoch) return;
+      if (
+        this.store.transcript.plan?.source !== 'todo_tool' ||
+        JSON.stringify(this.store.transcript.todoPhases) !== snapshotJson
+      ) {
+        return;
+      }
       this.#todoHudDismissed = true;
       this.scheduler.renderNow();
     }, delayMs);
@@ -6435,19 +7204,24 @@ export class AppController {
 
   #handleLiveTodoServerUpdate(event: TodoServerUpdateEvent): void {
     if (this.#shuttingDown) return;
-    const activeSessionId = this.store.getState().sessionId;
+    const state = this.store.getState();
     if (
-      activeSessionId &&
-      event.sessionId !== 'default' &&
-      event.sessionId !== activeSessionId
+      !this.#acpClientAlive ||
+      state.authRequired !== null ||
+      !state.isReady ||
+      this.#lifecycle.phase !== 'ready' ||
+      event.sessionId !== state.sessionId
     ) {
       return;
     }
     this.store.transcript.applyLiveTodoToolResult(event);
     if (!event.isError && event.op !== 'view') {
       this.#pendingTodoSyncReminder = null;
+      this.#hasRestoredUserAnchor = false;
+      this.#preservedAnchorTodoState = null;
       this.#todoHudDismissed = false;
       this.#scheduleTodoAutoClearIfDone();
+      void this.#persistSessionAnchorAndOsc().catch(() => {});
     }
     this.scheduler.markDirty();
   }
@@ -6459,9 +7233,11 @@ export class AppController {
   ): void {
     const cleaned = cloneTodoPhases(nextPhases).filter(phase => phase.tasks.length > 0);
     this.store.transcript.setTodoPhases(cleaned, { source: 'user' });
+    this.#hasRestoredUserAnchor = false;
+    this.#preservedAnchorTodoState = null;
     const activeSessionId = this.store.getState().sessionId;
-    if (activeSessionId) {
-      this.#ensureTodoServer()?.seedSession(activeSessionId, cleaned);
+    if (activeSessionId && this.#todoServer) {
+      this.#todoServer.seedSession(activeSessionId, cleaned);
     }
     this.#todoHudDismissed = false;
     this.#scheduleTodoAutoClearIfDone();
@@ -6506,28 +7282,115 @@ export class AppController {
     }
   }
 
+  #canEditSessionTodos():
+    | { readonly ok: true; readonly sessionId: string; readonly epoch: number }
+    | { readonly ok: false; readonly reason: string } {
+    if (this.#shuttingDown) {
+      return { ok: false, reason: '' };
+    }
+    if (this.#isTodoDisabled()) {
+      return {
+        ok: false,
+        reason: 'Todo tracking is Off. Enable MCP or Native in /settings.',
+      };
+    }
+    const state = this.store.getState();
+    if (
+      !this.#acpClientAlive ||
+      state.authRequired !== null ||
+      !state.isReady ||
+      !state.sessionId ||
+      this.#lifecycle.phase !== 'ready'
+    ) {
+      return {
+        ok: false,
+        reason:
+          state.connectionStatus === 'ready' &&
+          !state.sessionId &&
+          !state.isReplaying &&
+          !state.isCreatingSession
+            ? 'No active session — use /new or /resume before editing todos.'
+            : 'Session is not ready yet',
+      };
+    }
+    if (this.#lifecycle.provider !== 'mcp' || !this.#todoServer) {
+      return {
+        ok: false,
+        reason: this.#isTodoMcpEnabled()
+          ? 'MCP todo is not active in this session yet; start a new session (/new) or /resume to enable manual /todo editing.'
+          : 'Todo engine is set to Native (update_steps); manual /todo editing requires MCP (oma_todo) in /settings.',
+      };
+    }
+    return { ok: true, sessionId: state.sessionId, epoch: this.#lifecycle.epoch };
+  }
+
   async #handleTodoCommand(argsText: string): Promise<void> {
     const trimmed = argsText.trim();
+    const sepIdx = trimmed.search(/\s/);
+    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
+    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+
+    if (this.#isTodoDisabled() && verb !== 'help' && verb !== '?') {
+      this.store.pushToast(
+        'Todo tracking is Off. Enable MCP or Native in /settings.',
+        'warning'
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
     const state = this.store.getState();
     const current = cloneTodoPhases(this.store.transcript.todoPhases);
+    const activePlan = this.store.transcript.plan;
+    const isAcpPlanActive = activePlan?.source === 'acp' && activePlan.entries.length > 0;
+    const displayPhases = isAcpPlanActive
+      ? buildDisplayPhasesFromAcpPlan(activePlan)
+      : current.length > 0
+        ? current
+        : buildDisplayPhasesFromAcpPlan(activePlan);
 
     if (!trimmed) {
-      if (current.length === 0) {
-        this.store.pushToast('No todos. Use /todo append <task> to start one.', 'info');
+      if (displayPhases.length === 0) {
+        this.store.pushToast(
+          this.#isTodoMcpEnabled()
+            ? 'No todos. Use /todo append <task> to start one.'
+            : 'No active steps. Native update_steps is managed by the agent.',
+          'info'
+        );
       } else {
-        this.store.transcript.addInfoNotice(formatTodoMarkdown(current).trimEnd(), 'info');
+        this.store.transcript.addInfoNotice(formatTodoMarkdown(displayPhases).trimEnd(), 'info');
       }
       this.scheduler.renderNow();
       return;
     }
 
-    const sepIdx = trimmed.search(/\s/);
-    const verb = (sepIdx === -1 ? trimmed : trimmed.slice(0, sepIdx)).toLowerCase();
-    const rest = sepIdx === -1 ? '' : trimmed.slice(sepIdx + 1).trim();
+    const isMutatingVerb =
+      verb === 'import' ||
+      verb === 'edit' ||
+      verb === 'append' ||
+      verb === 'start' ||
+      verb === 'done' ||
+      verb === 'drop' ||
+      verb === 'clear' ||
+      verb === 'rm';
+
+    let expectedSessionId: string | null = state.sessionId;
+    const expectedEpoch = this.#lifecycle.epoch;
+    if (isMutatingVerb) {
+      const editGate = this.#canEditSessionTodos();
+      if (!editGate.ok) {
+        if (editGate.reason) {
+          this.store.pushToast(editGate.reason, 'warning');
+          this.scheduler.renderNow();
+        }
+        return;
+      }
+      expectedSessionId = editGate.sessionId;
+    }
 
     switch (verb) {
       case 'expand': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to expand.', 'info');
           this.scheduler.renderNow();
           return;
@@ -6552,19 +7415,19 @@ export class AppController {
         return;
       }
       case 'copy': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to copy.', 'warning');
           this.scheduler.renderNow();
           return;
         }
         await this.#copyTextWithToast(
-          formatTodoMarkdown(current),
+          formatTodoMarkdown(displayPhases),
           'Copied todos as Markdown to clipboard'
         );
         return;
       }
       case 'export': {
-        if (current.length === 0) {
+        if (displayPhases.length === 0) {
           this.store.pushToast('No todos to export.', 'warning');
           this.scheduler.renderNow();
           return;
@@ -6572,7 +7435,7 @@ export class AppController {
         const targetFile = rest ? path.resolve(state.cwd, rest) : path.join(state.cwd, 'TODO.md');
         try {
           await mkdir(path.dirname(targetFile), { recursive: true });
-          await writeFile(targetFile, formatTodoMarkdown(current), 'utf8');
+          await writeFile(targetFile, formatTodoMarkdown(displayPhases), 'utf8');
           this.store.pushToast(`Wrote todos to ${targetFile}`, 'success', { ttl: 3000 });
         } catch (err) {
           this.store.pushToast(
@@ -6596,6 +7459,23 @@ export class AppController {
           this.scheduler.renderNow();
           return;
         }
+        const postImportGate = this.#canEditSessionTodos();
+        if (
+          !postImportGate.ok ||
+          postImportGate.epoch !== expectedEpoch ||
+          postImportGate.sessionId !== expectedSessionId
+        ) {
+          if (
+            !postImportGate.ok &&
+            postImportGate.reason &&
+            !this.#shuttingDown &&
+            expectedEpoch === this.#lifecycle.epoch
+          ) {
+            this.store.pushToast(postImportGate.reason, 'warning');
+            this.scheduler.renderNow();
+          }
+          return;
+        }
         const parsed = parseTodoMarkdown(raw);
         if (parsed.errors.length > 0) {
           this.store.pushToast(`Could not parse ${targetFile}: ${parsed.errors[0]}`, 'error');
@@ -6611,6 +7491,7 @@ export class AppController {
         return;
       }
       case 'edit': {
+        const expectedTodoRevision = this.store.transcript.todoRevision;
         const initialMd =
           current.length > 0
             ? formatTodoMarkdown(current)
@@ -6635,6 +7516,31 @@ export class AppController {
           this.store.pushToast(
             `Failed to open editor: ${err instanceof Error ? err.message : String(err)}`,
             'error'
+          );
+          this.scheduler.renderNow();
+          return;
+        }
+        const postEditGate = this.#canEditSessionTodos();
+        if (
+          !postEditGate.ok ||
+          postEditGate.epoch !== expectedEpoch ||
+          postEditGate.sessionId !== expectedSessionId
+        ) {
+          if (
+            !postEditGate.ok &&
+            postEditGate.reason &&
+            !this.#shuttingDown &&
+            expectedEpoch === this.#lifecycle.epoch
+          ) {
+            this.store.pushToast(postEditGate.reason, 'warning');
+            this.scheduler.renderNow();
+          }
+          return;
+        }
+        if (this.store.transcript.todoRevision !== expectedTodoRevision) {
+          this.store.pushToast(
+            'Todos changed while editor was open; kept latest list.',
+            'warning'
           );
           this.scheduler.renderNow();
           return;
@@ -6894,18 +7800,42 @@ export class AppController {
     this.scheduler.renderNow();
   }
 
-  async #retryAfterCrash(): Promise<void> {
-    const previousSessionId =
-      this.store.getState().sessionId ?? this.#lastCommittedSessionId ?? undefined;
-    if (this.#lastCommittedCwd && !sameDir(this.store.getState().cwd, this.#lastCommittedCwd)) {
-      this.store.setCwd(this.#lastCommittedCwd);
+  async #retryAfterCrash(options?: { readonly forceRestart?: boolean }): Promise<void> {
+    if (this.#reconnectInFlight && !options?.forceRestart) {
+      return this.#reconnectInFlight;
     }
-    if (this.#acpClient) {
-      await this.#acpClient.close({ timeoutMs: 200 }).catch(() => {});
+    const reconnectSeq = ++this.#reconnectSeq;
+    const task = (async () => {
+      const state = this.store.getState();
+      const previousSessionId = this.#lastCommittedSession?.sessionId;
+      if (this.#lastCommittedSession?.cwd && !sameDir(state.cwd, this.#lastCommittedSession.cwd)) {
+        this.store.setCwd(this.#lastCommittedSession.cwd);
+      }
+      const oldClient = this.#acpClient;
+      this.#bootstrapSeq += 1;
       this.#acpClient = null;
+      this.#acpClientAlive = false;
+      this.#logoutInFlightClient = null;
+      this.#resetLifecycleToIdle({ advanceEpoch: true });
+      if (oldClient) {
+        await oldClient.close({ timeoutMs: 200 }).catch(() => {});
+      }
+      if (this.#shuttingDown || reconnectSeq !== this.#reconnectSeq) return;
+      this.store.setCrashError(null);
+      this.store.setAuthRequired(null);
+      if (previousSessionId === undefined) {
+        this.store.resetSessionState({ keepCommands: true });
+      }
+      await this.#bootstrapAcp(previousSessionId);
+    })();
+    this.#reconnectInFlight = task;
+    try {
+      await task;
+    } finally {
+      if (this.#reconnectInFlight === task) {
+        this.#reconnectInFlight = null;
+      }
     }
-    this.store.setCrashError(null);
-    await this.#bootstrapAcp(previousSessionId);
   }
 
   async #handleAuthLogin(): Promise<void> {
@@ -6947,49 +7877,99 @@ export class AppController {
   // -------------------------------------------------------------------------
 
   async #persistSessionAnchorAndOsc(): Promise<void> {
+    if (this.#shuttingDown) return;
     const state = this.store.getState();
-    const sid = state.sessionId;
-    if (!sid) return;
-    const epoch = this.#sessionEpoch;
+    if (state.isReplaying) return;
+    const expectedSid = state.sessionId;
+    if (!expectedSid) return;
+    const expectedEpoch = this.#lifecycle.epoch;
 
     const firstUserText = this.store.transcript.turns.find(t => t.user?.text)?.user?.text;
     const title =
       state.sessionTitle ||
       (firstUserText ? firstUserText.trim().split(/\r?\n/)[0]?.slice(0, 80) : '') ||
       'New Session';
-
-    try {
-      const anchorFile = await this.#previewStore.save({
-        sessionId: sid,
-        cwd: state.cwd,
-        title,
-        ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
-        ...(state.controls.currentThoughtLevel
-          ? { thoughtLevel: state.controls.currentThoughtLevel }
-          : {}),
-        ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
-        turnCount: this.store.transcript.turns.length,
-        preview: this.store.transcript.getPreviewMessages(3, 400),
-        ...(this.store.transcript.hasPersistedTodoState
-          ? {
-              todoState: {
-                phases: cloneTodoPhases(this.store.transcript.todoPhases),
-                toolCallCount: this.store.transcript.todoToolCallCount,
-              },
-            }
-          : {}),
-      });
-      if (
-        this.#shuttingDown ||
-        epoch !== this.#sessionEpoch ||
-        this.store.getState().sessionId !== sid
-      ) {
-        return;
-      }
-      this.osc.setReopenAnchor(anchorFile);
-    } catch {
-      // Anchor persistence errors must not interrupt interactive conversation
+    const preservedTodoState =
+      this.#preservedAnchorTodoState?.sessionId === expectedSid &&
+      this.#preservedAnchorTodoState.todoState.toolCallCount >=
+        this.store.transcript.todoToolCallCount
+        ? this.#preservedAnchorTodoState.todoState
+        : null;
+    if (!preservedTodoState && this.#preservedAnchorTodoState?.sessionId === expectedSid) {
+      this.#preservedAnchorTodoState = null;
     }
+    const snapshotTodoState: PersistedSessionTodoState | undefined = preservedTodoState
+      ? {
+          phases: cloneTodoPhases(preservedTodoState.phases),
+          toolCallCount: preservedTodoState.toolCallCount,
+          source: 'user',
+        }
+      : this.store.transcript.hasPersistedTodoState
+        ? {
+            phases: cloneTodoPhases(this.store.transcript.todoPhases),
+            toolCallCount: this.store.transcript.persistedTodoToolCallCount,
+            source: this.store.transcript.hasUserTodoOverride ? 'user' : 'auto',
+          }
+        : undefined;
+    const snapshot = {
+      sessionId: expectedSid,
+      cwd: state.cwd,
+      title,
+      ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
+      ...(state.controls.currentThoughtLevel
+        ? { thoughtLevel: state.controls.currentThoughtLevel }
+        : {}),
+      ...(state.controls.currentModeId ? { mode: state.controls.currentModeId } : {}),
+      turnCount: this.store.transcript.turns.length,
+      preview: this.store.transcript.getPreviewMessages(3, 400),
+      ...(snapshotTodoState ? { todoState: snapshotTodoState } : {}),
+    };
+
+    const writeStep = async (): Promise<void> => {
+      try {
+        const anchorFile = await this.#previewStore.save(snapshot);
+        if (
+          this.#shuttingDown ||
+          expectedEpoch !== this.#lifecycle.epoch ||
+          this.store.getState().sessionId !== expectedSid
+        ) {
+          return;
+        }
+        this.osc.setReopenAnchor(anchorFile);
+      } catch {
+        // Anchor persistence errors must not interrupt interactive conversation
+      }
+    };
+
+    const prev = this.#anchorSaveChains.get(expectedSid) ?? Promise.resolve();
+    const next = prev.then(writeStep, writeStep);
+    const settled = next.catch(() => {}).finally(() => {
+      if (this.#anchorSaveChains.get(expectedSid) === settled) {
+        this.#anchorSaveChains.delete(expectedSid);
+      }
+    });
+    this.#anchorSaveChains.set(expectedSid, settled);
+    await next;
+  }
+
+  async #deleteSessionAnchor(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    const deleteStep = async (): Promise<void> => {
+      try {
+        await this.#previewStore.delete(sessionId);
+      } catch {
+        // Best-effort anchor cleanup must not interrupt session flows
+      }
+    };
+    const prev = this.#anchorSaveChains.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(deleteStep, deleteStep);
+    const settled = next.catch(() => {}).finally(() => {
+      if (this.#anchorSaveChains.get(sessionId) === settled) {
+        this.#anchorSaveChains.delete(sessionId);
+      }
+    });
+    this.#anchorSaveChains.set(sessionId, settled);
+    await next;
   }
 
   #restoreOscAfterBlock(): void {
@@ -7037,13 +8017,13 @@ export class AppController {
     this.#clearBackgroundDoneTimer();
     if (this.#shuttingDown) return;
     const waitMs = delayMs ?? this.#backgroundDoneGraceMs;
-    const expectedEpoch = this.#sessionEpoch;
+    const expectedEpoch = this.#lifecycle.epoch;
     this.#backgroundDoneTimer = setTimeout(() => {
       this.#backgroundDoneTimer = undefined;
       void (async () => {
         if (
           this.#shuttingDown ||
-          expectedEpoch !== this.#sessionEpoch ||
+          expectedEpoch !== this.#lifecycle.epoch ||
           !this.#pendingBackgroundDone
         ) {
           return;
@@ -7052,7 +8032,7 @@ export class AppController {
           await this.#syncSessionMetricsFromTranscript({ reconcileBackground: false });
           if (
             this.#shuttingDown ||
-            expectedEpoch !== this.#sessionEpoch ||
+            expectedEpoch !== this.#lifecycle.epoch ||
             !this.#pendingBackgroundDone
           ) {
             return;
@@ -7737,7 +8717,7 @@ export class AppController {
       draft: this.store.draft.getState(),
       turns: allVisibleTurns,
       transcriptTurns: transcriptSlice.turns,
-      plan: this.store.transcript.plan,
+      plan: this.#isTodoDisabled() ? null : this.store.transcript.plan,
       todoExpanded: this.#todoExpanded,
       todoHudDismissed: this.#todoHudDismissed,
       jobs,

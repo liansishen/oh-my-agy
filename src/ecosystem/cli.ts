@@ -817,6 +817,7 @@ export interface ScanLocalSkillsOptions {
   readonly maxPreviewChars?: number;
   readonly workspaceSkillsDir?: string;
   readonly globalSkillsDir?: string;
+  readonly agentsGlobalSkillsDir?: string;
 }
 
 interface ParsedSkillFrontmatter {
@@ -887,7 +888,7 @@ async function scanSkillsDirectory(
 
   const results: SkillItem[] = [];
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
     const skillFile = join(rootDir, entry.name, 'SKILL.md');
     let content: string;
     try {
@@ -926,7 +927,8 @@ const SOURCE_PRIORITY: Record<SkillSource, number> = {
 
 /**
  * Merges ACP `available_commands_update` commands with read-only local skills from
- * `<cwd>/.agents/skills/<name>/SKILL.md` and `~/.gemini/config/skills/<name>/SKILL.md`.
+ * `<cwd>/.agents/skills/<name>/SKILL.md`, `~/.gemini/config/skills/<name>/SKILL.md`,
+ * and `~/.agents/skills/<name>/SKILL.md`.
  */
 export async function scanLocalSkills(
   cwd: string,
@@ -937,16 +939,24 @@ export async function scanLocalSkills(
   const maxPreviewChars = options.maxPreviewChars ?? 4000;
   const workspaceDir = options.workspaceSkillsDir ?? join(cwd, '.agents', 'skills');
   const globalDir = options.globalSkillsDir ?? join(home, '.gemini', 'config', 'skills');
+  const agentsGlobalDir =
+    options.agentsGlobalSkillsDir ??
+    (options.globalSkillsDir !== undefined && options.homedir === undefined
+      ? undefined
+      : join(home, '.agents', 'skills'));
 
-  const [workspaceSkills, globalSkills] = await Promise.all([
+  const [workspaceSkills, globalSkills, agentsGlobalSkills] = await Promise.all([
     scanSkillsDirectory(workspaceDir, 'workspace', maxPreviewChars),
     scanSkillsDirectory(globalDir, 'global', maxPreviewChars),
+    agentsGlobalDir
+      ? scanSkillsDirectory(agentsGlobalDir, 'global', maxPreviewChars)
+      : Promise.resolve([]),
   ]);
 
   const byName = new Map<string, SkillItem>();
 
-  // Priority: workspace > global > acp
-  for (const item of [...workspaceSkills, ...globalSkills]) {
+  // Priority: workspace > ~/.gemini/config/skills > ~/.agents/skills > acp
+  for (const item of [...workspaceSkills, ...globalSkills, ...agentsGlobalSkills]) {
     const key = item.name.toLowerCase();
     if (!byName.has(key)) {
       byName.set(key, item);

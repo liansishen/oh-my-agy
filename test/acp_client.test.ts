@@ -45,6 +45,7 @@ import {
   isElicitationCreateRequest,
   isKnownSessionUpdate,
   isRequestPermissionRequest,
+  isToolRawOutputTimedOut,
   mapAcpToolStatusToTsp,
   mapPlanStatusToChecklist,
   type AcpIncomingRequest,
@@ -704,6 +705,16 @@ describe("src/acp/protocol.ts tool_call 状态、exit_code 与辅助函数", () 
         cancelled: true,
       }),
     ).toBe("cancelled");
+
+    // 非零退出码与超时标记的已完成命令映射为 error，取消与后台运行保持原语义
+    expect(mapAcpToolStatusToTsp("completed", { exitCode: 0 })).toBe("done");
+    expect(mapAcpToolStatusToTsp("completed", { exitCode: 1 })).toBe("error");
+    expect(mapAcpToolStatusToTsp("completed", { timedOut: true })).toBe("error");
+    expect(mapAcpToolStatusToTsp("completed", { exitCode: 1, cancelled: true })).toBe("cancelled");
+    expect(mapAcpToolStatusToTsp("completed", { exitCode: 1, backgroundRunning: true })).toBe("done");
+    expect(isToolRawOutputTimedOut({ timed_out: true })).toBe(true);
+    expect(isToolRawOutputTimedOut({ status: "timed_out" })).toBe(true);
+    expect(isToolRawOutputTimedOut({ exit_code: 1 })).toBe(false);
   });
 
   test("extractToolExitCode 与 extractToolOutputText 正确解析 run_command 实测输出", () => {
@@ -745,6 +756,10 @@ describe("src/acp/protocol.ts tool_call 状态、exit_code 与辅助函数", () 
     expect(mapPlanStatusToChecklist("pending")).toBe("pending");
     expect(mapPlanStatusToChecklist("in_progress")).toBe("active");
     expect(mapPlanStatusToChecklist("completed")).toBe("done");
+    expect(mapPlanStatusToChecklist("done")).toBe("done");
+    expect(mapPlanStatusToChecklist("skipped")).toBe("dropped");
+    expect(mapPlanStatusToChecklist("failed")).toBe("blocked");
+    expect(mapPlanStatusToChecklist("unknown_future_state")).toBe("pending");
 
     const grouped: ConfigOption = {
       id: "model",

@@ -16,7 +16,12 @@ import {
   DEFAULT_AGY_SAFE_SETTINGS,
   parseOrchestratorModelSpec,
 } from '../config/agy_settings';
-import { DEFAULT_CONFIG, type OmaConfig } from '../config/config';
+import {
+  DEFAULT_CONFIG,
+  resolveEffectiveTodoProvider,
+  supportsNativeUpdateSteps,
+  type OmaConfig,
+} from '../config/config';
 import type { AppState, SettingsPanelState } from '../state/store';
 
 export interface SettingsCallbacks {
@@ -264,6 +269,23 @@ function buildPageSections(
   }
 
   if (pageId === 'interface') {
+    const agentVersion = state.agentVersion ?? state.agentInfo?.version;
+    const nativeTodoSupported = supportsNativeUpdateSteps(agentVersion);
+    const effectiveTodoProvider = resolveEffectiveTodoProvider(
+      config.ui.todo_provider,
+      agentVersion,
+    );
+    const todoProviderOptions: PrefsOption[] = nativeTodoSupported
+      ? [
+          { value: 'off', label: 'Off' },
+          { value: 'mcp', label: 'MCP' },
+          { value: 'native', label: 'Native' },
+        ]
+      : [
+          { value: 'off', label: 'Off' },
+          { value: 'mcp', label: 'MCP' },
+        ];
+
     const transcriptRows: PrefsRow[] = [
       {
         id: 'ui.auto_collapse_thought',
@@ -317,6 +339,25 @@ function buildPageSections(
           max: 200,
           step: 1,
           unit: 'lines',
+        },
+      },
+      {
+        id: 'ui.todo_provider',
+        label: 'Todo Tracking',
+        hint: nativeTodoSupported
+          ? 'Off hides todo HUD, MCP uses oma_todo (/todo + multi-phase), Native uses agy update_steps (applies on /new or reconnect)'
+          : 'Off hides todo HUD, MCP uses oma_todo (/todo + multi-phase); Native update_steps requires agy >= 1.5.16',
+        warning:
+          !nativeTodoSupported && config.ui.todo_provider === 'native'
+            ? `Configured "native" requires agy >= 1.5.16${agentVersion ? ` (detected ${agentVersion})` : ''}; currently Off`
+            : undefined,
+        changed: config.ui.todo_provider !== DEFAULT_CONFIG.ui.todo_provider,
+        defaultLabel: 'MCP',
+        control: {
+          k: 'choice',
+          value: effectiveTodoProvider,
+          options: todoProviderOptions,
+          style: 'segmented',
         },
       },
       {

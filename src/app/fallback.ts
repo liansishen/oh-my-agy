@@ -20,7 +20,11 @@ import {
   type RequestPermissionResult,
   type SessionUpdateParams,
 } from '../acp/protocol';
-import { loadSessionPreview } from '../preview/store';
+import {
+  loadSessionPreview,
+  parseSessionAnchorJson,
+  type PersistedSessionTodoState,
+} from '../preview/store';
 import { readTranscriptModelCandidates } from '../state/session_metrics';
 
 export const OMA_VERSION: string = pkg.version;
@@ -56,6 +60,7 @@ export interface ResolvedResumeTarget {
   model?: string;
   thoughtLevel?: string;
   mode?: string;
+  todoState?: PersistedSessionTodoState;
   source: 'id' | 'anchor_file' | 'invalid_anchor';
   rawInput: string;
   anchorPath?: string;
@@ -143,7 +148,8 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         options.continue = true;
         break;
       case '-r':
-      case '--resume': {
+      case '--resume':
+      case '--conversation': {
         const [val, nextIdx] = takeValue(flag, inlineValue, i);
         options.resume = val;
         options.resumeKind = 'resume';
@@ -277,6 +283,7 @@ export function resolveResumeTarget(raw: string): ResolvedResumeTarget {
           error: 'Anchor JSON missing valid sessionId',
         };
       }
+      const normalizedAnchor = parseSessionAnchorJson(parsed);
       return {
         sessionId,
         cwd: typeof obj['cwd'] === 'string' ? obj['cwd'] : undefined,
@@ -284,6 +291,7 @@ export function resolveResumeTarget(raw: string): ResolvedResumeTarget {
         model: typeof obj['model'] === 'string' ? obj['model'] : undefined,
         thoughtLevel: typeof obj['thoughtLevel'] === 'string' ? obj['thoughtLevel'] : undefined,
         mode: typeof obj['mode'] === 'string' ? obj['mode'] : undefined,
+        ...(normalizedAnchor?.todoState ? { todoState: normalizedAnchor.todoState } : {}),
         source: 'anchor_file',
         rawInput: raw,
         anchorPath: cleaned,
@@ -378,7 +386,7 @@ export function formatHelpText(): string {
     '',
     'Flags:',
     '  -c, --continue              Continue the most recent session in current directory',
-    '  -r, --resume <id|file>      Resume a session by ID or oma anchor JSON file',
+    '  -r, --resume <id|file>      Resume a session by ID or oma anchor JSON file (alias: --conversation)',
     '      --restore <id|file>     Alias for --resume (Tern reopen plugin compatibility)',
     '      --fork <id|file>        Tern pane fork compatibility (loads original session safely)',
     '      --sessions              Open /resume session picker immediately on startup',
@@ -677,6 +685,68 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
     let selectedThought: string | undefined;
     let selectedMode: string | undefined;
 
+    const applyReplControls = async (
+      sid: string,
+      desired: { model?: string; thought?: string; mode?: string },
+      warnOnError: boolean
+    ): Promise<{ model?: string; thought?: string; mode?: string }> => {
+      if (!opts.adapter.setConfigOption) return {};
+      const applied: { model?: string; thought?: string; mode?: string } = {};
+      const warn = (label: string, val: string, err: unknown): void => {
+        if (warnOnError) {
+          stderr.write(
+            `[oma] warning: failed to carry over ${label} "${val}": ${
+              err instanceof Error ? err.message : String(err)
+            }\n`
+          );
+        }
+      };
+      let modelFailed = false;
+      if (desired.model) {
+        const cur = opts.adapter.getControlState?.();
+        if (cur && cur.modelId === desired.model) {
+          applied.model = desired.model;
+        } else {
+          await opts.adapter.setConfigOption(sid, 'model', desired.model).then(
+            () => {
+              applied.model = desired.model;
+            },
+            err => {
+              modelFailed = true;
+              warn('model', desired.model!, err);
+            }
+          );
+        }
+      }
+      if (!modelFailed && desired.thought) {
+        const cur = opts.adapter.getControlState?.();
+        if (cur && cur.supportsThoughtLevel && cur.thoughtLevel === desired.thought) {
+          applied.thought = desired.thought;
+        } else if (!cur || cur.supportsThoughtLevel) {
+          await opts.adapter.setConfigOption(sid, 'thought_level', desired.thought).then(
+            () => {
+              applied.thought = desired.thought;
+            },
+            err => warn('thought level', desired.thought!, err)
+          );
+        }
+      }
+      if (desired.mode) {
+        const cur = opts.adapter.getControlState?.();
+        if (cur && cur.modeId === desired.mode) {
+          applied.mode = desired.mode;
+        } else {
+          await opts.adapter.setConfigOption(sid, 'mode', desired.mode).then(
+            () => {
+              applied.mode = desired.mode;
+            },
+            err => warn('mode', desired.mode!, err)
+          );
+        }
+      }
+      return applied;
+    };
+
     if (opts.adapter.setConfigOption) {
       let initialModel = opts.cli.model?.trim() || undefined;
       let initialThought = opts.cli.thought?.trim() || undefined;
@@ -716,48 +786,14 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
         initialMode = initialMode || savedMode;
       }
 
-      let modelFailed = false;
-      if (initialModel) {
-        const curControls = opts.adapter.getControlState?.();
-        if (curControls && curControls.modelId === initialModel) {
-          selectedModel = initialModel;
-        } else {
-          await opts.adapter
-            .setConfigOption(sessionId, 'model', initialModel)
-            .then(() => {
-              selectedModel = initialModel;
-            })
-            .catch(() => {
-              modelFailed = true;
-            });
-        }
-      }
-      if (!modelFailed && initialThought) {
-        const afterModel = opts.adapter.getControlState?.();
-        if (afterModel && afterModel.supportsThoughtLevel && afterModel.thoughtLevel === initialThought) {
-          selectedThought = initialThought;
-        } else if (!afterModel || afterModel.supportsThoughtLevel) {
-          await opts.adapter
-            .setConfigOption(sessionId, 'thought_level', initialThought)
-            .then(() => {
-              selectedThought = initialThought;
-            })
-            .catch(() => {});
-        }
-      }
-      if (initialMode) {
-        const afterThought = opts.adapter.getControlState?.();
-        if (afterThought && afterThought.modeId === initialMode) {
-          selectedMode = initialMode;
-        } else {
-          await opts.adapter
-            .setConfigOption(sessionId, 'mode', initialMode)
-            .then(() => {
-              selectedMode = initialMode;
-            })
-            .catch(() => {});
-        }
-      }
+      const applied = await applyReplControls(
+        sessionId,
+        { model: initialModel, thought: initialThought, mode: initialMode },
+        false
+      );
+      selectedModel = applied.model;
+      selectedThought = applied.thought;
+      selectedMode = applied.mode;
     }
 
     stdout.write(`oma ${OMA_VERSION} (--plain) connected to ${agentLabel} [session ${sessionId}]\n`);
@@ -805,54 +841,11 @@ export async function runPlainRepl(opts: RunPlainReplOptions): Promise<number> {
         await opts.adapter.closeSession(sessionId).catch(() => {});
         const created = await opts.adapter.newSession(opts.cwd);
         sessionId = created.sessionId;
-
-        if (opts.adapter.setConfigOption) {
-          let modelFailed = false;
-          const afterNew = opts.adapter.getControlState?.();
-          if (carryModel && (!afterNew || afterNew.modelId !== carryModel)) {
-            try {
-              await opts.adapter.setConfigOption(sessionId, 'model', carryModel);
-            } catch (err) {
-              modelFailed = true;
-              stderr.write(
-                `[oma] warning: failed to carry over model "${carryModel}": ${
-                  err instanceof Error ? err.message : String(err)
-                }\n`
-              );
-            }
-          }
-          if (!modelFailed && carryThought) {
-            const afterModel = opts.adapter.getControlState?.();
-            if (
-              !afterModel ||
-              (afterModel.supportsThoughtLevel && afterModel.thoughtLevel !== carryThought)
-            ) {
-              try {
-                await opts.adapter.setConfigOption(sessionId, 'thought_level', carryThought);
-              } catch (err) {
-                stderr.write(
-                  `[oma] warning: failed to carry over thought level "${carryThought}": ${
-                    err instanceof Error ? err.message : String(err)
-                  }\n`
-                );
-              }
-            }
-          }
-          if (carryMode) {
-            const afterThought = opts.adapter.getControlState?.();
-            if (!afterThought || afterThought.modeId !== carryMode) {
-              try {
-                await opts.adapter.setConfigOption(sessionId, 'mode', carryMode);
-              } catch (err) {
-                stderr.write(
-                  `[oma] warning: failed to carry over mode "${carryMode}": ${
-                    err instanceof Error ? err.message : String(err)
-                  }\n`
-                );
-              }
-            }
-          }
-        }
+        await applyReplControls(
+          sessionId,
+          { model: carryModel, thought: carryThought, mode: carryMode },
+          true
+        );
 
         stdout.write(`[new session ${sessionId}]\n`);
         continue;

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -419,6 +419,7 @@ describe('src/config/config.ts recent_models & atomic saveConfig', () => {
         collapse_compacted: true,
         tool_display: 'compact',
         tool_preview_lines: 24,
+        todo_provider: 'native',
         osc_7501: true,
         reopen_anchor: false,
       },
@@ -925,6 +926,54 @@ describe('src/ecosystem/cli.ts offline CLI wrappers & parsers', () => {
     expect(skills[0]?.preview).toContain('Run build and verify artifacts.');
     expect(skills[1]?.description).toBe('Inspect unsafe blocks carefully.');
     expect(skills[2]?.filePath).toBeUndefined();
+  });
+
+  test('scanLocalSkills discovers ~/.agents/skills (including symlinks) with ~/.gemini/config/skills precedence and respects test isolation', async () => {
+    const root = await makeTempDir('oma-agents-skills-');
+    const workspaceDir = join(root, 'repo');
+    const fakeHome = join(root, 'home');
+
+    // ~/.gemini/config/skills/shared-skill (must override ~/.agents/skills/shared-skill)
+    const geminiShared = join(fakeHome, '.gemini', 'config', 'skills', 'shared-skill');
+    await mkdir(geminiShared, { recursive: true });
+    await writeFile(
+      join(geminiShared, 'SKILL.md'),
+      '---\nname: shared-skill\ndescription: Gemini global skill\n---\nFrom gemini',
+      'utf8',
+    );
+
+    // ~/.agents/skills/shared-skill (shadowed) + symlinked ~/.agents/skills/apk-reverse
+    const agentsSkillsRoot = join(fakeHome, '.agents', 'skills');
+    const agentsShared = join(agentsSkillsRoot, 'shared-skill');
+    const externalTarget = join(root, 'external-apk-reverse');
+    await mkdir(agentsShared, { recursive: true });
+    await mkdir(externalTarget, { recursive: true });
+    await writeFile(
+      join(agentsShared, 'SKILL.md'),
+      '---\nname: shared-skill\ndescription: Agents shared skill\n---\nFrom agents',
+      'utf8',
+    );
+    await writeFile(
+      join(externalTarget, 'SKILL.md'),
+      '---\nname: apk-reverse\ndescription: Reverse engineer APKs\n---\nInspect dex & smali.',
+      'utf8',
+    );
+    await symlink(externalTarget, join(agentsSkillsRoot, 'apk-reverse'), 'dir');
+
+    const skills = await scanLocalSkills(workspaceDir, [], { homedir: fakeHome });
+    expect(skills.map((s) => `${s.source}:${s.name}`)).toEqual([
+      'global:apk-reverse',
+      'global:shared-skill',
+    ]);
+    expect(skills.find((s) => s.name === 'shared-skill')?.description).toBe('Gemini global skill');
+    expect(skills.find((s) => s.name === 'apk-reverse')?.preview).toContain('Inspect dex & smali.');
+
+    // When globalSkillsDir is overridden without homedir or agentsGlobalSkillsDir, host ~/.agents/skills is skipped
+    const isolated = await scanLocalSkills(workspaceDir, [], {
+      workspaceSkillsDir: join(root, 'empty-ws'),
+      globalSkillsDir: join(root, 'empty-global'),
+    });
+    expect(isolated).toEqual([]);
   });
 
   test('exportTranscriptMarkdown renders full Markdown and writes atomically to default or custom path', async () => {

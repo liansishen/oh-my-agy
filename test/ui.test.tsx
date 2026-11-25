@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { callTodoMcp, createTestController, replayWire } from './helpers/controller_harness';
 import {
   appendFileSync,
   existsSync,
@@ -865,11 +866,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const agentNodes = host.findWireNodes(n => n.k === 'agent');
     expect(agentNodes.length).toBeGreaterThan(0);
 
-    // Verify plan in main (omp.tool.todo) and dock HUD (omp.hud.todo)
-    const todoTool = host.findWireNodes(n => n.k === 'tool' && n.p?.['role'] === 'omp.tool.todo')[0];
-    expect(todoTool).toBeDefined();
-    const planNodes = host.findWireNodes(n => n.k === 'checklist' && n.p?.['mode'] === 'full');
-    expect(planNodes.length).toBeGreaterThan(0);
+    // Verify ACP plan renders in dock HUD (omp.hud.todo) without duplicating a floating main.plan card
+    expect(host.findWireNodes(n => n.id === 'main.plan')).toHaveLength(0);
     const hudTodoNodes = host.findWireNodes(n => n.k === 'checklist' && n.p?.['role'] === 'omp.hud.todo');
     expect(hudTodoNodes.length).toBeGreaterThan(0);
 
@@ -1788,7 +1786,23 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.store.isSwarmWorking).toBe(true);
     expect(controller.store.swarmWorkingNames).toContain('swarm-ui');
 
-    // `oma-swarm-fx` stylesheet dynamically installed & 4 orbiting bees + HUD bee button rendered
+    // Pre-existing swarm directory on disk before any swarm trigger in this session:
+    // HUD bee button is available, while `oma-swarm-fx` animation MUST NOT show until triggered in this session
+    expect(controller.store.getState().hasSwarm).toBe(true);
+    expect(controller.store.getState().swarmTriggeredInSession).toBe(false);
+    expect(
+      host.tspMessages.find(
+        m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx' && typeof m.body['css'] === 'string'
+      )
+    ).toBeUndefined();
+    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.swarm.fx')).toHaveLength(0);
+    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.bee.hud').length).toBeGreaterThan(0);
+
+    // 1. `/swarm 做点事` MUST pass through untouched to `agy acp`, NEVER open Swarm Board overlay,
+    //    and trigger `oma-swarm-fx` while the swarm is actively running (`isSwarmWorking === true`)
+    await controller.submitInput('/swarm 做点事');
+    await waitFor(() => receivedPrompts.includes('/swarm 做点事') && !controller.store.getState().isStreaming);
+    expect(controller.store.getState().swarmTriggeredInSession).toBe(true);
     const fxSheet = host.tspMessages.find(
       m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx' && typeof m.body['css'] === 'string'
     );
@@ -1797,11 +1811,6 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(String(fxSheet?.body['css'] ?? '')).not.toContain('url(');
     expect(String(fxSheet?.body['css'] ?? '')).not.toContain('position: fixed');
     expect(host.findWireNodes(n => n.p?.['role'] === 'oma.swarm.fx').length).toBeGreaterThan(0);
-    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.bee.hud').length).toBeGreaterThan(0);
-
-    // 1. `/swarm 做点事` MUST pass through untouched to `agy acp` and NEVER open Swarm Board overlay
-    await controller.submitInput('/swarm 做点事');
-    await waitFor(() => receivedPrompts.includes('/swarm 做点事') && !controller.store.getState().isStreaming);
     expect(controller.store.getState().swarmBoardOpen).toBe(false);
     expect(controller.store.getState().picker).toBeNull();
     expect(controller.isSwarmWatcherActive).toBe(true);
@@ -3974,7 +3983,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     //   before the coordinator emits a user-facing reply (avoids false finish notifications on
     //   worker pauses, subtask handoffs, or monitor checks!)
     // - bottom button switches back to Send!
-    // - because session is STILL in swarm mode (`hasSwarm`), perimeter bee animation STAYS visible with 2 idle bees!
+    // - because swarm is no longer actively running (`isSwarmWorking === false`), perimeter bee animation unmounts & unloads `oma-swarm-fx`!
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4012,11 +4021,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
 
     current = replayCurrentWireNodes();
-    // Swarm mode stays active visually with 2 idle orbiting bees (coordinator + monitor)
-    expect(current.has('dock.composer.swarm-fx')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-1')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-2')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-3')).toBe(false);
+    // Swarm animation (`oma.swarm.fx` / `oma-swarm-fx`) unmounts and unloads once swarm stops running, while static HUD bee stays
+    expect(current.has('dock.composer.swarm-fx')).toBe(false);
+    const fxUnloadMsg = host.tspMessages.filter(m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx').pop();
+    expect(fxUnloadMsg).toBeDefined();
+    expect(fxUnloadMsg?.body['css'] ?? null).toBeNull();
+    expect(current.has('dock.hud.running.agents.bee')).toBe(true);
     expect(current.has('dock.composer.bar.send')).toBe(true);
     expect(current.has('dock.composer.bar.stop')).toBe(false);
 
@@ -11285,6 +11295,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     let failNextPrompt = false;
     let replayReminderText = '';
     let loadCount = 0;
+    let newCount = 0;
+    let todoMcpUrl: string | undefined;
     let pendingExternalPromptId: number | string | undefined;
 
     acp.setHandler((msg, h) => {
@@ -11302,10 +11314,17 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }
 
       if (msg.method === 'session/new') {
+        newCount += 1;
+        const p = msg.params as { mcpServers?: Array<{ name?: string; url?: string }> } | undefined;
+        const url = p?.mcpServers?.find(s => s.name === 'oma_todo')?.url;
+        if (url) todoMcpUrl = url;
         h.send({
           jsonrpc: '2.0',
           id: msg.id,
-          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+          result: {
+            sessionId: newCount === 1 ? sessId : 'sess-todo-other',
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
         });
         return;
       }
@@ -11381,22 +11400,44 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
         const joined = blocks.map(b => b.text ?? '').join('\n');
         if (joined.includes('Retry succeeds')) {
-          h.send({
-            jsonrpc: '2.0',
-            method: 'session/update',
-            params: {
-              sessionId: sessId,
-              update: {
-                sessionUpdate: 'tool_call',
-                toolCallId: 'old-todo-1',
-                name: 'mcp_oma_todo_todo',
-                title: 'Run mcp_oma_todo_todo',
-                kind: 'other',
-                status: 'completed',
-                rawInput: { op: 'init', items: ['Old phantom task'] },
+          void (async () => {
+            if (todoMcpUrl) {
+              await fetch(todoMcpUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 777,
+                  method: 'tools/call',
+                  params: {
+                    _meta: {
+                      'antigravity.google/root_conversation_id': sessId,
+                    },
+                    name: 'todo',
+                    arguments: { op: 'init', items: ['Old phantom task'] },
+                  },
+                }),
+              });
+            }
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sessId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'old-todo-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'init', items: ['Old phantom task'] },
+                },
               },
-            },
-          });
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
         }
         if (joined.includes('Ask external todo')) {
           pendingExternalPromptId = msg.id;
@@ -11528,7 +11569,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }
       await Bun.sleep(10);
     }
-    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1 });
+    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1, source: 'user' });
+
+    await controller.submitInput('/new');
+    await waitFor(
+      () =>
+        controller.store.getState().sessionId === 'sess-todo-other' &&
+        controller.store.getState().isReady
+    );
 
     await controller.submitInput('/resume');
     await waitFor(
@@ -11536,10 +11584,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         controller.store.getState().picker?.kind === 'resume' &&
         !controller.store.getState().picker?.loading
     );
+    controller.store.setPickerSelected(sessId);
     host.input.emit('\r');
     await waitFor(
       () =>
         loadCount === 1 &&
+        controller.store.getState().sessionId === sessId &&
         !controller.store.getState().isReplaying &&
         controller.store.transcript.turns.length === 1
     );
@@ -12293,56 +12343,58 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
           return;
         }
         currentSessionId = p.sessionId;
-        server.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: p.sessionId,
-            update: {
-              sessionUpdate: 'user_message_chunk',
-              content: { type: 'text', text: '/plan build feature\n\n<system-reminder>\nThe user manually modified the todo list (manual).\nCurrent todo list:\n\n# Todos\n- [/] First task\n</system-reminder>' },
+        if (p.sessionId === 'sess-attach') {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: '/plan build feature\n\n<system-reminder>\nThe user manually modified the todo list (manual).\nCurrent todo list:\n\n# Todos\n- [/] First task\n</system-reminder>' },
+              },
             },
-          },
-        });
-        server.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: p.sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId: 'tc-attach-perm',
-              name: 'run_command',
-              kind: 'execute',
-              status: 'pending',
-              title: 'Run echo ok',
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-attach-perm',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'pending',
+                title: 'Run echo ok',
+              },
             },
-          },
-        });
-        // Reattached active permission & foreign-session stale permission during session/load replay
-        server.send({
-          jsonrpc: '2.0',
-          id: 7001,
-          method: 'session/request_permission',
-          params: {
-            sessionId: p.sessionId,
-            toolCall: { toolCallId: 'tc-attach-perm', name: 'run_command', kind: 'execute', title: 'Run echo ok' },
-            options: [
-              { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-              { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-            ],
-          },
-        });
-        server.send({
-          jsonrpc: '2.0',
-          id: 7002,
-          method: 'session/request_permission',
-          params: {
-            sessionId: 'sess-other-stale',
-            toolCall: { toolCallId: 'tc-stale', title: 'Stale' },
-            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
-          },
-        });
+          });
+          // Reattached active permission & foreign-session stale permission during session/load replay
+          server.send({
+            jsonrpc: '2.0',
+            id: 7001,
+            method: 'session/request_permission',
+            params: {
+              sessionId: p.sessionId,
+              toolCall: { toolCallId: 'tc-attach-perm', name: 'run_command', kind: 'execute', title: 'Run echo ok' },
+              options: [
+                { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+                { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+              ],
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            id: 7002,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'sess-other-stale',
+              toolCall: { toolCallId: 'tc-stale', title: 'Stale' },
+              options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+            },
+          });
+        }
         server.send({
           jsonrpc: '2.0',
           id: msg.id,
@@ -12529,7 +12581,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(modelNodes.get('layer.modal')?.p['subtitle']).toBe('Auto-compact: 800k (80%) (override)');
     controller.store.closePicker();
 
-    // 3. Switching to deleted session (-32002) cleans stale local anchor and warns cleanly
+    // 3. Switching to deleted session (-32002) cleans stale local anchor, restores previous session, and warns cleanly
     await controller.submitInput('/resume');
     await waitFor(
       () =>
@@ -12538,8 +12590,15 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     controller.store.setPickerSelected('sess-missing');
     host.input.emit('\r');
-    await waitFor(() => loadCount === 1);
-    await waitFor(() => !existsSync(previewStore.getFilePath('sess-missing')));
+    await waitFor(
+      () =>
+        loadCount >= 2 &&
+        !existsSync(previewStore.getFilePath('sess-missing')) &&
+        controller.store.getState().sessionId === 'sess-init' &&
+        controller.store.getState().isReady &&
+        Boolean(controller.store.getState().activeToast?.text.includes('not found')) &&
+        Boolean(controller.store.getState().activeToast?.text.includes('restored previous session')),
+    );
     expect(controller.store.getState().activeToast?.text).toContain('not found');
 
     // 4. Reattaching to running session preserves buffered permission prompt, sets OSC blocked,
@@ -12569,5 +12628,575 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
     await controller.shutdown({ cleanExit: true });
     await runPromise;
+  });
+
+  test('agy 1.5.16 parity: concurrent elicitation queue & meta banner, phase-aware omp.working timers, update_steps plan card, and Swarm system posts', async () => {
+    const tmp = makeTempDir();
+    const sessionId = 'sess-1516';
+    const swarmDir = join(tmp, 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(join(swarmDir, 'swarm.json'), JSON.stringify({ version: 1, backend: 'local', swarm_id: sessionId, created_at: '2026-11-24T00:00:00Z' }), 'utf8');
+    writeFileSync(join(swarmDir, 'members.json'), JSON.stringify({ title: '1.5.16 Swarm', members: { coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions' } } }), 'utf8');
+    writeFileSync(join(swarmDir, 'board.jsonl'), `${JSON.stringify({ seq: 1, agent: 'system', text: 'Board wakeup scheduled', time: '2026-11-24 12:00:00' })}\n`, 'utf8');
+
+    let fakeNow = 100_000;
+    const elicitationReplies: Array<{ id?: string | number; result?: unknown }> = [];
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+
+    const ctx = await createTestController({
+      tmp,
+      newSessionId: sessionId,
+      controllerOptions: { swarmDir, now: () => fakeNow },
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
+      },
+      onRpc: msg => {
+        if (msg.result !== undefined) {
+          elicitationReplies.push({ id: msg.id, result: msg.result });
+          return true;
+        }
+      },
+    });
+    await ctx.boot();
+
+    await ctx.controller.submitInput('Check phase timers');
+    await waitFor(() => promptResolver !== null);
+
+    fakeNow = 102_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning…' } });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Thinking…'));
+    fakeNow = 107_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ' more' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 5000);
+
+    fakeNow = 108_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-phase-bash', kind: 'execute', name: 'run_command', status: 'in_progress', title: 'echo hi' });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Running command…'));
+    fakeNow = 111_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-phase-bash', status: 'in_progress', rawOutput: { output: 'hi\n' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 3000);
+
+    ctx.acp.sendUpdate(sessionId, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-steps-ui',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Step A', status: 'done' }, { title: 'Step B', status: 'skipped' }, { title: 'Step C', status: 'failed' }] },
+    });
+    await waitFor(() => ctx.replayWire().get('main.t0-tc-steps-ui')?.p['target'] === '1/3 (1 skipped, 1 failed)');
+    const stepsToolUi = ctx.replayWire().get('main.t0-tc-steps-ui');
+    expect(stepsToolUi?.p['role']).toBe('omp.tool.todo');
+    expect(stepsToolUi?.p['title']).toBe('Todo');
+    expect(stepsToolUi?.p['status']).toBe('error');
+    expect(stepsToolUi?.p['collapsed']).toBe(true);
+    expect(stepsToolUi?.p['collapsible']).toBe(true);
+    expect(stepsToolUi?.p['frame']).toBe('inline');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
+    expect(ctx.replayWire().get('dock.activity.todo')?.p['role']).toBe('omp.hud.todo');
+
+    fakeNow = 112_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-phase-bash', status: 'completed', rawOutput: { output: 'hi', exit_code: 0 } });
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Responding…'));
+    fakeNow = 114_000;
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' done' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 2000);
+
+    ctx.acp.send({
+      jsonrpc: '2.0',
+      id: 9001,
+      method: 'elicitation/create',
+      params: { sessionId, mode: 'form', message: 'Subagent researcher asks:', requestedSchema: { type: 'object', properties: { choice1: { type: 'string', title: 'Pick mode', enum: ['fast', 'deep'] } } } },
+    });
+    await waitFor(() => ctx.controller.store.getState().activeQuestion?.requestId === 9001);
+
+    ctx.acp.send({
+      jsonrpc: '2.0',
+      id: 9002,
+      method: 'elicitation/create',
+      params: { sessionId, mode: 'form', message: 'Subagent verifier asks:', requestedSchema: { type: 'object', properties: { note2: { type: 'string', title: 'Provide note' } } } },
+    });
+    await waitFor(() => ctx.controller.store.getState().queuedQuestionCount === 1);
+    expect(elicitationReplies).toHaveLength(0);
+    const metaNodes = ctx.replayWire();
+    expect(metaNodes.get('main.questions-meta.msg')?.p['spans']).toEqual([{ t: 'Subagent researcher asks:', s: 'muted' }]);
+    expect(metaNodes.get('main.questions-meta.queued')?.p['text']).toBe('+1 queued');
+
+    ctx.testHost!.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { choice1: 'fast' } });
+    await waitFor(() => elicitationReplies.length === 1);
+    expect(elicitationReplies[0]?.id).toBe(9001);
+    expect(elicitationReplies[0]?.result).toEqual({ action: 'accept', content: { choice1: 'fast' } });
+    await waitFor(() => ctx.controller.store.getState().activeQuestion?.requestId === 9002);
+    expect(ctx.controller.currentSurfaceFocus).toBe('main.questions.note2.other');
+
+    ctx.testHost!.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { note2: 'looks good' } });
+    await waitFor(() => elicitationReplies.length === 2);
+    expect(elicitationReplies[1]?.id).toBe(9002);
+    expect(elicitationReplies[1]?.result).toEqual({ action: 'accept', content: { note2: 'looks good' } });
+
+    promptResolver!({ stopReason: 'end_turn' });
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
+
+    await ctx.controller.submitInput('/swarm board');
+    await waitFor(() => ctx.controller.store.getState().swarmBoardOpen);
+    const swarmNodes = ctx.replayWire();
+    expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['icon']).toBe('bell');
+    expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['tone']).toBe('info');
+    expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.head.who.icon')?.p['name']).toBe('bell');
+    expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.meta-row.system')?.p['text']).toBe('system');
+
+    await ctx.shutdown();
+  });
+
+  test('ui.todo_provider setting switches between native update_steps and embedded MCP oma_todo across /settings and /new', async () => {
+    const tmp = makeTempDir();
+    const configPath = join(tmp, 'config.toml');
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+
+    const ctx = await createTestController({
+      tmp,
+      todoProvider: 'native',
+      newSessionId: n => `sess-todo-mode-${n}`,
+      controllerOptions: { configPath },
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
+      },
+    });
+    await ctx.boot();
+
+    expect(ctx.acp.newParams).toHaveLength(1);
+    expect(ctx.acp.newParams[0]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.newParams[0]?.['_meta']).toBeUndefined();
+
+    await ctx.controller.submitInput('Track with native update_steps');
+    await waitFor(() => promptResolver !== null);
+    ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-native-steps',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Step 1', status: 'done' }, { title: 'Step 2', status: 'in_progress' }] },
+    });
+    promptResolver!({ stopReason: 'end_turn' });
+    promptResolver = null;
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
+    await waitFor(() => ctx.replayWire().has('dock.activity.todo') && ctx.replayWire().get('main.t0-tc-native-steps')?.p['target'] === '1/2');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
+    const nativeStepsNode = ctx.replayWire().get('main.t0-tc-native-steps');
+    expect(nativeStepsNode?.p['role']).toBe('omp.tool.todo');
+    expect(nativeStepsNode?.p['status']).toBe('done');
+    expect(nativeStepsNode?.p['collapsed']).toBe(true);
+    expect(nativeStepsNode?.p['frame']).toBe('inline');
+
+    ctx.testHost!.input.emitTspEvent({ ev: 'toggle', sf: 'oma', id: 'main.t0-tc-native-steps', collapsed: false });
+    await waitFor(() => ctx.replayWire().get('main.t0-tc-native-steps')?.p['collapsed'] === false);
+    expect(ctx.replayWire().get('main.t0-tc-native-steps')?.p['frame']).toBe('card');
+    expect(ctx.replayWire().get('main.t0-tc-native-steps.checklist')?.p['mode']).toBe('full');
+
+    await ctx.controller.submitInput('/todo');
+    const latestNotice = ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    expect(latestNotice?.text).toContain('# Plan');
+    expect(latestNotice?.text).toContain('- [x] Step 1');
+    expect(latestNotice?.text).toContain('- [/] Step 2');
+
+    await ctx.controller.submitInput('/todo done Step 2');
+    expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)'))).toBe(true);
+
+    await ctx.controller.submitInput('/settings interface');
+    await waitFor(() => ctx.controller.store.getState().settings?.page === 'interface');
+    ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'mcp' });
+    await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'));
+    expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'info' && t.text.includes('/new'))).toBe(true);
+
+    ctx.testHost!.input.emit('\x1b');
+    await waitFor(() => ctx.controller.store.getState().settings === null);
+    await ctx.controller.submitInput('/new');
+    await waitFor(() => ctx.acp.newParams.length === 2);
+    const mcpServers = ctx.acp.newParams[1]?.['mcpServers'] as Array<{ name?: string }> | undefined;
+    expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
+    const meta1 = ctx.acp.newParams[1]?.['_meta'] as { antigravity?: { systemPrompt?: { append?: string } } } | undefined;
+    expect(meta1?.antigravity?.systemPrompt?.append).toContain('mcp_oma_todo_todo');
+
+    await ctx.controller.submitInput('/settings interface');
+    await waitFor(() => ctx.controller.store.getState().settings?.page === 'interface');
+    ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'native' });
+    await waitFor(() => readFileSync(configPath, 'utf8').includes('todo_provider = "native"'));
+    ctx.testHost!.input.emit('\x1b');
+    await waitFor(() => ctx.controller.store.getState().settings === null);
+
+    await ctx.controller.submitInput('/new');
+    await waitFor(() => ctx.acp.newParams.length === 3);
+    expect(ctx.acp.newParams[2]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.newParams[2]?.['_meta']).toBeUndefined();
+
+    await ctx.shutdown();
+  });
+
+  test('resuming an unfinished mcp_oma_todo session in native mode skips stale anchor reminder and lets update_steps take over HUD and /todo', async () => {
+    const tmp = makeTempDir();
+    const oldSessionId = 'sess-legacy-mcp-unfinished';
+    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+    await previewStore.save({
+      sessionId: oldSessionId,
+      cwd: tmp,
+      title: 'Legacy MCP Session',
+      turnCount: 1,
+      updatedAt: '2026-11-24T06:00:00.000Z',
+      preview: [{ role: 'user', text: 'Run legacy MCP tasks' }],
+      todoState: { phases: [{ name: 'Anchor Phase', tasks: [{ content: 'Stale anchor task', status: 'in_progress' }] }], toolCallCount: 2, source: 'user' },
+    });
+
+    let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+    const ctx = await createTestController({
+      tmp,
+      previewStore,
+      cliArgs: ['--resume', oldSessionId],
+      todoProvider: 'native',
+      replayUpdates: () => [
+        { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Old MCP work' } },
+        { sessionUpdate: 'tool_call', toolCallId: 'tc-legacy-oma', name: 'mcp_oma_todo_todo', status: 'completed', rawInput: { op: 'init', items: ['Old MCP task A', 'Old MCP task B'] } },
+      ],
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
+      },
+    });
+    await ctx.boot();
+
+    expect(ctx.acp.loadParams[0]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.loadParams[0]?.['_meta']).toBeUndefined();
+    expect(ctx.controller.store.transcript.todoPhases[0]?.tasks[0]?.content).toBe('Old MCP task A');
+
+    await ctx.controller.submitInput('Continue with native update_steps');
+    await waitFor(() => promptResolver !== null);
+    expect(ctx.acp.sentPrompts).toHaveLength(1);
+    expect(ctx.acp.sentPrompts[0]?.text.includes('<system-reminder>')).toBe(false);
+
+    ctx.acp.sendUpdate(oldSessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-failed-legacy-oma', title: 'Run mcp_oma_todo_todo', status: 'failed', rawInput: { op: 'init', items: ['Failed fallback attempt'] } });
+    ctx.acp.sendUpdate(oldSessionId, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-resumed-native-steps',
+      title: 'Run update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Native Step 1', status: 'done' }, { title: 'Native Step 2', status: 'in_progress' }] },
+    });
+    promptResolver!({ stopReason: 'end_turn' });
+    promptResolver = null;
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
+    await waitFor(() => ctx.replayWire().get('main.t1-tc-resumed-native-steps')?.p['target'] === '1/2');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
+
+    const hudPhases = ctx.replayWire().get('dock.activity.todo')?.p['phases'] as Array<{ title: string; items: Array<{ text: string; status: string }> }>;
+    expect(hudPhases).toHaveLength(1);
+    expect(hudPhases[0]?.title).toBe('Plan');
+    expect(hudPhases[0]?.items.map(i => `${i.text}:${i.status}`)).toEqual(['Native Step 1:done', 'Native Step 2:active']);
+
+    await ctx.controller.submitInput('/todo');
+    const latestNotice = ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    expect(latestNotice?.text).toContain('- [x] Native Step 1');
+    expect(latestNotice?.text).toContain('- [/] Native Step 2');
+    expect(latestNotice?.text).not.toContain('Old MCP task A');
+    expect(latestNotice?.text).not.toContain('Stale anchor task');
+
+    await ctx.shutdown();
+    const anchorAfterNativeTurn = await previewStore.load(oldSessionId);
+    expect(anchorAfterNativeTurn?.turnCount).toBeGreaterThanOrEqual(2);
+    expect(anchorAfterNativeTurn?.todoState).toEqual({
+      phases: [{ name: 'Anchor Phase', tasks: [{ content: 'Stale anchor task', status: 'in_progress' }] }],
+      toolCallCount: 2,
+      source: 'user',
+    });
+  });
+
+  test('ui.todo_provider supports off mode and gates /settings options by agy version (1.5.15 Off/MCP vs 1.5.16 Off/MCP/Native)', async () => {
+    type PrefsSectionWire = { id: string; rows: Array<{ id: string; warning?: string; control?: { k: string; value?: unknown; options?: Array<{ value: string; label: string }> } }> };
+    const findTodoProviderRow = (nodes: Map<string, { p: Record<string, unknown> }>) =>
+      ((nodes.get('layer.settings')?.p['sections'] as PrefsSectionWire[] | undefined) ?? []).flatMap(s => s.rows).find(r => r.id === 'ui.todo_provider');
+
+    {
+      const tmp = makeTempDir();
+      const configPath = join(tmp, 'config.toml');
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctx = await createTestController({
+        tmp,
+        agentVersion: '1.5.16',
+        todoProvider: 'native',
+        controllerOptions: { configPath },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctx.boot();
+
+      await ctx.controller.submitInput('Show native plan');
+      await waitFor(() => promptResolver !== null);
+      ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, { sessionUpdate: 'tool_call', toolCallId: 'tc-on-off', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Active task', status: 'in_progress' }] } });
+      promptResolver!({ stopReason: 'end_turn' });
+      promptResolver = null;
+      await waitFor(() => ctx.replayWire().has('dock.activity.todo'));
+      expect(ctx.replayWire().has('main.plan')).toBe(false);
+
+      await ctx.controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(ctx.replayWire())));
+      const rowNew = findTodoProviderRow(ctx.replayWire());
+      expect(rowNew?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp', 'native']);
+      expect(rowNew?.control?.value).toBe('native');
+      expect(rowNew?.warning).toBeUndefined();
+
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'off' });
+      await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "off"'));
+      await waitFor(() => !ctx.replayWire().has('dock.activity.todo') && !ctx.replayWire().has('main.plan'));
+      ctx.testHost!.input.emit('\x1b');
+      await waitFor(() => ctx.controller.store.getState().settings === null);
+
+      await ctx.controller.submitInput('/todo');
+      expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Todo tracking is Off'))).toBe(true);
+      await ctx.controller.submitInput('/todo help');
+      expect(ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1)?.text).toContain('Usage: /todo');
+
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.acp.newParams.length === 2);
+      expect(ctx.acp.newParams[1]?.['mcpServers']).toEqual([]);
+      await ctx.shutdown();
+    }
+
+    {
+      const tmp = makeTempDir();
+      const configPath = join(tmp, 'config.toml');
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctx = await createTestController({
+        tmp,
+        agentVersion: '1.5.15',
+        todoProvider: 'native',
+        controllerOptions: { configPath },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctx.boot();
+      expect(ctx.acp.newParams[0]?.['mcpServers']).toEqual([]);
+
+      await ctx.controller.submitInput('Check suppressed plan on 1.5.15');
+      await waitFor(() => promptResolver !== null);
+      ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, { sessionUpdate: 'plan', entries: [{ content: 'Should stay hidden when fallback off', status: 'in_progress' }] });
+      promptResolver!({ stopReason: 'end_turn' });
+      promptResolver = null;
+      await waitFor(() => !ctx.controller.store.getState().isStreaming);
+      expect(ctx.replayWire().has('dock.activity.todo')).toBe(false);
+      expect(ctx.replayWire().has('main.plan')).toBe(false);
+
+      await ctx.controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(ctx.replayWire())));
+      const rowOld = findTodoProviderRow(ctx.replayWire());
+      expect(rowOld?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp']);
+      expect(rowOld?.control?.value).toBe('off');
+      expect(rowOld?.warning).toContain('1.5.16');
+
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'native' });
+      await waitFor(() => ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('1.5.16')));
+      expect(existsSync(configPath)).toBe(false);
+
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'mcp' });
+      await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'));
+      ctx.testHost!.input.emit('\x1b');
+      await waitFor(() => ctx.controller.store.getState().settings === null);
+
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.acp.newParams.length === 2);
+      const mcpServers = ctx.acp.newParams[1]?.['mcpServers'] as Array<{ name?: string }> | undefined;
+      expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
+      await ctx.shutdown();
+    }
+  });
+
+  test('P1 regression: OSC 1337/7501 sequences across queued /todo saves, initialization sendable gating, and unsendable recovery UI', async () => {
+    {
+      const tmp = makeTempDir();
+      const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+      const origSave = previewStore.save.bind(previewStore);
+      const ctxQuit = await createTestController({ tmp, previewStore, todoProvider: 'mcp', newSessionId: 'sess-quit-todo' });
+      await ctxQuit.boot();
+
+      let blockFirst = true;
+      const entered = Promise.withResolvers<void>();
+      const gate = Promise.withResolvers<void>();
+      previewStore.save = async input => {
+        if (blockFirst) {
+          blockFirst = false;
+          entered.resolve();
+          await gate.promise;
+        }
+        return origSave(input);
+      };
+
+      await ctxQuit.controller.submitInput('/todo append "Phase 1" First queued');
+      await entered.promise;
+      await ctxQuit.controller.submitInput('/todo append "Phase 1" Second before quit');
+      const quitPromise = ctxQuit.shutdown();
+      gate.resolve();
+      await quitPromise;
+
+      const persisted = await previewStore.load('sess-quit-todo');
+      expect(persisted?.todoState?.phases[0]?.tasks.map(t => t.content)).toEqual(['First queued', 'Second before quit']);
+      expect(ctxQuit.host.osc1337.filter(v => v.startsWith('omp_session_file=')).at(-1)).toBe('omp_session_file=');
+      expect(ctxQuit.host.osc7501.length).toBeGreaterThan(0);
+    }
+
+    {
+      const tmp = makeTempDir();
+      let bootNewId: string | number | undefined;
+      let failNextNew = false;
+      let failPrevLoad = false;
+
+      const ctx = await createTestController({
+        tmp,
+        todoProvider: 'mcp',
+        onRpc: (msg, acp) => {
+          if (msg.method === 'session/new') {
+            acp.newCount += 1;
+            if (acp.newCount === 1) {
+              bootNewId = msg.id;
+              return true;
+            }
+            if (failNextNew) {
+              acp.replyError(msg.id, -32603, 'backend unavailable');
+              return true;
+            }
+            acp.reply(msg.id, { sessionId: `sess-new-${acp.newCount}`, configOptions: [] });
+            return true;
+          }
+          if (msg.method === 'session/load' && failPrevLoad) {
+            acp.replyError(msg.id, -32603, 'reload failed');
+            return true;
+          }
+        },
+      });
+
+      const runPromise = ctx.start();
+      await waitFor(() => bootNewId !== undefined && replayWire(ctx.host).has(EDITOR_NODE_ID));
+      expect(replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['sendable']).toBe(false);
+      expect(replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['placeholder']).toBe('Connecting to agy acp… (you can start typing)');
+
+      ctx.acp.reply(bootNewId, { sessionId: 'sess-new-1', configOptions: [] });
+      await ctx.controller.readyPromise;
+      await waitFor(() => ctx.controller.store.getState().isReady && replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['sendable'] === true);
+
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.controller.store.getState().sessionId === 'sess-new-2' && ctx.controller.store.getState().isReady);
+      const lastSessionB64 = ctx.host.osc1337.filter(v => v.startsWith('omp_session_file=')).at(-1)?.slice('omp_session_file='.length) ?? '';
+      expect(Buffer.from(lastSessionB64, 'base64').toString('utf8')).toContain('sess-new-2.json');
+
+      failNextNew = true;
+      failPrevLoad = true;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => {
+        const st = ctx.controller.store.getState();
+        const ed = replayWire(ctx.host).get(EDITOR_NODE_ID);
+        return st.sessionId === null && st.connectionStatus === 'ready' && !st.isReady && ed?.p['sendable'] === false && ed?.p['typeahead'] === false && ed?.p['placeholder'] === 'No active session — use /new or /resume';
+      });
+
+      await ctx.controller.submitInput('Blocked while unsendable');
+      expect(ctx.acp.sentPrompts).toHaveLength(0);
+      expect(ctx.controller.store.getState().activeToast?.text).toBe('No active session — use /new or /resume');
+
+      failNextNew = false;
+      failPrevLoad = false;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => {
+        const ed = replayWire(ctx.host).get(EDITOR_NODE_ID);
+        return ctx.controller.store.getState().sessionId === 'sess-new-4' && ctx.controller.store.getState().isReady && ed?.p['sendable'] === true && ed?.p['typeahead'] === false;
+      });
+
+      await ctx.shutdown();
+      await runPromise;
+    }
+  });
+
+  test('P1 regression: oma_todo and update_steps failure preview isolation, multi-line error spans, and HUD auto-dismiss in UI', async () => {
+    {
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctxMcp = await createTestController({
+        tmp: makeTempDir(),
+        todoProvider: 'mcp',
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctxMcp.boot();
+      const sessionId = ctxMcp.controller.store.getState().sessionId!;
+      const mcpUrl = ctxMcp.acp.mcpUrls[0]!;
+
+      await ctxMcp.controller.submitInput('Check MCP failure card rendering');
+      await waitFor(() => promptResolver !== null);
+
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-fail-nosnap', name: 'mcp_oma_todo_todo', status: 'in_progress', rawInput: { op: 'init', items: ['Task'] }, rawOutput: { output: 'Transient preview' } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-nosnap', status: 'failed', rawOutput: {} });
+      await waitFor(() => ctxMcp.replayWire().get('main.t0-tc-fail-nosnap')?.p['status'] === 'error');
+      expect(ctxMcp.replayWire().has('main.t0-tc-fail-nosnap.err')).toBe(false);
+
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-nosnap', status: 'failed', rawOutput: { error: 'Actual failure' } });
+      await waitFor(() => Boolean(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap.err')));
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap')?.p['collapsed']).toBe(false);
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap.err')?.p['spans']).toEqual([{ t: 'Actual failure', s: 'error' }]);
+
+      const snapRes = await callTodoMcp(mcpUrl, { op: 'init', items: ['Snap task'] });
+      expect(snapRes.status).toBe(200);
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-fail-snap', name: 'mcp_oma_todo_todo', status: 'in_progress', rawInput: { op: 'init', items: ['Snap task'] } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-snap', status: 'failed', rawOutput: { error: 'Diagnostic part 1' } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-snap', status: 'failed', rawOutput: { error: 'Diagnostic part 1\nDiagnostic part 2' } });
+      await waitFor(() => JSON.stringify(ctxMcp.replayWire().get('main.t0-tc-fail-snap.err')?.p['spans'] ?? '').includes('Diagnostic part 2'));
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-snap.err')?.p['spans']).toEqual([{ t: 'Diagnostic part 1\nDiagnostic part 2', s: 'error' }]);
+
+      promptResolver!({ stopReason: 'end_turn' });
+      await waitFor(() => !ctxMcp.controller.store.getState().isStreaming);
+      await ctxMcp.shutdown();
+    }
+
+    {
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctxNat = await createTestController({
+        tmp: makeTempDir(),
+        todoProvider: 'native',
+        controllerOptions: { todoAutoClearDelayMs: 15 },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctxNat.boot();
+      const sessionId = ctxNat.controller.store.getState().sessionId!;
+
+      await ctxNat.controller.submitInput('Check native failure card and HUD auto-dismiss');
+      await waitFor(() => promptResolver !== null);
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-fail', name: 'update_steps', status: 'in_progress', rawInput: { steps: [{ title: 'Preview only', status: 'in_progress' }] }, rawOutput: { output: 'Pre-failure progress' } });
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-steps-fail', status: 'failed', rawOutput: { error: 'Native step schema rejected' } });
+      await waitFor(() => Boolean(ctxNat.replayWire().get('main.t0-tc-steps-fail.err')));
+      const failedStepsNode = ctxNat.replayWire().get('main.t0-tc-steps-fail');
+      expect(failedStepsNode?.p['status']).toBe('error');
+      expect(failedStepsNode?.p['frame']).toBe('card');
+      expect(failedStepsNode?.p['collapsed']).toBe(false);
+      expect(ctxNat.replayWire().has('main.t0-tc-steps-fail.checklist')).toBe(false);
+      expect(ctxNat.replayWire().get('main.t0-tc-steps-fail.err')?.p['spans']).toEqual([{ t: 'Native step schema rejected', s: 'error' }]);
+      expect(ctxNat.replayWire().has('dock.activity.todo')).toBe(false);
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-open', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 1', status: 'in_progress' }] } });
+      await waitFor(() => ctxNat.replayWire().has('dock.activity.todo'));
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-done', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 1', status: 'done' }] } });
+      await waitFor(() => !ctxNat.replayWire().has('dock.activity.todo'));
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-reopen', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 2', status: 'in_progress' }] } });
+      await waitFor(() => ctxNat.replayWire().has('dock.activity.todo'));
+
+      promptResolver!({ stopReason: 'end_turn' });
+      await waitFor(() => !ctxNat.controller.store.getState().isStreaming);
+      await ctxNat.shutdown();
+    }
   });
 });

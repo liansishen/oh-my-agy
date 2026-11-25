@@ -433,12 +433,15 @@ export interface AppState {
   readonly isReady: boolean;
   readonly isStreaming: boolean;
   readonly isReplaying: boolean;
+  readonly isCreatingSession: boolean;
   /** True when transcript has any in-flight tool call or detached background task still running. */
   readonly hasActiveBackgroundTasks: boolean;
   /** Latest background-polled swarm board snapshot for the active session, if any. */
   readonly swarmSnapshot: SwarmBoardSnapshot | null;
   /** True once the active session has entered swarm mode (snapshot exists or swarm tool detected). */
   readonly hasSwarm: boolean;
+  /** True only when a swarm run has been triggered during the current live session (not merely inherited from pre-existing disk files). */
+  readonly swarmTriggeredInSession?: boolean;
   /** True when at least one non-killed, non-stopped swarm member is currently `working`. */
   readonly isSwarmWorking: boolean;
   /** Roster names of swarm members currently in `working` status. */
@@ -505,6 +508,7 @@ export interface AppState {
   readonly gitOverlay: GitOverlayState | null;
   readonly helpOpen: boolean;
   readonly activeQuestion: ActiveQuestionCard | null;
+  readonly queuedQuestionCount: number;
   readonly completion: CompletionPopupState;
   readonly pendingAttachments: readonly AttachmentItem[];
   readonly toasts: readonly ToastItem[];
@@ -612,7 +616,7 @@ export class AppStore {
 
   private _connectionStatus: ConnectionStatus = 'initializing';
   private _isStreaming = false;
-  private _isReplaying = false;
+  private _sessionPhase: 'none' | 'creating' | 'replaying' | 'ready' = 'none';
   private _sessionId: string | null = null;
   private _sessionTitle: string | null = null;
   private _cwd: string;
@@ -623,6 +627,7 @@ export class AppStore {
   private _activeSwarmCount: number | undefined;
   private _swarmSnapshot: SwarmBoardSnapshot | null = null;
   private _hasSwarmHint = false;
+  private _swarmTriggeredInSession = false;
   private _swarmBoardOpen = false;
   private _swarmBoardFilterAgent: string | null = null;
   private _swarmBoardQuery = '';
@@ -663,6 +668,7 @@ export class AppStore {
   private _gitOverlay: GitOverlayState | null = null;
   private _helpOpen = false;
   private _activeQuestion: ActiveQuestionCard | null = null;
+  private readonly _questionQueue: ActiveQuestionCard[] = [];
   private _completion: CompletionPopupState = EMPTY_COMPLETION;
 
   private _pendingAttachments: AttachmentItem[] = [];
@@ -937,8 +943,12 @@ export class AppStore {
   }
 
   setHasSwarm(hasSwarm: boolean): void {
-    if (this._hasSwarmHint === hasSwarm) return;
+    const nextTriggered = hasSwarm ? true : false;
+    if (this._hasSwarmHint === hasSwarm && this._swarmTriggeredInSession === nextTriggered) {
+      return;
+    }
     this._hasSwarmHint = hasSwarm;
+    this._swarmTriggeredInSession = nextTriggered;
     this.emit();
   }
 
@@ -1094,14 +1104,21 @@ export class AppStore {
     const isSwarmWorking = Boolean(this._swarmSnapshot?.isSwarmActive);
     const swarmWorkingNames = this._swarmSnapshot?.workingMembers ?? [];
     const isBusy = this._isStreaming || hasActiveBackgroundTasks || isSwarmWorking;
+    const isReplaying = this._sessionPhase === 'replaying';
+    const isCreatingSession = this._sessionPhase === 'creating';
     return {
       connectionStatus: this._connectionStatus,
-      isReady: this._connectionStatus === 'ready',
+      isReady:
+        this._connectionStatus === 'ready' &&
+        this._sessionId !== null &&
+        this._sessionPhase === 'ready',
       isStreaming: this._isStreaming,
-      isReplaying: this._isReplaying,
+      isReplaying,
+      isCreatingSession,
       hasActiveBackgroundTasks,
       swarmSnapshot: this._swarmSnapshot,
       hasSwarm,
+      swarmTriggeredInSession: this._swarmTriggeredInSession,
       isSwarmWorking,
       swarmWorkingNames,
       isBusy,
@@ -1157,6 +1174,7 @@ export class AppStore {
       gitOverlay: this._gitOverlay,
       helpOpen: this._helpOpen,
       activeQuestion: this._activeQuestion,
+      queuedQuestionCount: this._questionQueue.length,
       completion: this._completion,
       pendingAttachments: this._pendingAttachments,
       toasts: this._toasts,
@@ -1173,10 +1191,28 @@ export class AppStore {
 
   setConnectionStatus(status: ConnectionStatus): void {
     this._connectionStatus = status;
-    if (status === 'ready') {
+    if (status === 'ready' || status === 'initializing') {
       this._crashError = null;
       this._authRequired = null;
     }
+    this.emit();
+  }
+
+  private settledSessionPhase(): 'none' | 'ready' {
+    return this._sessionId !== null ? 'ready' : 'none';
+  }
+
+  markSessionReady(): void {
+    this._connectionStatus = 'ready';
+    this._sessionPhase = this.settledSessionPhase();
+    this._crashError = null;
+    this._authRequired = null;
+    this.emit();
+  }
+
+  setSessionPhase(phase: 'none' | 'creating' | 'replaying' | 'ready'): void {
+    if (this._sessionPhase === phase) return;
+    this._sessionPhase = phase;
     this.emit();
   }
 
@@ -1202,7 +1238,19 @@ export class AppStore {
   }
 
   setReplaying(replaying: boolean): void {
-    this._isReplaying = replaying;
+    if (replaying) this._sessionPhase = 'replaying';
+    else if (this._sessionPhase === 'replaying') this._sessionPhase = this.settledSessionPhase();
+    this.emit();
+  }
+
+  setCreatingSession(creating: boolean): void {
+    const next = creating
+      ? 'creating'
+      : this._sessionPhase === 'creating'
+        ? this.settledSessionPhase()
+        : this._sessionPhase;
+    if (this._sessionPhase === next) return;
+    this._sessionPhase = next;
     this.emit();
   }
 
@@ -1216,6 +1264,7 @@ export class AppStore {
     if (err) {
       this._connectionStatus = 'crashed';
       this._isStreaming = false;
+      this._sessionPhase = this.settledSessionPhase();
     }
     this.emit();
   }
@@ -1225,6 +1274,7 @@ export class AppStore {
     if (auth) {
       this._connectionStatus = 'auth_required';
       this._isStreaming = false;
+      this._sessionPhase = this.settledSessionPhase();
     }
     this.emit();
   }
@@ -1248,6 +1298,9 @@ export class AppStore {
 
   applySessionSnapshot(snapshot: SessionSnapshotInput): void {
     this._sessionId = snapshot.sessionId;
+    if (this._sessionPhase === 'none') {
+      this._sessionPhase = 'ready';
+    }
     if (snapshot.cwd !== undefined) {
       this._cwd = snapshot.cwd;
     }
@@ -1332,9 +1385,10 @@ export class AppStore {
    * configOptions, mode, and session info.
    */
   applySessionUpdate(update: SessionUpdate | UnknownSessionUpdate): TranscriptUpdateOutcome {
+    const isReplaying = this._sessionPhase === 'replaying';
     const outcome = this.transcript.applySessionUpdate(update, {
       autoCollapseThought: this._autoCollapseThought,
-      isReplaying: this._isReplaying,
+      isReplaying,
       showThinking: this._showThinking,
       expandAllTools: this._expandAllTools,
     });
@@ -1357,7 +1411,7 @@ export class AppStore {
 
     // Automatically enter swarm mode hint if a `swarm` tool call is observed in live stream
     if (
-      !this._isReplaying &&
+      !isReplaying &&
       (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
     ) {
       const uName =
@@ -1370,6 +1424,27 @@ export class AppStore {
           : '';
       if (uName === 'swarm' || uTitle === 'swarm' || uTitle.startsWith('swarm ')) {
         this._hasSwarmHint = true;
+        const rawRec =
+          typeof (update as { rawInput?: unknown }).rawInput === 'object' &&
+          (update as { rawInput?: unknown }).rawInput !== null
+            ? ((update as { rawInput: Record<string, unknown> }).rawInput)
+            : typeof (update as { args?: unknown }).args === 'object' &&
+                (update as { args?: unknown }).args !== null
+              ? ((update as { args: Record<string, unknown> }).args)
+              : undefined;
+        const action = typeof rawRec?.action === 'string' ? rawRec.action.trim().toLowerCase() : '';
+        if (action !== 'status' && action !== 'models') {
+          this._swarmTriggeredInSession = true;
+        }
+      } else if (
+        uName === 'post_message' ||
+        uTitle === 'post_message' ||
+        uName === 'swarm_wait' ||
+        uTitle === 'swarm_wait' ||
+        uTitle.includes('swarm_wait')
+      ) {
+        this._hasSwarmHint = true;
+        this._swarmTriggeredInSession = true;
       }
     }
 
@@ -1382,8 +1457,11 @@ export class AppStore {
    */
   resetSessionState(options: { keepCommands?: boolean } = {}): void {
     this._sessionId = null;
+    if (this._sessionPhase === 'ready') {
+      this._sessionPhase = 'none';
+    }
     this.approvals.cancelAll();
-    this.cancelActiveQuestion();
+    this.cancelAllQuestions();
     this.transcript.clear();
     this._usage = null;
     this._sessionMetrics = null;
@@ -1393,6 +1471,7 @@ export class AppStore {
     this._completion = EMPTY_COMPLETION;
     this._swarmSnapshot = null;
     this._hasSwarmHint = false;
+    this._swarmTriggeredInSession = false;
     this._activeSwarmCount = undefined;
     this._swarmBoardOpen = false;
     this._swarmBoardFilterAgent = null;
@@ -1863,13 +1942,16 @@ export class AppStore {
    */
   setSwarmSnapshot(
     snapshot: SwarmBoardSnapshot | null,
-    options: { autoFollow?: boolean } = {},
+    options: { autoFollow?: boolean; fromInitialLoad?: boolean } = {},
   ): void {
     const prevLatestSeq = this._swarmSnapshot?.latestSeq ?? 0;
     this._swarmSnapshot = snapshot;
     if (snapshot) {
       this._hasSwarmHint = true;
       this._activeSwarmCount = snapshot.counts.activeMembers;
+      if (snapshot.isSwarmActive && !options.fromInitialLoad) {
+        this._swarmTriggeredInSession = true;
+      }
     } else {
       this._activeSwarmCount = undefined;
     }
@@ -2425,18 +2507,21 @@ export class AppStore {
     params: ElicitationCreateParams,
     resolve: (result: ElicitationCreateResult) => void,
   ): ActiveQuestionCard {
-    if (this._activeQuestion) {
-      this._activeQuestion.resolve({ action: 'cancel' });
-    }
-    this._completion = EMPTY_COMPLETION;
-    this._activeQuestion = buildQuestionCardFromElicitation(
+    const card = buildQuestionCardFromElicitation(
       requestId,
       params,
       resolve,
       this._now(),
     );
+    if (this._activeQuestion) {
+      this._questionQueue.push(card);
+      this.emit();
+      return card;
+    }
+    this._completion = EMPTY_COMPLETION;
+    this._activeQuestion = card;
     this.emit();
-    return this._activeQuestion;
+    return card;
   }
 
   setQuestionAnswer(questionId: string, answer: string | string[]): void {
@@ -2501,7 +2586,11 @@ export class AppStore {
   resolveActiveQuestion(result: ElicitationCreateResult): boolean {
     const card = this._activeQuestion;
     if (!card) return false;
-    this._activeQuestion = null;
+    const nextCard = this._questionQueue.shift() ?? null;
+    this._activeQuestion = nextCard;
+    if (nextCard) {
+      this._completion = EMPTY_COMPLETION;
+    }
     card.resolve(result);
     this.emit();
     return true;
@@ -2509,6 +2598,23 @@ export class AppStore {
 
   cancelActiveQuestion(): boolean {
     return this.resolveActiveQuestion({ action: 'cancel' });
+  }
+
+  cancelAllQuestions(): number {
+    const pending: ActiveQuestionCard[] = [];
+    if (this._activeQuestion) {
+      pending.push(this._activeQuestion);
+      this._activeQuestion = null;
+    }
+    if (this._questionQueue.length > 0) {
+      pending.push(...this._questionQueue.splice(0, this._questionQueue.length));
+    }
+    if (pending.length === 0) return 0;
+    for (const card of pending) {
+      card.resolve({ action: 'cancel' });
+    }
+    this.emit();
+    return pending.length;
   }
 
   // -------------------------------------------------------------------------
