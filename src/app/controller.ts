@@ -82,6 +82,7 @@ import {
 } from '../config/config';
 import {
   exportTranscriptMarkdown,
+  fetchUsageQuota,
   listAgents,
   listMcpServers,
   listPlugins,
@@ -672,6 +673,7 @@ export class AppController {
   #configSaveChain: Promise<void> = Promise.resolve();
   #anchorSaveChains = new Map<string, Promise<void>>();
   #pickerLoadToken = 0;
+  #usageQuotaLoadToken = 0;
   #attachmentSeq = 0;
   #shutdownPromise: Promise<void> | null = null;
   #shuttingDown = false;
@@ -2751,6 +2753,13 @@ export class AppController {
     if (state.infoOverlay) {
       if (name === 'escape' || name === 'q') {
         this.#closeInfoOverlay();
+        return;
+      }
+      if (
+        state.infoOverlay.kind === 'usage' &&
+        ((name === 'r' && key.ctrl) || (name === 'r' && !key.ctrl && !key.alt && !key.meta))
+      ) {
+        void this.#loadUsageQuota(++this.#usageQuotaLoadToken);
         return;
       }
       if (state.infoOverlay.kind === 'jobs') {
@@ -7117,15 +7126,55 @@ export class AppController {
 
   #openInfoOverlay(kind: 'status' | 'context' | 'usage' | 'logout_confirm' | 'jobs'): void {
     this.#pickerLoadToken += 1;
+    this.#usageQuotaLoadToken += 1;
+    const usageToken = this.#usageQuotaLoadToken;
     this.store.openInfoOverlay(kind, {
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
+      ...(kind === 'usage' ? { quotaLoading: true } : {}),
     });
     this.scheduler.renderNow();
     this.syncFocus();
+    if (kind === 'usage') {
+      void this.#loadUsageQuota(usageToken);
+    }
+  }
+
+  async #loadUsageQuota(loadToken: number): Promise<void> {
+    const isStale = (): boolean =>
+      this.#shuttingDown ||
+      loadToken !== this.#usageQuotaLoadToken ||
+      this.store.getState().infoOverlay?.kind !== 'usage';
+
+    this.store.setUsageQuotaLoading(true);
+    this.scheduler.renderNow();
+
+    try {
+      const res = await fetchUsageQuota(this.#resolveAgyBin(), {
+        execCommand: this.#ecosystemRunner,
+        cwd: this.store.getState().cwd,
+      });
+      if (isStale()) return;
+      if (res.ok && res.quota) {
+        this.store.setUsageQuota(res.quota);
+      } else {
+        this.store.setUsageQuota(
+          null,
+          res.error ?? 'Failed to fetch quota via agy -p /usage'
+        );
+      }
+    } catch (err) {
+      if (isStale()) return;
+      this.store.setUsageQuota(
+        null,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+    this.scheduler.renderNow();
   }
 
   #closeInfoOverlay(): void {
+    this.#usageQuotaLoadToken += 1;
     if (!this.store.closeInfoOverlay()) return;
     this.scheduler.renderNow();
     this.syncFocus();
@@ -7170,6 +7219,7 @@ export class AppController {
         abortError: new Error('Signed out'),
         resetStore: true,
       });
+      this.store.clearUsageQuota();
       this.osc.setStatusBlocked('auth');
       this.store.setAuthRequired({
         message: 'Signed out of Antigravity. Run /login or click Sign in to reconnect.',
@@ -9430,6 +9480,9 @@ export class AppController {
           },
           onDetachJob: jobId => {
             this.#detachBackgroundJob(jobId);
+          },
+          onRefreshUsage: () => {
+            void this.#loadUsageQuota(++this.#usageQuotaLoadToken);
           },
         },
       },

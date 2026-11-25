@@ -48,6 +48,11 @@ import {
 import {
   addMcpServer,
   exportTranscriptMarkdown,
+  fetchUsageQuota,
+  formatQuotaPercent,
+  formatQuotaResetClock,
+  formatQuotaResetCountdown,
+  formatQuotaResetDisplay,
   formatTranscriptMarkdown,
   listAgents,
   listMcpServers,
@@ -55,6 +60,7 @@ import {
   parseAgentsOutput,
   parseMcpListOutput,
   parsePluginsJsonOutput,
+  parseUsageQuotaOutput,
   removeMcpServer,
   scanLocalSkills,
   setMcpServerEnabled,
@@ -1048,5 +1054,245 @@ describe('src/ecosystem/cli.ts offline CLI wrappers & parsers', () => {
     );
     expect(customExport.path).toBe(join(dir, 'out', 'transcript.md'));
     expect(await readdir(join(dir, 'out'))).toEqual(['transcript.md']);
+  });
+});
+
+describe('Usage quota parsing & fetching (agy -p /usage)', () => {
+  test('parseUsageQuotaOutput handles --output-format json, response TSV, plain text, and empty output', () => {
+    const fixedNow = Date.parse('2026-11-25T13:15:00Z');
+    const jsonPayload = JSON.stringify({
+      conversation_id: '',
+      status: 'SUCCESS',
+      response: 'Gemini Models\tWeekly Limit Remaining\t87%\t2026-12-01T00:27:39Z',
+      command: {
+        name: 'usage',
+        data: {
+          description: 'Shared quota description',
+          groups: [
+            {
+              name: 'Gemini Models',
+              description: 'Gemini 4 Neon, Gemini 4 Carbon',
+              buckets: [
+                {
+                  id: 'gemini-weekly',
+                  name: 'Weekly Limit Remaining',
+                  window: 'weekly',
+                  remaining_fraction: 0.87077,
+                  reset_time: '2026-12-01T00:27:39Z',
+                },
+                {
+                  id: 'gemini-5h',
+                  name: 'Five Hour Limit Remaining',
+                  window: '5h',
+                  remaining_fraction: 0.9899,
+                  reset_time: '2026-11-25T16:05:15Z',
+                },
+              ],
+            },
+            {
+              name: 'Claude and GPT models',
+              buckets: [
+                {
+                  id: '3p-weekly',
+                  name: 'Weekly Limit Remaining',
+                  window: 'weekly',
+                  remaining_fraction: 1,
+                  reset_time: '1970-01-01T00:00:00Z',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    const parsedJson = parseUsageQuotaOutput(jsonPayload, fixedNow);
+    expect(parsedJson).not.toBeNull();
+    expect(parsedJson?.description).toBe('Shared quota description');
+    expect(parsedJson?.groups).toHaveLength(2);
+    expect(parsedJson?.groups[0]?.buckets[0]).toMatchObject({
+      id: 'gemini-weekly',
+      window: 'weekly',
+      remainingPercent: 87.08,
+      resetTime: '2026-12-01T00:27:39Z',
+    });
+    expect(parsedJson?.groups[0]?.buckets[1]).toMatchObject({
+      id: 'gemini-5h',
+      window: '5h',
+      remainingPercent: 98.99,
+    });
+    expect(parsedJson?.groups[1]?.buckets[0]).toEqual({
+      id: '3p-weekly',
+      name: 'Weekly Limit Remaining',
+      window: 'weekly',
+      remainingFraction: 1,
+      remainingPercent: 100,
+    });
+
+    // JSON envelope with only response TSV lines
+    const tsvEnvelope = JSON.stringify({
+      status: 'SUCCESS',
+      response:
+        'Gemini Models\tWeekly Limit Remaining\t64%\t2026-12-01T00:27:39Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\n',
+    });
+    const parsedTsv = parseUsageQuotaOutput(tsvEnvelope, fixedNow);
+    expect(parsedTsv?.groups).toHaveLength(2);
+    expect(parsedTsv?.groups[0]?.buckets[0]?.remainingPercent).toBe(64);
+    expect(parsedTsv?.groups[1]?.buckets[0]?.resetTime).toBeUndefined();
+
+    // Plain text output from `agy -p /usage`
+    const plainOutput = [
+      'Quota:',
+      'Gemini Models          Weekly Limit Remaining     87%   2026-12-01 08:27 CST',
+      'Gemini Models          Five Hour Limit Remaining  99%   2026-11-26 00:05 CST',
+      'Claude and GPT models  Weekly Limit Remaining     100%  1970-01-01 08:00 CST',
+    ].join('\n');
+    const parsedPlain = parseUsageQuotaOutput(plainOutput, fixedNow);
+    expect(parsedPlain?.groups).toHaveLength(2);
+    expect(parsedPlain?.groups[0]?.buckets.map((b) => b.remainingPercent)).toEqual([87, 99]);
+    expect(parsedPlain?.groups[0]?.buckets[0]?.resetTime).toBe('2026-12-01 08:27 CST');
+    expect(parsedPlain?.groups[0]?.buckets[0]?.resetAtMs).toBeUndefined();
+    expect(parsedPlain?.groups[1]?.buckets[0]?.resetTime).toBeUndefined();
+
+    expect(parseUsageQuotaOutput('')).toBeNull();
+    expect(parseUsageQuotaOutput(JSON.stringify({ status: 'ERROR' }))).toBeNull();
+  });
+
+  test('formatQuotaResetCountdown formats >=24h, <24h, <1h, Full, and fallback timestamps', () => {
+    const now = Date.parse('2026-11-25T13:15:00Z');
+    expect(
+      formatQuotaResetCountdown(
+        { remainingPercent: 87, resetAtMs: now + ((5 * 24 + 11) * 60 + 13) * 60_000 },
+        now,
+      ),
+    ).toBe('in 5d 11h 13m');
+    expect(
+      formatQuotaResetCountdown(
+        { remainingPercent: 99, resetAtMs: now + (2 * 60 + 49) * 60_000 },
+        now,
+      ),
+    ).toBe('in 2h 49m');
+    expect(
+      formatQuotaResetCountdown(
+        { remainingPercent: 40, resetAtMs: now + 15 * 60_000 },
+        now,
+      ),
+    ).toBe('in 15m');
+    expect(formatQuotaResetCountdown({ remainingPercent: 100 }, now)).toBe('Full');
+    expect(
+      formatQuotaResetCountdown({ remainingPercent: 87, resetTime: '2026-12-01 08:27 CST' }, now),
+    ).toBe('2026-12-01 08:27 CST');
+  });
+
+  test('formatQuotaResetClock and formatQuotaResetDisplay format local clock and reset states', () => {
+    const localNow = new Date(2026, 10, 25, 9, 15).getTime();
+    const sameDayReset = new Date(2026, 10, 25, 14, 5).getTime();
+    const sameYearReset = new Date(2026, 11, 1, 8, 27).getTime();
+    const nextYearReset = new Date(2027, 0, 3, 6, 4).getTime();
+
+    expect(formatQuotaResetClock(sameDayReset, localNow)).toBe('Today 14:05');
+    expect(formatQuotaResetClock(sameYearReset, localNow)).toBe('12-01 08:27');
+    expect(formatQuotaResetClock(nextYearReset, localNow)).toBe('2027-01-03 06:04');
+
+    expect(
+      formatQuotaResetDisplay({ remainingPercent: 87, resetAtMs: sameYearReset }, localNow),
+    ).toEqual({
+      kind: 'scheduled',
+      countdown: 'in 5d 23h 12m',
+      localTime: '12-01 08:27',
+      text: 'Resets in 5d 23h 12m · 12-01 08:27',
+    });
+    expect(
+      formatQuotaResetDisplay({ remainingPercent: 50, resetAtMs: localNow - 60_000 }, localNow),
+    ).toEqual({
+      kind: 'refreshing',
+      text: 'Refreshing soon',
+    });
+    expect(
+      formatQuotaResetDisplay({ remainingPercent: 100, resetAtMs: localNow - 60_000 }, localNow),
+    ).toEqual({
+      kind: 'full',
+      text: 'Full',
+    });
+    expect(
+      formatQuotaResetDisplay({ remainingPercent: 86, resetTime: '2026-12-01 08:27 CST' }, localNow),
+    ).toEqual({
+      kind: 'raw',
+      localTime: '2026-12-01 08:27 CST',
+      text: 'Resets 2026-12-01 08:27 CST',
+    });
+    expect(formatQuotaResetDisplay({ remainingPercent: 100 }, localNow)).toEqual({
+      kind: 'full',
+      text: 'Full',
+    });
+    expect(formatQuotaResetDisplay({ remainingPercent: 60 }, localNow)).toEqual({
+      kind: 'unknown',
+      text: '—',
+    });
+    expect(formatQuotaPercent(0.87077)).toBe('87.08%');
+    expect(formatQuotaPercent(0.9899)).toBe('98.99%');
+    expect(formatQuotaPercent(1)).toBe('100.00%');
+    expect(formatQuotaPercent(0)).toBe('0.00%');
+    expect(formatQuotaPercent(-0.1)).toBe('0.00%');
+    expect(formatQuotaPercent(1.5)).toBe('100.00%');
+  });
+
+  test('fetchUsageQuota invokes --output-format json, falls back when flag unsupported, and reports errors', async () => {
+    const calls: string[][] = [];
+    const okRes = await fetchUsageQuota('/custom/agy', {
+      execCommand: async (cmd, opts) => {
+        calls.push([...cmd]);
+        expect(opts?.timeoutMs).toBe(20_000);
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            command: {
+              name: 'usage',
+              data: {
+                groups: [
+                  {
+                    name: 'Gemini Models',
+                    buckets: [
+                      { id: 'g-5h', name: 'Five Hour Limit Remaining', remaining_fraction: 0.75 },
+                    ],
+                  },
+                ],
+              },
+            },
+          }),
+          stderr: '',
+        };
+      },
+    });
+    expect(okRes.ok).toBe(true);
+    expect(okRes.quota?.groups[0]?.buckets[0]?.remainingPercent).toBe(75);
+    expect(calls[0]).toEqual(['/custom/agy', '-p', '/usage', '--output-format', 'json']);
+
+    const fallbackCalls: string[][] = [];
+    const fallbackRes = await fetchUsageQuota('agy', {
+      execCommand: async (cmd) => {
+        fallbackCalls.push([...cmd]);
+        if (cmd.includes('--output-format')) {
+          return { exitCode: 2, stdout: '', stderr: 'flag provided but not defined: -output-format' };
+        }
+        return {
+          exitCode: 0,
+          stdout: 'Quota:\nGemini Models          Weekly Limit Remaining     52%   2026-12-01 08:27 CST\n',
+          stderr: '',
+        };
+      },
+    });
+    expect(fallbackRes.ok).toBe(true);
+    expect(fallbackRes.quota?.groups[0]?.buckets[0]?.remainingPercent).toBe(52);
+    expect(fallbackCalls).toEqual([
+      ['agy', '-p', '/usage', '--output-format', 'json'],
+      ['agy', '-p', '/usage'],
+    ]);
+
+    const errRes = await fetchUsageQuota('agy', {
+      execCommand: async () => ({ exitCode: 1, stdout: '', stderr: 'Not signed in' }),
+    });
+    expect(errRes.ok).toBe(false);
+    expect(errRes.error).toContain('Not signed in');
   });
 });

@@ -52,6 +52,7 @@ import {
   detectCompletionTrigger,
   type CompletionTrigger,
 } from '../editor/trigger';
+import type { UsageQuotaSnapshot } from '../ecosystem/cli';
 import type { SessionTitleSource } from '../preview/store';
 import type { SwarmBoardMessage, SwarmBoardSnapshot } from '../swarm/board';
 import { ApprovalQueue } from './approval';
@@ -234,6 +235,8 @@ export interface SettingsPanelState {
 
 export type InfoOverlayKind = 'status' | 'context' | 'usage' | 'logout_confirm' | 'jobs';
 
+export type { UsageQuotaBucket, UsageQuotaGroup, UsageQuotaSnapshot } from '../ecosystem/cli';
+
 export interface InfoOverlayState {
   readonly kind: InfoOverlayKind;
   readonly configPath?: string;
@@ -241,6 +244,9 @@ export interface InfoOverlayState {
   readonly contextBreakdown?: ContextBreakdown;
   readonly message?: string;
   readonly selectedJobId?: string;
+  readonly quotaLoading?: boolean;
+  readonly quotaError?: string;
+  readonly quota?: UsageQuotaSnapshot | null;
 }
 
 export interface TierInfo {
@@ -679,6 +685,7 @@ export class AppStore {
   private _terminalRows: number;
   private readonly _autoCompactOverrideRaw: string | undefined;
   private _usage: ContextUsageState | null = null;
+  private _usageQuota: UsageQuotaSnapshot | null = null;
   private _sessionMetrics: SessionMetricsSnapshot | null = null;
   private _gitStatus: GitStatusSnapshot | null = null;
 
@@ -1653,6 +1660,9 @@ export class AppStore {
       contextBreakdown?: ContextBreakdown;
       message?: string;
       selectedJobId?: string;
+      quotaLoading?: boolean;
+      quotaError?: string;
+      quota?: UsageQuotaSnapshot | null;
     } = {},
   ): InfoOverlayState {
     this._picker = null;
@@ -1664,6 +1674,8 @@ export class AppStore {
       kind === 'jobs'
         ? (data.selectedJobId ?? this.transcript.getBackgroundJobsSnapshot().all[0]?.id)
         : undefined;
+    const initialQuota =
+      kind === 'usage' ? (data.quota !== undefined ? data.quota : this._usageQuota) : undefined;
     this._infoOverlay = {
       kind,
       ...(data.configPath !== undefined ? { configPath: data.configPath } : {}),
@@ -1675,9 +1687,58 @@ export class AppStore {
           : {}),
       ...(data.message !== undefined ? { message: data.message } : {}),
       ...(defaultJobId !== undefined ? { selectedJobId: defaultJobId } : {}),
+      ...(kind === 'usage'
+        ? {
+            quotaLoading: data.quotaLoading ?? false,
+            quota: initialQuota ?? null,
+            ...(data.quotaError !== undefined ? { quotaError: data.quotaError } : {}),
+          }
+        : {}),
     };
     this.emit();
     return this._infoOverlay;
+  }
+
+  setUsageQuotaLoading(loading: boolean, error?: string): void {
+    if (!this._infoOverlay || this._infoOverlay.kind !== 'usage') return;
+    if (
+      this._infoOverlay.quotaLoading === loading &&
+      this._infoOverlay.quotaError === error
+    ) {
+      return;
+    }
+    this._infoOverlay = {
+      ...this._infoOverlay,
+      quotaLoading: loading,
+      ...(error !== undefined ? { quotaError: error } : { quotaError: undefined }),
+    };
+    this.emit();
+  }
+
+  setUsageQuota(quota: UsageQuotaSnapshot | null, error?: string): void {
+    if (quota !== null) {
+      this._usageQuota = quota;
+    }
+    if (!this._infoOverlay || this._infoOverlay.kind !== 'usage') return;
+    this._infoOverlay = {
+      ...this._infoOverlay,
+      quotaLoading: false,
+      quota: quota ?? this._infoOverlay.quota ?? null,
+      ...(error !== undefined ? { quotaError: error } : { quotaError: undefined }),
+    };
+    this.emit();
+  }
+
+  clearUsageQuota(): void {
+    this._usageQuota = null;
+    if (!this._infoOverlay || this._infoOverlay.kind !== 'usage') return;
+    this._infoOverlay = {
+      ...this._infoOverlay,
+      quota: null,
+      quotaLoading: false,
+      quotaError: undefined,
+    };
+    this.emit();
   }
 
   setSelectedJobId(jobId: string | undefined): void {

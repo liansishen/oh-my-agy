@@ -10,6 +10,11 @@ import {
 } from '@stencil-hq/tern';
 import { formatAutoCompactSummary } from '../config/agy_settings';
 import {
+  formatQuotaPercent,
+  formatQuotaResetDisplay,
+  type UsageQuotaBucket,
+} from '../ecosystem/cli';
+import {
   formatCompactTokens,
   formatContextUsage,
   type AppState,
@@ -30,6 +35,7 @@ export interface InfoOverlayCallbacks {
   readonly onSelectJob?: (jobId: string) => void;
   readonly onStopJob?: () => void;
   readonly onDetachJob?: (jobId: string) => void;
+  readonly onRefreshUsage?: () => void;
 }
 
 export interface InfoOverlayViewProps {
@@ -139,6 +145,40 @@ function formatCostValue(cost: { readonly amount: number; readonly currency: str
   const num = cost.amount >= 0.01 ? cost.amount.toFixed(2) : cost.amount.toFixed(4);
   if (cur === 'USD' || cur === '$') return `$${num}`;
   return `${num} ${cur}`;
+}
+
+function formatQuotaWindowLabel(bucket: UsageQuotaBucket): string {
+  const win = bucket.window?.trim().toLowerCase();
+  if (win === 'weekly') return 'Weekly Limit';
+  if (win === '5h') return '5-Hour Limit';
+  return bucket.name.replace(/\s+remaining$/i, '').trim() || bucket.name;
+}
+
+function formatQuotaGroupModels(description: string | undefined): string | null {
+  if (!description) return null;
+  const cleaned = description.replace(/^Models within this group:\s*/i, '').trim();
+  if (!cleaned) return null;
+  const items = cleaned
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+  return items.length > 0 ? items.join(' · ') : null;
+}
+
+function formatLocalClockHHMM(epochMs: number): string {
+  const d = new Date(epochMs);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function sanitizeQuotaKey(raw: string): string {
+  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32);
+  return cleaned.length > 0 ? cleaned : 'item';
+}
+
+function resolveQuotaRemainingTone(fraction: number): Tone {
+  if (fraction <= 0.1) return 'error';
+  if (fraction <= 0.3) return 'warning';
+  return 'success';
 }
 
 function renderCloseFooter(onClose: () => void, extra?: JSX.Element): JSX.Element {
@@ -715,9 +755,16 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
   if (info.kind === 'usage') {
     const totalTools = turns.reduce((sum, t) => sum + t.toolCalls.length, 0);
     const totalThoughts = turns.reduce((sum, t) => sum + t.thoughts.length, 0);
+    const contextTone: Tone | undefined = state.usage
+      ? state.usage.percent >= 90
+        ? 'error'
+        : state.usage.percent >= 70
+          ? 'warning'
+          : undefined
+      : undefined;
     const statItems: StatItem[] = [
       {
-        label: 'Subscription Tier',
+        label: 'Subscription',
         value: state.tier?.name || 'Standard',
         sub: state.tier?.id ? state.tier.id : 'From ACP session metadata',
         tone: state.tier?.name ? 'accent' : 'muted',
@@ -728,6 +775,7 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
         sub: state.usage
           ? `of ${formatCompactTokens(state.usage.size)} (${state.usage.percent.toFixed(1)}%)`
           : 'Waiting for usage_update',
+        ...(contextTone ? { tone: contextTone } : {}),
       },
       {
         label: 'Session Activity',
@@ -772,6 +820,142 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
         : []),
     ];
 
+    const groupCards: JSX.Element[] = (info.quota?.groups ?? []).map((group, gIdx) => {
+      const minFraction = Math.min(...group.buckets.map(b => b.remainingFraction));
+      const allFull = group.buckets.every(b => b.remainingPercent >= 100);
+      const groupBadge = allFull ? (
+        <badge key="st" text="Full" tone="success" />
+      ) : (
+        <badge
+          key="st"
+          text={`${formatQuotaPercent(minFraction)} min`}
+          tone={resolveQuotaRemainingTone(minFraction)}
+        />
+      );
+      const groupIcon: IconName = /gemini/i.test(group.name) ? 'sparkles' : 'model';
+      const modelsText = formatQuotaGroupModels(group.description);
+
+      return (
+        <card
+          key={`group-${gIdx}-${sanitizeQuotaKey(group.name)}`}
+          role="oma.usage.group"
+          head={group.name}
+          icon={groupIcon}
+          end={groupBadge}
+        >
+          <col key="body" role="oma.usage.group.body" gap="sm">
+            {modelsText ? (
+              <text
+                key="models"
+                role="oma.usage.models"
+                wrap="word"
+                spans={[{ t: modelsText, s: 'muted' }]}
+              />
+            ) : null}
+            {group.buckets.map((bucket, bIdx) => {
+              const tone = resolveQuotaRemainingTone(bucket.remainingFraction);
+              const pctLabel = formatQuotaPercent(bucket.remainingFraction);
+              const reset = formatQuotaResetDisplay(bucket, now);
+              const resetNode =
+                reset.kind === 'scheduled' ? (
+                  <row key="reset" role="oma.usage.reset" gap="xs" align="center">
+                    <icon key="ico" name="clock" tone="muted" />
+                    <text
+                      key="txt"
+                      wrap="none"
+                      spans={[
+                        { t: 'Resets ', s: 'muted' },
+                        { t: reset.countdown ?? '', s: 'mono' },
+                        { t: ' · ', s: 'dim' },
+                        { t: reset.localTime ?? '', s: 'mono muted' },
+                      ]}
+                    />
+                  </row>
+                ) : reset.kind === 'raw' ? (
+                  <row key="reset" role="oma.usage.reset" gap="xs" align="center">
+                    <icon key="ico" name="clock" tone="muted" />
+                    <text
+                      key="txt"
+                      wrap="none"
+                      spans={[
+                        { t: 'Resets ', s: 'muted' },
+                        { t: reset.localTime ?? '', s: 'mono' },
+                      ]}
+                    />
+                  </row>
+                ) : reset.kind === 'refreshing' ? (
+                  <row key="reset" role="oma.usage.reset" gap="xs" align="center">
+                    <icon key="ico" name="clock" tone="info" />
+                    <text
+                      key="txt"
+                      wrap="none"
+                      spans={[{ t: reset.text, s: 'info mono' }]}
+                    />
+                  </row>
+                ) : reset.kind === 'full' ? (
+                  <row key="reset" role="oma.usage.reset" gap="xs" align="center">
+                    <icon key="ico" name="check" tone="success" />
+                    <text key="txt" wrap="none" spans={[{ t: 'Full', s: 'success' }]} />
+                  </row>
+                ) : (
+                  <row key="reset" role="oma.usage.reset" gap="xs" align="center">
+                    <text key="txt" wrap="none" spans={[{ t: '—', s: 'muted mono' }]} />
+                  </row>
+                );
+
+              return (
+                <col
+                  key={`bucket-${bIdx}-${sanitizeQuotaKey(bucket.id || bucket.name)}`}
+                  role="oma.usage.bucket"
+                  gap="xs"
+                >
+                  <row
+                    key="head"
+                    role="oma.usage.bucket.head"
+                    justify="between"
+                    align="center"
+                    gap="sm"
+                  >
+                    <text
+                      key="win"
+                      wrap="none"
+                      spans={[{ t: formatQuotaWindowLabel(bucket), s: 'strong' }]}
+                    />
+                    {resetNode}
+                  </row>
+                  <meter
+                    key="bar"
+                    role="oma.usage.meter"
+                    value={bucket.remainingFraction}
+                    style="bar"
+                    size="md"
+                    tone={tone}
+                    label={[{ t: pctLabel, s: `${tone} strong mono` }]}
+                    title={bucket.description || `${pctLabel} remaining`}
+                  />
+                </col>
+              );
+            })}
+          </col>
+        </card>
+      );
+    });
+
+    const refreshButton: JSX.Element | undefined = callbacks.onRefreshUsage ? (
+      <button
+        key="refresh"
+        role="omp.btn"
+        icon="repeat"
+        busy={info.quotaLoading}
+        keys={['ctrl+r']}
+        disabled={info.quotaLoading ? 'Refreshing quota…' : undefined}
+        actions={{ click: 'usage.refresh' }}
+        onClick={() => callbacks.onRefreshUsage?.()}
+      >
+        Refresh
+      </button>
+    ) : undefined;
+
     return (
       <overlay
         key="info"
@@ -779,23 +963,71 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
         size="lg"
         modal
         role="omp.overlay.usage"
-        head="Usage & subscription"
+        head="Usage & Quota"
         icon="stats"
-        foot={renderCloseFooter(callbacks.onClose)}
+        meta={
+          info.quotaLoading
+            ? 'Refreshing…'
+            : info.quota
+              ? `Updated ${formatLocalClockHHMM(info.quota.fetchedAt)}`
+              : undefined
+        }
+        foot={renderCloseFooter(callbacks.onClose, refreshButton)}
       >
-        <col key="usage-body" gap="md">
+        <col key="usage-body" role="oma.usage.body" gap="md">
           <stats key="tiles" items={statItems} />
-          <kv key="details" layout="grid" items={detailItems} />
-          <text
-            key="quota-note"
-            wrap="word"
-            spans={[
-              {
-                t: 'Note: agy acp reports session context usage and subscription tier only. For detailed 5-hour or weekly quota windows, check the official agy CLI or Antigravity dashboard.',
-                s: 'muted',
-              },
-            ]}
-          />
+          <section key="quota" role="oma.usage.section" head="Model quota">
+            {groupCards.length > 0 ? (
+              <col key="quota-groups" role="oma.usage.groups" gap="sm">
+                {groupCards}
+                {info.quotaLoading ? (
+                  <row key="quota-refreshing" gap="xs" align="center">
+                    <spinner key="sp" tone="accent" />
+                    <text
+                      key="lbl"
+                      spans={[{ t: 'Refreshing quota via agy -p /usage…', s: 'muted' }]}
+                    />
+                  </row>
+                ) : info.quotaError ? (
+                  <text
+                    key="quota-warn"
+                    wrap="word"
+                    spans={[{ t: `Refresh failed: ${info.quotaError}`, s: 'warning' }]}
+                  />
+                ) : null}
+              </col>
+            ) : info.quotaLoading ? (
+              <card key="quota-loading" role="oma.usage.state">
+                <row key="inner" gap="sm" align="center">
+                  <spinner key="sp" tone="accent" />
+                  <text
+                    key="lbl"
+                    spans={[{ t: 'Fetching live model quota via agy -p /usage…', s: 'muted' }]}
+                  />
+                </row>
+              </card>
+            ) : (
+              <card key="quota-error" role="oma.usage.state" tone="warning">
+                <row key="inner" gap="sm" align="center">
+                  <icon key="ico" name="warn" tone="warning" />
+                  <text
+                    key="lbl"
+                    wrap="word"
+                    spans={[
+                      {
+                        t: info.quotaError
+                          ? `Unable to fetch quota via agy -p /usage: ${info.quotaError}`
+                          : 'Quota unavailable. Press Ctrl+R to retry.',
+                        s: 'warning',
+                      },
+                    ]}
+                  />
+                </row>
+              </card>
+            )}
+          </section>
+          <rule key="sep" />
+          <kv key="details" role="oma.usage.details" layout="grid" items={detailItems} />
         </col>
       </overlay>
     );

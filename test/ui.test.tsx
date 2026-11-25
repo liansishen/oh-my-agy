@@ -23,7 +23,7 @@ import type { AcpChildProcess, AcpSpawnFn } from '../src/acp/client';
 import { AppController, isSemverAtLeast } from '../src/app/controller';
 import { parseCliArgs } from '../src/app/fallback';
 import { DEFAULT_CONFIG, parseConfigToml } from '../src/config/config';
-import type { ExecCommandFn } from '../src/ecosystem/cli';
+import { formatQuotaResetClock, type ExecCommandFn } from '../src/ecosystem/cli';
 import { PreviewStore } from '../src/preview/store';
 import type { GitExecFn } from '../src/state/git_status';
 import { getTranscriptPath } from '../src/state/session_metrics';
@@ -13472,6 +13472,139 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     host.input.emit('\t'); // Tab -> completes & closes
     await waitFor(() => ctx.controller.store.draft.text === '/plugin:lint ');
     expect(ctx.controller.store.getState().completion.open).toBe(false);
+
+    await ctx.shutdown();
+  });
+
+  test('/usage overlay fetches and renders quota via agy -p /usage, supports Ctrl+R refresh, and handles fetch errors', async () => {
+    const tmp = makeTempDir();
+    let callCount = 0;
+    let failNext = false;
+    const weeklyResetIso = new Date(Date.now() + (5 * 24 + 11) * 3_600_000 + 12 * 60_000).toISOString();
+    const fiveHourResetIso = new Date(Date.now() + 2 * 3_600_000 + 49 * 60_000).toISOString();
+
+    const ctx = await createTestController({
+      tmp,
+      controllerOptions: {
+        ecosystemRunner: async (cmd) => {
+          if (cmd[1] === '-p' && cmd[2] === '/usage') {
+            callCount += 1;
+            if (failNext) {
+              return { exitCode: 1, stdout: '', stderr: 'OAuth token expired' };
+            }
+            const geminiWeeklyFrac = callCount === 1 ? 0.87077 : 0.72;
+            const gemini5hFrac = callCount === 1 ? 0.9899 : 0.84;
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                status: 'SUCCESS',
+                command: {
+                  name: 'usage',
+                  data: {
+                    groups: [
+                      {
+                        name: 'Gemini Models',
+                        description: 'Gemini 4 Neon, Gemini 4 Carbon',
+                        buckets: [
+                          {
+                            id: 'gemini-weekly',
+                            name: 'Weekly Limit Remaining',
+                            window: 'weekly',
+                            remaining_fraction: geminiWeeklyFrac,
+                            reset_time: weeklyResetIso,
+                          },
+                          {
+                            id: 'gemini-5h',
+                            name: 'Five Hour Limit Remaining',
+                            window: '5h',
+                            remaining_fraction: gemini5hFrac,
+                            reset_time: fiveHourResetIso,
+                          },
+                        ],
+                      },
+                      {
+                        name: 'Claude and GPT models',
+                        buckets: [
+                          {
+                            id: '3p-weekly',
+                            name: 'Weekly Limit Remaining',
+                            window: 'weekly',
+                            remaining_fraction: 1,
+                            reset_time: '1970-01-01T00:00:00Z',
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              }),
+              stderr: '',
+            };
+          }
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      },
+    });
+    await ctx.boot();
+    const host = ctx.testHost!;
+
+    await ctx.controller.submitInput('/usage');
+    await waitFor(
+      () =>
+        ctx.controller.store.getState().infoOverlay?.kind === 'usage' &&
+        ctx.controller.store.getState().infoOverlay?.quotaLoading === false,
+    );
+    expect(callCount).toBe(1);
+
+    const overlayWireJson = () =>
+      JSON.stringify([...ctx.replayWire().entries()].filter(([id]) => id.startsWith('layer.info')));
+
+    await waitFor(() => overlayWireJson().includes('87.08%'));
+    const firstOverlayJson = overlayWireJson();
+    expect(firstOverlayJson).toContain('"k":"meter"');
+    expect(firstOverlayJson).toContain('"k":"card"');
+    expect(firstOverlayJson).toContain('"role":"oma.usage.group"');
+    expect(firstOverlayJson).toContain('"role":"oma.usage.bucket"');
+    expect(firstOverlayJson).toContain('Model quota');
+    expect(firstOverlayJson).toContain('Gemini Models');
+    expect(firstOverlayJson).toContain('Gemini 4 Neon · Gemini 4 Carbon');
+    expect(firstOverlayJson).toContain('Weekly Limit');
+    expect(firstOverlayJson).toContain('5-Hour Limit');
+    expect(firstOverlayJson).toContain('87.08%');
+    expect(firstOverlayJson).toContain('87.08% min');
+    expect(firstOverlayJson).toContain('98.99%');
+    expect(firstOverlayJson).toContain('Claude and GPT models');
+    expect(firstOverlayJson).toContain('100.00%');
+    expect(firstOverlayJson).toContain('Full');
+    expect(firstOverlayJson).toContain('in 5d');
+    expect(firstOverlayJson).toContain('in 2h');
+    expect(firstOverlayJson).toContain(formatQuotaResetClock(Date.parse(weeklyResetIso)));
+    expect(firstOverlayJson).toContain(formatQuotaResetClock(Date.parse(fiveHourResetIso)));
+
+    // Ctrl+R refreshes quota in place
+    host.input.emit('\x12');
+    await waitFor(
+      () =>
+        callCount === 2 &&
+        ctx.controller.store.getState().infoOverlay?.quotaLoading === false &&
+        overlayWireJson().includes('72.00%'),
+    );
+    const secondOverlayJson = overlayWireJson();
+    expect(secondOverlayJson).toContain('72.00%');
+    expect(secondOverlayJson).toContain('84.00%');
+
+    // Error state shows warning while keeping cached rows if already fetched, or standalone error after clearUsageQuota
+    failNext = true;
+    ctx.controller.store.clearUsageQuota();
+    host.input.emit('\x12');
+    await waitFor(
+      () =>
+        callCount === 3 &&
+        ctx.controller.store.getState().infoOverlay?.quotaLoading === false &&
+        overlayWireJson().includes('OAuth token expired'),
+    );
+    const errOverlayJson = overlayWireJson();
+    expect(errOverlayJson).toContain('OAuth token expired');
 
     await ctx.shutdown();
   });
