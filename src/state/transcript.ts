@@ -924,6 +924,8 @@ function classifyNonAgentJobType(tool: ToolCallItem): BackgroundJobType | null {
     inputRec &&
     (typeof inputRec.CommandLine === 'string' ||
       inputRec.WaitMsBeforeAsync !== undefined ||
+      inputRec.NotificationTimeoutSeconds !== undefined ||
+      inputRec.notificationTimeoutSeconds !== undefined ||
       inputRec.IsDaemon !== undefined ||
       inputRec.isDaemon !== undefined)
   ) {
@@ -5140,10 +5142,25 @@ export class TranscriptStore {
     }
 
     // Explicit `Task id "<id>" [was|has|is] finished / exited / killed / canceled / failed / timed out` notification
+    const bgStillRunningRe = /\b(?:still\s+running|continues?\s+to\s+run|notification\s+timeout)\b/i;
+    const isLineNonTerminalRunningNotice = (
+      sourceText: string,
+      matchStart: number,
+      matchLen: number,
+    ): boolean => {
+      const lineStart = sourceText.lastIndexOf('\n', matchStart) + 1;
+      const rawLineEnd = sourceText.indexOf('\n', matchStart + matchLen);
+      const lineEnd = rawLineEnd === -1 ? sourceText.length : rawLineEnd;
+      return bgStillRunningRe.test(sourceText.slice(lineStart, lineEnd));
+    };
+
     const explicitTaskRe =
       /\btask\s+id\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(finished|completed|exited|killed|cancelled|canceled|failed|stopped|terminated|aborted|errored|timed\s+out)\b/gi;
     let match: RegExpExecArray | null;
     while ((match = explicitTaskRe.exec(text)) !== null) {
+      if (isLineNonTerminalRunningNotice(text, match.index, match[0].length)) {
+        continue;
+      }
       const id = match[1];
       const verb = (match[2] ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
       if (!id) continue;
@@ -5195,20 +5212,24 @@ export class TranscriptStore {
       }
     }
 
-    // Match any running detached task's taskId / conversationId when accompanied by a terminal cue
-    const terminal = inferTerminalBgStatusFromText(text);
-    if (!terminal) return;
+    // Match any running detached task's taskId / conversationId on non-running lines with a terminal cue
+    const textLines = text.split(/\r?\n/);
     for (const task of this._detachedBgTasks.values()) {
       if (task.status !== 'running') continue;
       const needle = task.taskId ?? task.conversationId;
-      if (needle && text.includes(needle)) {
-        task.status = terminal;
-        task.endedAt = now;
-        if (task.taskId) {
-          this._settledTranscriptTaskIds.add(task.taskId);
-        }
-        this.syncToolBackgroundState(task.toolCallId, false, task.taskId, terminal);
+      if (!needle) continue;
+      const matchingLines = textLines.filter(
+        (line) => line.includes(needle) && !bgStillRunningRe.test(line),
+      );
+      if (matchingLines.length === 0) continue;
+      const terminal = inferTerminalBgStatusFromText(matchingLines.join('\n'));
+      if (!terminal) continue;
+      task.status = terminal;
+      task.endedAt = now;
+      if (task.taskId) {
+        this._settledTranscriptTaskIds.add(task.taskId);
       }
+      this.syncToolBackgroundState(task.toolCallId, false, task.taskId, terminal);
     }
   }
 

@@ -8803,7 +8803,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     await waitFor(() => replayNodes().get('dock.composer.bar.executor.effort')?.p['level'] === 'xhigh');
 
-    // Click `Plan` capsule -> strictly restricted to 4 Planner models (Neon, Carbon, Argon, Opus 5.5)
+    // Click `Plan` capsule -> shows all non-orchestrator models ordered with Planner favorites first
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
     await waitFor(() => controller.store.getState().picker?.kind === 'planner');
     const plannerData = computePickerData(
@@ -8816,6 +8816,10 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       'gemini-4-carbon',
       'gemini-4-argon',
       'claude-opus-5-5',
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'claude-sonnet-5-5',
+      'gpt-oss-120b-medium',
     ]);
     expect(plannerData.selectedId).toBe('gemini-4-carbon');
     expect(plannerData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high']);
@@ -8853,7 +8857,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     host.input.emit('\x1b');
     await waitFor(() => controller.store.getState().picker === null);
 
-    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5) and preserves saved `xhigh` (Extra)
+    // Click `Exec` capsule -> shows all non-orchestrator models ordered with Executor favorites first and preserves saved `xhigh` (Extra)
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
     await waitFor(() => controller.store.getState().picker?.kind === 'executor');
     const execData = computePickerData(
@@ -8861,7 +8865,16 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       controller.store.getState().picker!,
       [],
     );
-    expect(execData.items.map(i => i.id)).toEqual(['gemini-4-hydrogen', 'claude-sonnet-5-5']);
+    expect(execData.items.map(i => i.id)).toEqual([
+      'gemini-4-hydrogen',
+      'claude-sonnet-5-5',
+      'gemini-4-neon',
+      'gemini-4-carbon',
+      'gemini-4-argon',
+      'gemini-3.8-flash',
+      'claude-opus-5-5',
+      'gpt-oss-120b-medium',
+    ]);
     expect(execData.selectedId).toBe('gemini-4-hydrogen');
     expect(execData.level?.value).toBe('xhigh');
     expect(execData.level?.steps.find(s => s.id === 'xhigh')?.label).toBe('Extra');
@@ -13291,5 +13304,175 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       await waitFor(() => !ctxNat.controller.store.getState().isStreaming);
       await ctxNat.shutdown();
     }
+  });
+
+  test('agy 1.5.17 parity: Orchestrator shared model pool, single-agent collapse on identical model+effort, and plugin: slash completion', async () => {
+    const tmp = makeTempDir();
+    const agySettingsPath = join(tmp, 'agy-settings.json');
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify({
+        orchestrator: {
+          planner: 'Gemini 4 Neon (Extra)',
+          executor: 'Gemini 4 Hydrogen (High)',
+        },
+      }),
+      'utf8',
+    );
+
+    const MODEL_CHOICES = [
+      { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+      { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+      { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+      { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+    ];
+    const FOUR_LEVELS = [
+      { value: 'low', name: 'Low' },
+      { value: 'medium', name: 'Medium' },
+      { value: 'high', name: 'High' },
+      { value: 'xhigh', name: 'Extra' },
+    ];
+    let activeModel = 'gemini-pro-orchestrator-neon';
+    let activeThought = 'xhigh';
+
+    const buildConfigOptions = () => {
+      const opts: Array<Record<string, unknown>> = [
+        {
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          type: 'select',
+          currentValue: activeModel,
+          options: MODEL_CHOICES,
+        },
+      ];
+      if (!activeModel.includes('orchestrator')) {
+        opts.push({
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          type: 'select',
+          currentValue: activeThought,
+          options: FOUR_LEVELS,
+        });
+      }
+      return opts;
+    };
+
+    const ctx = await createTestController({
+      tmp,
+      agentVersion: '1.5.17',
+      controllerOptions: { agySettingsPath },
+      onRpc: (msg, acp) => {
+        if (msg.method === 'initialize') {
+          acp.reply(msg.id, {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.17' },
+            agentCapabilities: { loadSession: true },
+          });
+          return true;
+        }
+        if (msg.method === 'session/new') {
+          acp.reply(msg.id, {
+            sessionId: 'sess-1517',
+            configOptions: buildConfigOptions(),
+          });
+          acp.sendUpdate('sess-1517', {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [
+              { name: 'plugin:deploy', description: 'Deploy plugin' },
+              { name: 'plugin:lint', description: 'Lint plugin' },
+              { name: 'antigravity-guide', description: 'Docs skill' },
+            ],
+          });
+          return true;
+        }
+        if (msg.method === 'session/set_config_option') {
+          const p = (msg.params ?? {}) as { configId: string; value: string };
+          if (p.configId === 'model') activeModel = p.value;
+          if (p.configId === 'thought_level') activeThought = p.value;
+          acp.reply(msg.id, { configOptions: buildConfigOptions() });
+          return true;
+        }
+        return false;
+      },
+    });
+    await ctx.boot();
+    const host = ctx.testHost!;
+    const replay = () => ctx.replayWire();
+
+    // 1. Same model (Gemini 4 Neon) with DIFFERENT effort (Extra vs Medium) stays in two-phase Orchestrator
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
+    await waitFor(() => ctx.controller.store.getState().picker?.kind === 'executor');
+    ctx.controller.store.setPickerSelected('gemini-4-neon');
+    ctx.controller.store.setModelPickerThinking('medium');
+    host.input.emit('\r');
+    await waitFor(() => ctx.controller.store.getState().picker === null);
+    await waitFor(() => ctx.controller.store.getState().orchestratorSettings.executor === 'Gemini 4 Neon (Medium)');
+    expect(ctx.controller.store.getState().controls.currentModelId).toBe('gemini-pro-orchestrator-neon');
+    expect(replay().get('dock.composer.bar.planner')).toBeDefined();
+    expect(replay().get('dock.composer.bar.executor')).toBeDefined();
+
+    // 2. Setting Executor effort to Extra (matching Planner `Gemini 4 Neon (Extra)`) collapses directly to single-agent `gemini-4-neon` + `xhigh`
+    await ctx.controller.submitInput('/model');
+    await waitFor(() => ctx.controller.store.getState().picker?.kind === 'model');
+    const modelDataDifferent = computePickerData(
+      ctx.controller.store.getState(),
+      ctx.controller.store.getState().picker!,
+      [],
+    );
+    expect(modelDataDifferent.items.find(i => i.id === 'orchestrator')?.detail).toBe('Neon (Extra) → Neon (Medium)');
+    host.input.emit('\x1b');
+    await waitFor(() => ctx.controller.store.getState().picker === null);
+
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
+    await waitFor(() => ctx.controller.store.getState().picker?.kind === 'executor');
+    ctx.controller.store.setPickerSelected('gemini-4-neon');
+    ctx.controller.store.setModelPickerThinking('xhigh');
+    host.input.emit('\r');
+    await waitFor(() => ctx.controller.store.getState().picker === null);
+    await waitFor(() => ctx.controller.store.getState().controls.currentModelId === 'gemini-4-neon');
+    expect(ctx.controller.store.getState().controls.currentThoughtLevel).toBe('xhigh');
+    expect(replay().get('dock.composer.bar.planner')).toBeUndefined();
+    expect(replay().get('dock.composer.bar.executor')).toBeUndefined();
+
+    // 3. Re-opening `/model` displays `(single-agent)` on the Orchestrator row, and selecting it activates single-agent directly
+    await ctx.controller.submitInput('/model gemini-4-carbon');
+    await waitFor(() => ctx.controller.store.getState().controls.currentModelId === 'gemini-4-carbon');
+    await ctx.controller.submitInput('/model');
+    await waitFor(() => ctx.controller.store.getState().picker?.kind === 'model');
+    const modelDataMatched = computePickerData(
+      ctx.controller.store.getState(),
+      ctx.controller.store.getState().picker!,
+      [],
+    );
+    expect(modelDataMatched.items.find(i => i.id === 'orchestrator')?.detail).toBe('Neon (Extra) (single-agent)');
+    ctx.controller.store.setPickerSelected('orchestrator');
+    host.input.emit('\r');
+    await waitFor(() => ctx.controller.store.getState().picker === null);
+    await waitFor(() => ctx.controller.store.getState().controls.currentModelId === 'gemini-4-neon');
+    expect(ctx.controller.store.getState().controls.currentThoughtLevel).toBe('xhigh');
+
+    // 4. `/` completion collapses `plugin:*`, Tab expands `/plugin:`, Down + Tab completes highlighted item and closes popup
+    await waitFor(() => ctx.controller.store.commands.getAcpPluginCommands().length === 2);
+    ctx.controller.store.draft.setText('/');
+    ctx.controller.store.refreshCompletion();
+    await waitFor(() => ctx.controller.store.getState().completion.open);
+    const pluginGroupItem = ctx.controller.store.getState().completion.items.find(i => i.label === 'plugin:');
+    expect(pluginGroupItem).toBeDefined();
+    ctx.controller.store.selectCompletionByKey(pluginGroupItem!.key);
+    host.input.emit('\t');
+    await waitFor(() => ctx.controller.store.draft.text === '/plugin:');
+    expect(ctx.controller.store.getState().completion.items.map(i => i.label)).toEqual([
+      'plugin:deploy',
+      'plugin:lint',
+    ]);
+    host.input.emit('\x1b[B'); // Down -> plugin:lint
+    host.input.emit('\t'); // Tab -> completes & closes
+    await waitFor(() => ctx.controller.store.draft.text === '/plugin:lint ');
+    expect(ctx.controller.store.getState().completion.open).toBe(false);
+
+    await ctx.shutdown();
   });
 });

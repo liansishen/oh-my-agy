@@ -184,6 +184,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         i = nextIdx;
         break;
       }
+      case '--effort':
       case '--thought': {
         const [val, nextIdx] = takeValue(flag, inlineValue, i);
         options.thought = val;
@@ -394,7 +395,7 @@ export function formatHelpText(): string {
     '      --fork <id|file>        Tern pane fork compatibility (loads original session safely)',
     '      --sessions              Open /resume session picker immediately on startup',
     '      --model <model>         Initial model (base name or full ID with thought suffix)',
-    '      --thought <level>       Initial thought level (low|medium|high|xhigh|max)',
+    '      --thought <level>       Initial thought level (low|medium|high|xhigh|max; alias: --effort)',
     '      --mode <mode>           Initial permission mode (default|accept-edits|auto|plan)',
     '      --add-dir <dir>         Add extra workspace directory (repeatable)',
     '      --agy-bin <path>        Override agy executable path (default: agy from PATH)',

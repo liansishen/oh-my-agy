@@ -7,6 +7,10 @@
  */
 
 import {
+  parseOrchestratorModelSpec,
+  type AgyOrchestratorSettings,
+} from "../config/agy_settings.ts";
+import {
   flattenConfigOptionChoices,
   type ConfigOption,
   type ConfigOptionChoice,
@@ -70,33 +74,164 @@ export function isOrchestratorModelId(
 }
 
 /**
- * 按 Orchestrator 角色严格过滤可选模型列表，并与服务端当前可用模型取交集：
- * - `planner`：限定为 `Gemini 4 Neon`、`Gemini 4 Carbon`、`Gemini 4 Argon`、`Claude Opus 5.5`
- * - `executor`：限定为 `Gemini 4 Hydrogen`、`Claude Sonnet 5.5`
+ * 按 Orchestrator 角色排序并过滤可用模型：
+ * 返回全部非 Orchestrator 模型，优先按该角色推荐顺序排列（`planner` 优先
+ * `Neon / Carbon / Argon / Claude Opus 5.5`；`executor` 优先 `Hydrogen / Claude Sonnet 5.5`），
+ * 其余非 Orchestrator 模型按服务端原始顺序附后。
  */
 export function filterOrchestratorRoleModels(
   role: "planner" | "executor",
   availableModels: readonly ConfigOptionChoice[],
 ): readonly ConfigOptionChoice[] {
-  const allowlist: readonly string[] =
+  const nonOrch = availableModels.filter((c) => !isOrchestratorModelId(c.value));
+  if (nonOrch.length === 0) {
+    return availableModels;
+  }
+  const preferredOrder: readonly string[] =
     role === "planner"
       ? ORCHESTRATOR_PLANNER_MODEL_IDS
       : ORCHESTRATOR_EXECUTOR_MODEL_IDS;
   const byLowerId = new Map<string, ConfigOptionChoice>();
-  for (const choice of availableModels) {
+  for (const choice of nonOrch) {
     byLowerId.set(choice.value.toLowerCase(), choice);
   }
-  const matched: ConfigOptionChoice[] = [];
-  for (const id of allowlist) {
+  const ordered: ConfigOptionChoice[] = [];
+  const seen = new Set<string>();
+  for (const id of preferredOrder) {
     const found = byLowerId.get(id);
-    if (found) matched.push(found);
+    if (found) {
+      ordered.push(found);
+      seen.add(found.value.toLowerCase());
+    }
   }
-  if (matched.length > 0) {
-    return matched;
+  for (const choice of nonOrch) {
+    if (!seen.has(choice.value.toLowerCase())) {
+      ordered.push(choice);
+    }
   }
-  // 极简离线/Mock 环境兜底：若服务端未使用标准模型 ID，至少过滤掉 Orchestrator 自身
-  const nonOrch = availableModels.filter((c) => !isOrchestratorModelId(c.value));
-  return nonOrch.length > 0 ? nonOrch : availableModels;
+  return ordered;
+}
+
+export interface OrchestratorSingleAgentSelection {
+  readonly modelId: string;
+  readonly modelName: string;
+  readonly thoughtLevel?: string;
+}
+
+function resolveOrchestratorRoleSpec(
+  role: "planner" | "executor",
+  orchestratorSettings: AgyOrchestratorSettings | undefined,
+  controls: Pick<
+    SessionControlState,
+    "currentModelId" | "supportsThoughtLevel" | "availableThoughtLevels" | "availableModels"
+  >,
+  cachedByModel?: Readonly<Record<string, readonly ConfigOptionChoice[]>>,
+): OrchestratorSingleAgentSelection | null {
+  const nonOrch = controls.availableModels.filter(
+    (c) => !isOrchestratorModelId(c.value),
+  );
+  if (nonOrch.length === 0) return null;
+
+  const rawSpec = orchestratorSettings?.[role]?.trim();
+  if (rawSpec) {
+    const rawLower = rawSpec.toLowerCase();
+    const directFixed = nonOrch.find(
+      (c) =>
+        c.name.toLowerCase() === rawLower || c.value.toLowerCase() === rawLower,
+    );
+    if (
+      directFixed &&
+      resolveThoughtLevelsForModel(directFixed.value, controls, cachedByModel)
+        .length === 0
+    ) {
+      return {
+        modelId: directFixed.value,
+        modelName: directFixed.name,
+      };
+    }
+  }
+
+  const parsed = parseOrchestratorModelSpec(rawSpec);
+  const fallback =
+    role === "planner"
+      ? inferOrchestratorDefaultPlannerModel(controls.currentModelId) ?? {
+          modelId: "gemini-4-carbon",
+          modelName: "Gemini 4 Carbon",
+        }
+      : inferOrchestratorDefaultExecutorModel(controls.currentModelId) ?? {
+          modelId: "gemini-4-hydrogen",
+          modelName: "Gemini 4 Hydrogen",
+        };
+  const targetName = parsed?.modelName ?? fallback.modelName;
+  const targetLower = targetName.toLowerCase();
+  const matched =
+    nonOrch.find(
+      (c) =>
+        c.name.toLowerCase() === targetLower ||
+        c.value.toLowerCase() === targetLower,
+    ) ??
+    (!parsed
+      ? nonOrch.find(
+          (c) => c.value.toLowerCase() === fallback.modelId.toLowerCase(),
+        )
+      : undefined);
+  if (!matched) return null;
+
+  const choices = resolveThoughtLevelsForModel(
+    matched.value,
+    controls,
+    cachedByModel,
+  );
+  if (choices.length === 0) {
+    return {
+      modelId: matched.value,
+      modelName: matched.name,
+    };
+  }
+  const thoughtLevel = clampThoughtLevelForChoices(
+    parsed?.thoughtLevel ?? "high",
+    choices,
+  )?.toLowerCase();
+  return {
+    modelId: matched.value,
+    modelName: matched.name,
+    ...(thoughtLevel ? { thoughtLevel } : {}),
+  };
+}
+
+/**
+ * 判断 Orchestrator 的 Planner 与 Executor 是否指向完全相同的模型与思考强度：
+ * - 若模型与 `Effort` 完全一致，返回单 Agent 直跑目标 `{ modelId, modelName, thoughtLevel }`；
+ * - 若模型不同，或同模型采用不同的 `Effort` 档位，返回 `null`（维持两阶段 Plan-and-Execute）。
+ */
+export function resolveOrchestratorSingleAgentSelection(
+  orchestratorSettings: AgyOrchestratorSettings | undefined,
+  controls: Pick<
+    SessionControlState,
+    "currentModelId" | "supportsThoughtLevel" | "availableThoughtLevels" | "availableModels"
+  >,
+  cachedByModel?: Readonly<Record<string, readonly ConfigOptionChoice[]>>,
+): OrchestratorSingleAgentSelection | null {
+  const planner = resolveOrchestratorRoleSpec(
+    "planner",
+    orchestratorSettings,
+    controls,
+    cachedByModel,
+  );
+  const executor = resolveOrchestratorRoleSpec(
+    "executor",
+    orchestratorSettings,
+    controls,
+    cachedByModel,
+  );
+  if (!planner || !executor) return null;
+  if (planner.modelId.toLowerCase() !== executor.modelId.toLowerCase()) {
+    return null;
+  }
+  if (planner.thoughtLevel !== executor.thoughtLevel) {
+    return null;
+  }
+  return planner;
 }
 
 /**

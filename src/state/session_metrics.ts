@@ -319,6 +319,20 @@ const TRANSCRIPT_BG_TASK_DESC_RE =
 const TRANSCRIPT_BG_TASK_LOG_RE = /\bTask\s+logs\s+are\s+available\s+at:\s*([^\r\n]+)/i;
 const TRANSCRIPT_BG_TERMINAL_RE =
   /\bTask\s+id\s+["'`]?([A-Za-z0-9._:/-]+)["'`]?\s+(?:(?:was|has|is)\s+)?(finished|completed|exited|killed|cancelled|canceled|failed|stopped|terminated|aborted|errored|timed\s+out)\b/gi;
+const TRANSCRIPT_BG_STILL_RUNNING_RE =
+  /\b(?:still\s+running|continues?\s+to\s+run|notification\s+timeout)\b/i;
+
+function isLineNonTerminalRunningNotice(
+  text: string,
+  matchStart: number,
+  matchLen: number,
+): boolean {
+  const lineStart = text.lastIndexOf('\n', matchStart) + 1;
+  const rawLineEnd = text.indexOf('\n', matchStart + matchLen);
+  const lineEnd = rawLineEnd === -1 ? text.length : rawLineEnd;
+  const line = text.slice(lineStart, lineEnd);
+  return TRANSCRIPT_BG_STILL_RUNNING_RE.test(line);
+}
 const TRANSCRIPT_BG_SERVER_RESET_RE =
   /\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i;
 const TRANSCRIPT_SYSTEM_MESSAGE_BLOCK_RE =
@@ -647,6 +661,9 @@ function parseTranscriptLine(line: string): ParsedTranscriptLine | null {
     const endedAt = parseTranscriptTimestampMs(raw);
     let termMatch: RegExpExecArray | null;
     while ((termMatch = TRANSCRIPT_BG_TERMINAL_RE.exec(raw.content)) !== null) {
+      if (isLineNonTerminalRunningNotice(raw.content, termMatch.index, termMatch[0].length)) {
+        continue;
+      }
       const taskId = termMatch[1]?.replace(/[.,;)]+$/, '');
       const verb = termMatch[2];
       if (!taskId || !verb) continue;

@@ -16,6 +16,7 @@ import {
   BUILTIN_COMMANDS,
   CommandRegistry,
   fuzzyMatchText,
+  isAcpPluginCommand,
   isAcpSkillCommand,
   resolveAcpCommandIcon,
 } from '../src/commands/registry';
@@ -3178,5 +3179,57 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
       mcpUpdate(errStore, d.id, undefined, 'failed', { text: d.text, rawOutput: { error: d.err } });
       expect(errStore.getToolById(d.id)?.failureOutputText).toBe(d.expected);
     }
+  });
+
+  test('CommandRegistry & AppStore collapse/expand plugin: ACP commands and complete highlighted item on Tab', () => {
+    expect(isAcpPluginCommand('plugin:deploy')).toBe(true);
+    expect(isAcpSkillCommand('plugin:deploy')).toBe(false);
+    expect(resolveAcpCommandIcon('plugin:deploy')).toBe('package');
+
+    const app = new AppStore({ cwd: 'D:\\Projects\\oh-my-agy' });
+    app.commands.setAcpCommands([
+      { name: 'antigravity-guide', description: 'Guide skill' },
+      { name: 'plugin:deploy', description: 'Deploy plugin command', input: { hint: '<env>' } },
+      { name: 'plugin:lint', description: 'Lint plugin command' },
+    ]);
+    expect(app.commands.getAcpPluginCommands().map(c => c.name)).toEqual([
+      'plugin:deploy',
+      'plugin:lint',
+    ]);
+    expect(app.commands.getAcpSkillCommands().map(c => c.name)).toEqual(['antigravity-guide']);
+
+    // Bare `/` includes collapsed `plugin:` row with package icon and excludes flat plugin:* entries
+    app.draft.setText('/');
+    const rootComp = app.refreshCompletion();
+    const pluginGroup = rootComp.items.find(i => i.label === 'plugin:');
+    expect(pluginGroup).toBeDefined();
+    expect(pluginGroup?.icon).toBe('package');
+    expect(pluginGroup?.statusValue).toBe('2 plugins');
+    expect(pluginGroup?.isPluginGroup).toBe(true);
+    expect(rootComp.items.some(i => i.label.startsWith('plugin:deploy'))).toBe(false);
+
+    // Accepting `plugin:` expands into `/plugin:` sub-list
+    app.selectCompletionByKey(pluginGroup!.key);
+    const expanded = app.acceptCompletion({ viaKey: 'tab' });
+    expect(expanded?.autoExecute).toBe(false);
+    expect(app.draft.text).toBe('/plugin:');
+    const subItems = app.getState().completion.items;
+    expect(subItems.map(i => i.label)).toEqual(['plugin:deploy', 'plugin:lint']);
+    expect(subItems.every(i => i.icon === 'package')).toBe(true);
+
+    // Move selection down to `plugin:lint` and press Tab -> completes command and closes menu
+    app.moveCompletionSelection(1);
+    const accepted = app.acceptCompletion({ viaKey: 'tab' });
+    expect(accepted?.autoExecute).toBe(false);
+    expect(app.draft.text).toBe('/plugin:lint ');
+    expect(app.getState().completion.open).toBe(false);
+
+    const dispatched = dispatchSlashCommand('/plugin:deploy prod', app.commands);
+    expect(dispatched.isCommand && dispatched.action).toEqual({
+      type: 'passthrough_prompt',
+      text: '/plugin:deploy prod',
+      commandName: 'plugin:deploy',
+      source: 'agy',
+    });
   });
 });

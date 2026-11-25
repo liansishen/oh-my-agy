@@ -347,7 +347,7 @@ export async function createTestController(opts: CreateTestControllerOptions = {
   const host = opts.host ?? defaultHost!;
   const session = await createConnectedTestSession(host);
   const acp = new DeclarativeAcpHarness();
-  const agentVersion = opts.agentVersion ?? '1.5.16';
+  const agentVersion = opts.agentVersion ?? '1.5.17';
   const supportsLogout = opts.supportsLogout ?? true;
 
   acp.setHandler((msg, h) => {

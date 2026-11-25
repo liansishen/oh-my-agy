@@ -355,4 +355,70 @@ describe('Background daemon non-blocking tracking', () => {
 
     await ctx.shutdown();
   });
+
+  test('guards NotificationTimeoutSeconds still-running wakeups while settling genuine terminal lines', () => {
+    const app = new AppStore();
+    const { transcript } = app;
+
+    transcript.beginUserTurn('Run long test suite with notification timeout');
+    transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-notify-1',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'completed',
+      title: 'Long command',
+      rawInput: {
+        CommandLine: 'bun test --timeout 120000',
+        WaitMsBeforeAsync: 5000,
+        NotificationTimeoutSeconds: 30,
+      },
+      rawOutput: { output: 'Tool is running as a background task with task id: sess-nt/task-1' },
+    });
+    transcript.applySessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-notify-2',
+      name: 'custom_exec',
+      status: 'completed',
+      title: 'Worker with NotificationTimeoutSeconds',
+      rawInput: {
+        NotificationTimeoutSeconds: 20,
+      },
+      rawOutput: { output: 'Tool is running as a background task with task id: sess-nt/task-2' },
+    });
+    transcript.finishActiveTurn('end_turn');
+
+    expect(transcript.getBackgroundJobsSnapshot().running.map(j => j.type)).toEqual(['bash', 'bash']);
+
+    // NotificationTimeoutSeconds wakeup message with `still running` must NOT close task-1 or task-2
+    transcript.applySessionUpdate({
+      sessionUpdate: 'user_message_chunk',
+      content: {
+        type: 'text',
+        text: '<SYSTEM_MESSAGE>\nTask id "sess-nt/task-1" notification timeout reached: command is still running.\nTask id "sess-nt/task-2" continues to run.\n</SYSTEM_MESSAGE>',
+      },
+    });
+    transcript.finishActiveTurn('end_turn');
+    expect(transcript.hasActiveBackgroundTasks()).toBe(true);
+    expect(transcript.getBackgroundJobsSnapshot().runningJobCount).toBe(2);
+
+    // Mixed system text via notice: task-1 finishes while task-2 is still running -> only task-1 settles
+    transcript.applySessionUpdate({
+      sessionUpdate: 'notice',
+      level: 'info',
+      text: 'Task id "sess-nt/task-1" finished with exit code 0\nsess-nt/task-2 is still running',
+    });
+    transcript.finishActiveTurn('end_turn');
+    expect(transcript.getBackgroundJobsSnapshot().running.map(j => j.id)).toEqual(['tc-notify-2']);
+
+    // Genuine fatal timeout without `still running` settles task-2 as failed
+    transcript.applySessionUpdate({
+      sessionUpdate: 'notice',
+      level: 'error',
+      text: 'Task id "sess-nt/task-2" timed out after 120s',
+    });
+    transcript.finishActiveTurn('end_turn');
+    expect(transcript.hasActiveBackgroundTasks()).toBe(false);
+    expect(transcript.getBackgroundJobsSnapshot().recent.find(j => j.id === 'tc-notify-2')?.status).toBe('failed');
+  });
 });

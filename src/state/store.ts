@@ -358,6 +358,8 @@ export interface CompletionPopupItem {
   readonly autoExecuteOnEnter?: boolean;
   /** True for the collapsed `skill:` expansion row. */
   readonly isSkillGroup?: boolean;
+  /** True for the collapsed `plugin:` expansion row. */
+  readonly isPluginGroup?: boolean;
   /** True for directory entries in `@` file completion. */
   readonly isDirectory?: boolean;
 }
@@ -2698,7 +2700,28 @@ export class AppStore {
     readonly modelId: string | null;
     readonly thoughtLevel: string;
   } {
-    const parsed = parseOrchestratorModelSpec(this._orchestratorSettings[role]);
+    const rawSpec = this._orchestratorSettings[role]?.trim();
+    const candidates = filterOrchestratorRoleModels(role, this._controls.availableModels);
+    if (rawSpec) {
+      const rawLower = rawSpec.toLowerCase();
+      const directFixed = candidates.find(
+        (c) => c.name.toLowerCase() === rawLower || c.value.toLowerCase() === rawLower
+      );
+      if (
+        directFixed &&
+        resolveThoughtLevelsForModel(
+          directFixed.value,
+          this._controls,
+          this._modelThoughtLevels
+        ).length === 0
+      ) {
+        return {
+          modelId: directFixed.value,
+          thoughtLevel: 'high',
+        };
+      }
+    }
+    const parsed = parseOrchestratorModelSpec(rawSpec);
     const fallback =
       role === 'planner'
         ? inferOrchestratorDefaultPlannerModel(this._controls.currentModelId)
@@ -2706,7 +2729,6 @@ export class AppStore {
     const targetName = parsed?.modelName ?? fallback?.modelName;
     let modelId: string | null = fallback?.modelId ?? null;
     if (targetName) {
-      const candidates = filterOrchestratorRoleModels(role, this._controls.availableModels);
       const matched = candidates.find(
         (c) =>
           c.name.toLowerCase() === targetName.toLowerCase() ||
@@ -2781,6 +2803,7 @@ export class AppStore {
     const query = rawQuery.trim();
     const queryLower = query.toLowerCase();
     const acpSkills = this.commands.getAcpSkillCommands();
+    const acpPlugins = this.commands.getAcpPluginCommands();
 
     // 1. Expanded `skill:` sub-list when user types `/skill:` (or accepts the collapsed `skill:` row)
     if (queryLower.startsWith('skill:')) {
@@ -2833,7 +2856,59 @@ export class AppStore {
       }));
     }
 
-    // 2. Normal `/` query (empty or not starting with `skill:`)
+    // 1b. Expanded `plugin:` sub-list when user types `/plugin:` (or accepts the collapsed `plugin:` row)
+    if (queryLower.startsWith('plugin:')) {
+      const subQuery = query.slice('plugin:'.length).trim();
+      const matchedPlugins: Array<{
+        cmd: SlashCommandDef;
+        score: number;
+        hits: readonly (readonly [number, number])[];
+      }> = [];
+
+      for (let i = 0; i < acpPlugins.length; i++) {
+        const cmd = acpPlugins[i]!;
+        const suffix = cmd.name.slice('plugin:'.length);
+        if (subQuery.length === 0) {
+          matchedPlugins.push({
+            cmd,
+            score: 1000 - i,
+            hits: [[0, 'plugin:'.length]],
+          });
+          continue;
+        }
+        const m = fuzzyMatchText(suffix, subQuery);
+        if (m) {
+          const shifted: Array<readonly [number, number]> = [
+            [0, 'plugin:'.length],
+            ...m.hits.map(([s, e]) => [s + 'plugin:'.length, e + 'plugin:'.length] as const),
+          ];
+          matchedPlugins.push({ cmd, score: m.score + 100, hits: shifted });
+        } else if (cmd.description.toLowerCase().includes(subQuery.toLowerCase())) {
+          matchedPlugins.push({
+            cmd,
+            score: 50,
+            hits: [[0, 'plugin:'.length]],
+          });
+        }
+      }
+
+      matchedPlugins.sort((a, b) =>
+        b.score !== a.score ? b.score - a.score : a.cmd.name.localeCompare(b.cmd.name),
+      );
+
+      return matchedPlugins.slice(0, MAX_COMPLETION_ITEMS).map((entry, idx) => ({
+        key: sanitizeCompletionKey(`plugin_${entry.cmd.name}`, idx),
+        kind: 'slash' as const,
+        value: entry.cmd.name,
+        label: entry.cmd.name,
+        icon: 'package',
+        detail: entry.cmd.description,
+        hits: entry.hits,
+        autoExecuteOnEnter: entry.cmd.autoExecuteOnEnter,
+      }));
+    }
+
+    // 2. Normal `/` query (empty or not starting with `skill:` / `plugin:`)
     const shouldCollapseSkills =
       acpSkills.length > 1 || (queryLower.length === 0 && acpSkills.length === 1);
     const skillGroupMatch =
@@ -2843,6 +2918,16 @@ export class AppStore {
 
     const includeCollapsedSkillRow =
       shouldCollapseSkills && (queryLower.length === 0 || skillGroupMatch !== null);
+
+    const shouldCollapsePlugins =
+      acpPlugins.length > 1 || (queryLower.length === 0 && acpPlugins.length === 1);
+    const pluginGroupMatch =
+      queryLower.length === 0
+        ? { score: 1000, hits: [] as readonly (readonly [number, number])[] }
+        : fuzzyMatchText('plugin:', queryLower);
+
+    const includeCollapsedPluginRow =
+      shouldCollapsePlugins && (queryLower.length === 0 || pluginGroupMatch !== null);
 
     const items: CompletionPopupItem[] = [];
 
@@ -2863,12 +2948,32 @@ export class AppStore {
       });
     }
 
+    if (includeCollapsedPluginRow) {
+      const countLabel = acpPlugins.length === 1 ? '1 plugin' : `${acpPlugins.length} plugins`;
+      items.push({
+        key: 'cmd_plugin_group',
+        kind: 'slash',
+        value: 'plugin:',
+        label: 'plugin:',
+        icon: 'package',
+        detail: 'Browse and invoke plugin commands',
+        statusValue: countLabel,
+        badge: countLabel,
+        hits: pluginGroupMatch ? pluginGroupMatch.hits : [],
+        autoExecuteOnEnter: false,
+        isPluginGroup: true,
+      });
+    }
+
     const allMatches = this.commands.search(query);
     for (let idx = 0; idx < allMatches.length; idx++) {
       if (items.length >= MAX_COMPLETION_ITEMS) break;
       const m = allMatches[idx]!;
-      // Hide individual ACP skill rows when collapsed under `skill:`
+      // Hide individual ACP skill/plugin rows when collapsed under `skill:` or `plugin:`
       if (includeCollapsedSkillRow && m.command.source === 'agy' && m.command.isSkill) {
+        continue;
+      }
+      if (includeCollapsedPluginRow && m.command.source === 'agy' && m.command.isPlugin) {
         continue;
       }
       const statusValue = this.resolveCommandStatusValue(m.command);
@@ -3046,9 +3151,10 @@ export class AppStore {
     const trigger = this._completion.trigger;
     if (!item) return null;
 
-    // Expanding the collapsed `skill:` group row inserts `/skill:` and refreshes the popup immediately
-    if (item.isSkillGroup) {
-      const replaced = applyTriggerReplacement(this.draft.text, trigger, 'skill:', {
+    // Expanding the collapsed `skill:` or `plugin:` group row inserts `/skill:` or `/plugin:` and refreshes immediately
+    if (item.isSkillGroup || item.isPluginGroup) {
+      const prefix = item.isPluginGroup ? 'plugin:' : 'skill:';
+      const replaced = applyTriggerReplacement(this.draft.text, trigger, prefix, {
         appendSpace: false,
       });
       this.draft.replaceRange(replaced.from, replaced.to, replaced.inserted, replaced.cursor, true);
