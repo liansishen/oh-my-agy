@@ -8750,6 +8750,40 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       expect(WELCOME_LOGO_STYLESHEET).not.toContain(disallowed);
     }
 
+    // Hover feedback uses cohesive luminosity/border polish with zero fractional vertical translate jitter
+    expect(WELCOME_LOGO_STYLESHEET).not.toContain('translateY(');
+    for (const role of [
+      'oma.composer.model.orchestrator',
+      'oma.composer.planner',
+      'oma.composer.executor',
+    ]) {
+      const baseMarker = `"[data-role='${role}'] {"`;
+      const workingMarker = `[data-role='${role}'][data-mark='working']`;
+      const hoverMarker = `[data-role='${role}']:hover {`;
+      const basePos = WELCOME_LOGO_STYLESHEET.indexOf(`[data-role='${role}'] {`);
+      const workingPos = WELCOME_LOGO_STYLESHEET.indexOf(workingMarker);
+      const hoverPos = WELCOME_LOGO_STYLESHEET.indexOf(hoverMarker);
+      expect(baseMarker.length).toBeGreaterThan(0);
+      expect(basePos).toBeGreaterThan(-1);
+      expect(workingPos).toBeGreaterThan(basePos);
+      expect(hoverPos).toBeGreaterThan(workingPos);
+      const baseEnd = WELCOME_LOGO_STYLESHEET.indexOf('}', basePos);
+      const baseBlock = WELCOME_LOGO_STYLESHEET.slice(basePos, baseEnd);
+      expect(baseBlock).toContain('height: 24px;');
+      expect(baseBlock).not.toContain('transform');
+      const hoverEnd = WELCOME_LOGO_STYLESHEET.indexOf('}', hoverPos);
+      const hoverBlock = WELCOME_LOGO_STYLESHEET.slice(hoverPos, hoverEnd);
+      expect(hoverBlock).toContain('animation: none;');
+      expect(hoverBlock).not.toContain('transform:');
+    }
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.model.orchestrator'] > .sf-icon:last-child");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('width: 12px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('height: 12px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.planner.effort']:hover");
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.executor.effort']:hover");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('width: 13px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('height: 13px;');
+
     // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
     await waitFor(
