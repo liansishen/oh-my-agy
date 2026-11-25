@@ -436,6 +436,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
     jobs?.inspectableAgentCount ?? 0
   );
   const runningJobs = jobs?.runningJobCount ?? 0;
+  const runningDaemons = jobs?.runningDaemonCount ?? 0;
+  const blockingRunningJobs = Math.max(0, runningJobs - runningDaemons);
 
   const showSwarmBeeSeg = hasSwarm;
   const showGenericAgentsSeg = !hasSwarm && (runningAgents > 0 || inspectableAgents > 0);
@@ -462,7 +464,10 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
       ? `${agentsAria}  Alt+S`
       : `No agents running · ${inspectableAgents} in this session  Alt+S`;
 
-  const jobsAria = `${runningJobs} ${runningJobs === 1 ? 'job' : 'jobs'} running`;
+  const jobsAria =
+    blockingRunningJobs === 0 && runningDaemons > 0
+      ? `${runningDaemons} ${runningDaemons === 1 ? 'daemon' : 'daemons'} running`
+      : `${runningJobs} ${runningJobs === 1 ? 'job' : 'jobs'} running`;
   const jobSummaryLines = (jobs?.runningJobSummaries ?? []).slice(0, 5);
   const jobsTitle =
     jobSummaryLines.length > 0
@@ -580,7 +585,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
                 actions={{ click: 'jobs.open' }}
                 onClick={() => callbacks.onOpenJobs?.()}
               >
-                <icon key="icon" name="job" tone="warning" />
+                <icon key="icon" name="job" tone={blockingRunningJobs > 0 ? 'warning' : 'muted'} />
                 <text
                   key="count"
                   spans={[{ t: String(runningJobs), s: 'num' }]}

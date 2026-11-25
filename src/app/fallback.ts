@@ -24,6 +24,7 @@ import {
   loadSessionPreview,
   parseSessionAnchorJson,
   type PersistedSessionTodoState,
+  type SessionTitleSource,
 } from '../preview/store';
 import { readTranscriptModelCandidates } from '../state/session_metrics';
 
@@ -57,6 +58,7 @@ export interface ResolvedResumeTarget {
   sessionId?: string;
   cwd?: string;
   title?: string;
+  titleSource?: SessionTitleSource;
   model?: string;
   thoughtLevel?: string;
   mode?: string;
@@ -288,6 +290,7 @@ export function resolveResumeTarget(raw: string): ResolvedResumeTarget {
         sessionId,
         cwd: typeof obj['cwd'] === 'string' ? obj['cwd'] : undefined,
         title: typeof obj['title'] === 'string' ? obj['title'] : undefined,
+        ...(normalizedAnchor?.titleSource ? { titleSource: normalizedAnchor.titleSource } : {}),
         model: typeof obj['model'] === 'string' ? obj['model'] : undefined,
         thoughtLevel: typeof obj['thoughtLevel'] === 'string' ? obj['thoughtLevel'] : undefined,
         mode: typeof obj['mode'] === 'string' ? obj['mode'] : undefined,

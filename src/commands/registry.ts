@@ -33,7 +33,8 @@ export type BuiltinCommandId =
   | 'export'
   | 'jobs'
   | 'git'
-  | 'todo';
+  | 'todo'
+  | 'rename';
 
 export interface AcpAvailableCommandLike {
   readonly name: string;
@@ -398,6 +399,17 @@ export const EXTRA_BUILTIN_COMMANDS: readonly SlashCommandDef[] = [
     takesArgs: true,
     autoExecuteOnEnter: true,
     builtinId: 'todo',
+  },
+  {
+    name: 'rename',
+    aliases: ['title'],
+    description: 'Rename current session title locally (/rename --reset restores auto title)',
+    source: 'oma',
+    icon: 'pen',
+    argHint: '<title | --reset>',
+    takesArgs: true,
+    autoExecuteOnEnter: false,
+    builtinId: 'rename',
   },
 ];
 

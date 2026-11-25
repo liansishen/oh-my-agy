@@ -127,12 +127,14 @@ import {
 import {
   AppStore,
   EDITOR_NODE_ID,
+  normalizeSessionTitle,
   type AgentItem,
   type BeeMemberBlobPair,
   type McpServerItem,
   type ModalPickerKind,
   type PluginItem,
   type ResumeSessionEntry,
+  type SessionTitleSource,
   type SkillItem,
 } from '../state/store';
 import {
@@ -518,6 +520,12 @@ function extractMentionedPaths(text: string): string[] {
   return found;
 }
 
+const DEFAULT_TERMINAL_TITLE = 'oma · Antigravity';
+
+function formatTerminalTitle(sessionTitle: string | null): string {
+  return normalizeSessionTitle(sessionTitle) ?? DEFAULT_TERMINAL_TITLE;
+}
+
 interface SessionControlCarryOver {
   readonly modelId: string | null;
   readonly thoughtLevel: string | null;
@@ -525,6 +533,8 @@ interface SessionControlCarryOver {
 }
 
 interface ResumeAnchorHint {
+  readonly title?: string;
+  readonly titleSource?: SessionTitleSource;
   readonly model?: string;
   readonly thoughtLevel?: string;
   readonly mode?: string;
@@ -668,6 +678,8 @@ export class AppController {
   #welcomeLogoStyleInstalled = false;
   #swarmFxStyleInstalled = false;
   #swarmFxStyleSig = '';
+  #lastEmittedTerminalTitle: string = DEFAULT_TERMINAL_TITLE;
+  #lastAutoSessionTitle: { readonly sessionId: string; readonly title: string } | null = null;
   #memberBeeBlobDark: boolean | null = null;
   #memberBeeBlobCache: Record<string, BeeMemberBlobPair> = {};
   #doneIdleTimer: ReturnType<typeof setTimeout> | undefined = undefined;
@@ -794,13 +806,13 @@ export class AppController {
       mode: 'inline',
       chat: true,
       role: 'omp.session',
-      title: 'oma · Antigravity',
+      title: DEFAULT_TERMINAL_TITLE,
     });
 
     this.#syncWelcomeLogoStylesheet(this.session.caps.features);
 
     // Emit OSC 2 pane title + DECTCEM hide cursor immediately after opening the surface.
-    this.osc.setTitleAndHideCursor('oma · Antigravity');
+    this.osc.setTitleAndHideCursor(DEFAULT_TERMINAL_TITLE);
 
     this.scheduler = new RenderScheduler(
       this.surface,
@@ -1194,6 +1206,8 @@ export class AppController {
     this.#todoServer?.revokeSessionRoute();
     if (options.resetStore) {
       this.store.resetSessionState({ keepCommands: true });
+      this.#lastAutoSessionTitle = null;
+      this.#syncTerminalTitle();
     }
     this.store.setSessionPhase('none');
     if (this.scheduler.suspended) {
@@ -1467,6 +1481,8 @@ export class AppController {
       if (target.sessionId) {
         const targetCwd = target.cwd || cwd;
         const anchorHint: ResumeAnchorHint = {
+          ...(target.title !== undefined ? { title: target.title } : {}),
+          ...(target.titleSource !== undefined ? { titleSource: target.titleSource } : {}),
           ...(target.model ? { model: target.model } : {}),
           ...(target.thoughtLevel ? { thoughtLevel: target.thoughtLevel } : {}),
           ...(target.mode ? { mode: target.mode } : {}),
@@ -1553,6 +1569,7 @@ export class AppController {
     }
     this.store.transcript.setPreferNativeSteps(sessionTodoProvider === 'native');
     try {
+      this.#lastAutoSessionTitle = null;
       const created = await client.newSession({
         cwd,
         ...bootstrapOptions,
@@ -1570,6 +1587,7 @@ export class AppController {
         ...(createdTier ? { tier: createdTier } : {}),
       });
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
+      this.#syncTerminalTitle();
       this.#bindSessionMetrics(created.sessionId);
       this.#ensureSwarmWatcher(created.sessionId, { forceRestart: true });
       void this.#refreshGitStatus();
@@ -1692,6 +1710,7 @@ export class AppController {
     };
 
     try {
+      this.#lastAutoSessionTitle = null;
       const loaded = await client.loadSession({
         sessionId,
         cwd,
@@ -1796,13 +1815,22 @@ export class AppController {
         this.store.transcript.syncTranscriptBackgroundTasks(terminalBgRecords);
       }
 
-      const effectiveTodoAnchor =
+      const effectiveAnchor =
         storedAnchorResult.status === 'found'
           ? storedAnchorResult.record
           : storedAnchorResult.status === 'missing'
             ? options?.anchorHint
             : undefined;
-      const storedTodoState = effectiveTodoAnchor?.todoState;
+      if (effectiveAnchor?.titleSource === 'user' && normalizeSessionTitle(effectiveAnchor.title)) {
+        this.store.setSessionTitle(effectiveAnchor.title ?? null, 'user');
+      } else if (
+        !this.store.getState().sessionTitle &&
+        effectiveAnchor?.titleSource === 'auto' &&
+        normalizeSessionTitle(effectiveAnchor.title)
+      ) {
+        this.store.setSessionTitle(effectiveAnchor.title ?? null, 'auto');
+      }
+      const storedTodoState = effectiveAnchor?.todoState;
       const candidateUserAnchor =
         storedTodoState?.source === 'user' &&
         storedTodoState.toolCallCount >= this.store.transcript.todoToolCallCount
@@ -1869,10 +1897,11 @@ export class AppController {
         }
       }
       if (settledAny) {
-        this.osc.reassertCursorHidden();
+        this.osc.reassertCursorHidden({ force: true });
       }
       this.#drainPendingReplayedServerRequests(bufferedRequests, loaded.sessionId, loadEpoch);
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
+      this.#syncTerminalTitle();
       return sessionTodoProvider;
     } catch (err) {
       if (loadEpoch !== this.#lifecycle.epoch) {
@@ -2030,6 +2059,17 @@ export class AppController {
     }
     const prevBusy = this.store.isBusy;
     const isReplayingBefore = this.store.getState().isReplaying;
+    const prevSessionTitle = this.store.getState().sessionTitle;
+    if (
+      params.update.sessionUpdate === 'session_info_update' &&
+      typeof params.update.title === 'string'
+    ) {
+      const normalizedAuto = normalizeSessionTitle(params.update.title);
+      const sidForAuto = incomingSessionId || expectedSessionId;
+      if (normalizedAuto && sidForAuto) {
+        this.#lastAutoSessionTitle = { sessionId: sidForAuto, title: normalizedAuto };
+      }
+    }
     const prevUsageUsed =
       !isReplayingBefore && params.update.sessionUpdate === 'usage_update'
         ? (this.store.getState().usage?.used ?? 0)
@@ -2052,6 +2092,10 @@ export class AppController {
     const update = params.update;
 
     if (!isReplaying) {
+      if (this.store.getState().sessionTitle !== prevSessionTitle) {
+        this.#syncTerminalTitle();
+        void this.#persistSessionAnchorAndOsc().catch(() => {});
+      }
       const todoRevisionChanged = this.store.transcript.todoRevision !== prevTodoRevision;
       const todoCountChanged =
         this.store.transcript.todoToolCallCount !== prevTodoToolCallCount;
@@ -2634,12 +2678,14 @@ export class AppController {
       if (this.store.getFocusMode() !== prevMode) {
         this.scheduler.renderNow();
       }
+      this.osc.reassertCursorHidden();
       return;
     }
     if (this.store.getFocusMode() !== prevMode) {
       this.scheduler.renderNow();
       this.syncFocus();
     }
+    this.osc.reassertCursorHidden();
   }
 
   /**
@@ -2727,10 +2773,29 @@ export class AppController {
           }
           return;
         }
+        if (name === 'd' && !key.ctrl && !key.alt && !key.meta) {
+          const selected =
+            items.find(j => j.id === state.infoOverlay?.selectedJobId) ?? items[0];
+          if (
+            selected &&
+            selected.status === 'running' &&
+            selected.endedAt === undefined &&
+            !selected.isDaemon &&
+            !state.isStreaming
+          ) {
+            this.#detachBackgroundJob(selected.id);
+          }
+          return;
+        }
         if (name === 'x' && !key.ctrl && !key.alt && !key.meta) {
           const selected =
             items.find(j => j.id === state.infoOverlay?.selectedJobId) ?? items[0];
-          if (selected && selected.status === 'running' && selected.endedAt === undefined && state.isBusy) {
+          if (
+            selected &&
+            selected.status === 'running' &&
+            selected.endedAt === undefined &&
+            (state.isStreaming || (!selected.isDaemon && state.isBusy))
+          ) {
             await this.cancelPendingAndTurn();
           }
           return;
@@ -4048,6 +4113,9 @@ export class AppController {
       handleTodo: async (argsText: string) => {
         await this.#handleTodoCommand(argsText);
       },
+      renameSession: async (title: string) => {
+        await this.#handleRenameSession(title);
+      },
       openHelp: () => {
         this.#pickerLoadToken += 1;
         this.store.openHelp();
@@ -4327,7 +4395,7 @@ export class AppController {
           this.scheduler.renderNow();
           if (!stillBusy && finishedTurn) {
             this.scheduler.settleTurn(finishedTurn.index);
-            this.osc.reassertCursorHidden();
+            this.osc.reassertCursorHidden({ force: true });
           }
 
           if (stillBusy) {
@@ -4580,6 +4648,47 @@ export class AppController {
     this.#clearToolWatchTimer();
     this.scheduler.renderNow();
     this.syncFocus();
+  }
+
+  #detachBackgroundJob(jobId: string): void {
+    const detached = this.store.transcript.markBackgroundTaskAsDaemon(jobId);
+    if (!detached) return;
+
+    if (!this.store.isBusy && !this.store.getState().isStreaming) {
+      this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#backgroundResumeAnchorStepSeq = 0;
+      this.#backgroundWaitLastProgressAt = 0;
+      this.#workingStartedAt = undefined;
+      this.#clearBackgroundDoneTimer();
+
+      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: this.store.getState().expandAllTools,
+        terminalToolStatus: 'done',
+        terminalTurnStatus: 'done',
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
+      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+      this.#deferredSettleTurnIndex = null;
+      this.scheduler.renderNow();
+      if (settleIdx !== null) {
+        this.scheduler.settleTurn(settleIdx);
+        this.osc.reassertCursorHidden({ force: true });
+      }
+      if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+        this.osc.setStatusIdle();
+      }
+    }
+
+    this.#syncToolWatchTimer();
+    this.store.pushToast(`Detached "${detached.label}" as background daemon`, 'info', {
+      ttl: 2500,
+    });
+    this.scheduler.renderNow();
   }
 
   #getSwarmPathOptions(): SwarmPathOptions {
@@ -4972,7 +5081,10 @@ export class AppController {
             sessionId: s.sessionId,
             cwd: rawCwd,
             displayCwd: normalizeDisplayPath(rawCwd),
-            title: (s.title ?? '').trim() || cached?.title || '',
+            title:
+              cached?.titleSource === 'user' && cached.title.trim().length > 0
+                ? cached.title.trim()
+                : (s.title ?? '').trim() || cached?.title || '',
             updatedAt: s.updatedAt || cached?.updatedAt || '',
             ...(cached?.model ? { model: cached.model } : {}),
             ...(cached?.thoughtLevel ? { thoughtLevel: cached.thoughtLevel } : {}),
@@ -5882,6 +5994,8 @@ export class AppController {
       undefined,
       hasCarryOver ? carryOver : null
     );
+    this.#lastAutoSessionTitle = null;
+    this.#syncTerminalTitle();
     this.scheduler.renderNow();
 
     if (oldId) {
@@ -5933,6 +6047,7 @@ export class AppController {
         ...(createdTier ? { tier: createdTier } : {}),
       });
       this.#drainPendingNewSessionUpdates(created.sessionId, createEpoch);
+      this.#syncTerminalTitle();
       if (hasCarryOver) {
         await this.#applySessionControls(client, created.sessionId, carryOver, createEpoch, {
           clampInvalidThought: true,
@@ -7277,7 +7392,7 @@ export class AppController {
         process.stdin.setRawMode(wasRaw);
       }
       this.surface.resume();
-      this.osc.setTitleAndHideCursor('oma · Antigravity');
+      this.#syncTerminalTitle({ hideCursor: true });
       await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }
@@ -7762,6 +7877,65 @@ export class AppController {
     this.scheduler.renderNow();
   }
 
+  async #handleRenameSession(rawTitle: string): Promise<void> {
+    const state = this.store.getState();
+    if (!state.sessionId || state.isReplaying || state.isCreatingSession) {
+      this.store.pushToast('No active session to rename.', 'warning');
+      this.scheduler.renderNow();
+      return;
+    }
+
+    const trimmed = rawTitle.trim();
+    if (!trimmed) {
+      const currentTitle = normalizeSessionTitle(state.sessionTitle);
+      const sourceLabel = state.sessionTitleSource === 'user' ? 'custom' : 'auto';
+      this.store.pushToast(
+        currentTitle
+          ? `Current title: "${currentTitle}" (${sourceLabel}) — use /rename <title> or /rename --reset`
+          : 'Usage: /rename <title> (or /rename --reset to restore auto title)',
+        'info',
+        { ttl: 3500 }
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
+    if (trimmed === '--reset' || trimmed === '--auto') {
+      const restored =
+        this.#lastAutoSessionTitle?.sessionId === state.sessionId
+          ? this.#lastAutoSessionTitle.title
+          : null;
+      this.store.setSessionTitle(restored, restored ? 'auto' : null, { force: true });
+      this.#syncTerminalTitle();
+      await this.#persistSessionAnchorAndOsc();
+      this.store.pushToast(
+        restored
+          ? `Restored auto title "${restored}"`
+          : 'Cleared custom title; waiting for auto title',
+        'success',
+        { ttl: 2500 }
+      );
+      this.scheduler.renderNow();
+      return;
+    }
+
+    const normalized = normalizeSessionTitle(trimmed);
+    if (!normalized) {
+      this.store.pushToast('Session title cannot be empty.', 'warning');
+      this.scheduler.renderNow();
+      return;
+    }
+
+    this.store.setSessionTitle(normalized, 'user');
+    this.#syncTerminalTitle();
+    await this.#persistSessionAnchorAndOsc();
+    this.store.pushToast(`Session renamed to "${normalized}"`, 'success', {
+      sub: 'Saved locally in oma',
+      ttl: 2500,
+    });
+    this.scheduler.renderNow();
+  }
+
   async #retryTurn(turnIndex: number): Promise<void> {
     const turn = this.store.transcript.turns.find(t => t.index === turnIndex);
     if (!turn?.user) return;
@@ -7865,7 +8039,7 @@ export class AppController {
         process.stdin.setRawMode(wasRaw || true);
       }
       this.surface.resume();
-      this.osc.setTitleAndHideCursor('oma · Antigravity');
+      this.#syncTerminalTitle({ hideCursor: true });
     }
 
     this.store.setAuthRequired(null);
@@ -7875,6 +8049,24 @@ export class AppController {
   // -------------------------------------------------------------------------
   // Anchor Persistence, OSC & Signal Helpers
   // -------------------------------------------------------------------------
+
+  #syncTerminalTitle(options?: { readonly force?: boolean; readonly hideCursor?: boolean }): void {
+    const nextTitle = formatTerminalTitle(this.store.getState().sessionTitle);
+    if (options?.hideCursor) {
+      this.osc.setTitleAndHideCursor(nextTitle);
+      this.#lastEmittedTerminalTitle = nextTitle;
+      return;
+    }
+    if (!options?.force && nextTitle === this.#lastEmittedTerminalTitle) {
+      return;
+    }
+    if (this.osc.cursorHidden) {
+      this.osc.setTitleAndHideCursor(nextTitle);
+    } else {
+      this.osc.setTitle(nextTitle);
+    }
+    this.#lastEmittedTerminalTitle = nextTitle;
+  }
 
   async #persistSessionAnchorAndOsc(): Promise<void> {
     if (this.#shuttingDown) return;
@@ -7915,6 +8107,9 @@ export class AppController {
       sessionId: expectedSid,
       cwd: state.cwd,
       title,
+      ...(state.sessionTitle && state.sessionTitleSource
+        ? { titleSource: state.sessionTitleSource }
+        : {}),
       ...(state.controls.currentModelId ? { model: state.controls.currentModelId } : {}),
       ...(state.controls.currentThoughtLevel
         ? { thoughtLevel: state.controls.currentThoughtLevel }
@@ -8085,7 +8280,7 @@ export class AppController {
         this.scheduler.renderNow();
         if (settleIdx !== null) {
           this.scheduler.settleTurn(settleIdx);
-          this.osc.reassertCursorHidden();
+          this.osc.reassertCursorHidden({ force: true });
         }
         if (!this.store.approvals.hasPending() && !state.activeQuestion) {
           this.osc.setStatusDone();
@@ -8111,6 +8306,7 @@ export class AppController {
       !this.store.getState().isReplaying &&
       (this.store.transcript.hasInFlightToolCall() ||
         this.store.hasActiveBackgroundTasks() ||
+        this.store.transcript.hasRunningDaemonTasks() ||
         this.#pendingBackgroundDone);
     if (!shouldWatch) {
       this.#clearToolWatchTimer();
@@ -8127,6 +8323,7 @@ export class AppController {
         this.store.getState().isReplaying ||
         (!this.store.transcript.hasInFlightToolCall() &&
           !this.store.hasActiveBackgroundTasks() &&
+          !this.store.transcript.hasRunningDaemonTasks() &&
           !this.#pendingBackgroundDone)
       ) {
         this.#clearToolWatchTimer();
@@ -9127,6 +9324,9 @@ export class AppController {
           },
           onStopJob: () => {
             void this.cancelPendingAndTurn();
+          },
+          onDetachJob: jobId => {
+            this.#detachBackgroundJob(jobId);
           },
         },
       },

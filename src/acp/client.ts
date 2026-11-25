@@ -512,7 +512,7 @@ export class AcpClient {
   ): Promise<InitializeResult> {
     const req: InitializeParams = {
       protocolVersion: params?.protocolVersion ?? 1,
-      clientInfo: params?.clientInfo ?? { name: "oma", version: "0.3.2" },
+      clientInfo: params?.clientInfo ?? { name: "oma", version: "0.3.3" },
       clientCapabilities: params?.clientCapabilities ?? {},
       ...(params?._meta ? { _meta: params._meta } : {}),
     };

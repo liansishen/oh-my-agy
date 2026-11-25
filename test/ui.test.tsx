@@ -3748,8 +3748,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
                 name: 'run_command',
                 kind: 'execute',
                 status: 'completed',
-                title: 'Start dev server',
-                args: { CommandLine: 'bun run server.ts', IsDaemon: true },
+                title: 'Run background build',
+                args: { CommandLine: 'bun run build.ts', WaitMsBeforeAsync: 500 },
                 rawOutput: { output: 'Command is running in the background. TaskId: bg-task-42' },
               },
             },
@@ -8750,6 +8750,40 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       expect(WELCOME_LOGO_STYLESHEET).not.toContain(disallowed);
     }
 
+    // Hover feedback uses cohesive luminosity/border polish with zero fractional vertical translate jitter
+    expect(WELCOME_LOGO_STYLESHEET).not.toContain('translateY(');
+    for (const role of [
+      'oma.composer.model.orchestrator',
+      'oma.composer.planner',
+      'oma.composer.executor',
+    ]) {
+      const baseMarker = `"[data-role='${role}'] {"`;
+      const workingMarker = `[data-role='${role}'][data-mark='working']`;
+      const hoverMarker = `[data-role='${role}']:hover {`;
+      const basePos = WELCOME_LOGO_STYLESHEET.indexOf(`[data-role='${role}'] {`);
+      const workingPos = WELCOME_LOGO_STYLESHEET.indexOf(workingMarker);
+      const hoverPos = WELCOME_LOGO_STYLESHEET.indexOf(hoverMarker);
+      expect(baseMarker.length).toBeGreaterThan(0);
+      expect(basePos).toBeGreaterThan(-1);
+      expect(workingPos).toBeGreaterThan(basePos);
+      expect(hoverPos).toBeGreaterThan(workingPos);
+      const baseEnd = WELCOME_LOGO_STYLESHEET.indexOf('}', basePos);
+      const baseBlock = WELCOME_LOGO_STYLESHEET.slice(basePos, baseEnd);
+      expect(baseBlock).toContain('height: 24px;');
+      expect(baseBlock).not.toContain('transform');
+      const hoverEnd = WELCOME_LOGO_STYLESHEET.indexOf('}', hoverPos);
+      const hoverBlock = WELCOME_LOGO_STYLESHEET.slice(hoverPos, hoverEnd);
+      expect(hoverBlock).toContain('animation: none;');
+      expect(hoverBlock).not.toContain('transform:');
+    }
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.model.orchestrator'] > .sf-icon:last-child");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('width: 12px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('height: 12px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.planner.effort']:hover");
+    expect(WELCOME_LOGO_STYLESHEET).toContain("[data-role='oma.composer.executor.effort']:hover");
+    expect(WELCOME_LOGO_STYLESHEET).toContain('width: 13px;');
+    expect(WELCOME_LOGO_STYLESHEET).toContain('height: 13px;');
+
     // Clicking `Plan` effort icon cycles Planner thinking (Carbon: high -> low); `/thought` defaults to Planner
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner.effort', act: 'planner.thinking.cycle' });
     await waitFor(
@@ -8806,7 +8840,20 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => replayNodes().get('dock.composer.bar.planner.name')?.p['text'] === 'Opus 5.5');
     expect(replayNodes().get('dock.composer.bar.planner.effort')?.p['level']).toBe('medium');
 
-    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5)
+    // Re-opening `Plan` capsule preserves saved `medium` instead of falling back to `high`
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const reopenedOpusData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(reopenedOpusData.selectedId).toBe('claude-opus-5-5');
+    expect(reopenedOpusData.level?.value).toBe('medium');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+
+    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5) and preserves saved `xhigh` (Extra)
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
     await waitFor(() => controller.store.getState().picker?.kind === 'executor');
     const execData = computePickerData(
@@ -8815,7 +8862,20 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       [],
     );
     expect(execData.items.map(i => i.id)).toEqual(['gemini-4-hydrogen', 'claude-sonnet-5-5']);
+    expect(execData.selectedId).toBe('gemini-4-hydrogen');
+    expect(execData.level?.value).toBe('xhigh');
+    expect(execData.level?.steps.find(s => s.id === 'xhigh')?.label).toBe('Extra');
     expect(execData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Moving onto a 3-level Executor clamps to `high`, and moving back restores saved `xhigh` (`Extra`)
+    controller.store.setPickerSelected('claude-sonnet-5-5');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('high');
+    controller.store.setPickerSelected('gemini-4-hydrogen');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('xhigh');
 
     // Select `claude-sonnet-5-5` (clamps xhigh -> high) and press Enter -> persists & shows short name `Sonnet 5.5`
     controller.store.setPickerSelected('claude-sonnet-5-5');
@@ -8831,6 +8891,39 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     });
     await waitFor(() => replayNodes().get('dock.composer.bar.executor.name')?.p['text'] === 'Sonnet 5.5');
     expect(replayNodes().get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Selecting 4-level Planner `gemini-4-neon` at `xhigh` (`Extra`) persists & re-opens at `xhigh` (`Extra`)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    controller.store.setPickerSelected('gemini-4-neon');
+    controller.store.setModelPickerThinking('xhigh');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Neon (Extra)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.effort')?.p['level'] === 'xhigh');
+
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const reopenedNeonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(reopenedNeonData.selectedId).toBe('gemini-4-neon');
+    expect(reopenedNeonData.level?.value).toBe('xhigh');
+    expect(reopenedNeonData.level?.steps.find(s => s.id === 'xhigh')?.label).toBe('Extra');
+    controller.store.setPickerSelected('gemini-4-carbon');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('high');
+    controller.store.setPickerSelected('gemini-4-neon');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('xhigh');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
 
     // 3) `/thinking on` enables live thinking stream, persists `showThinking: true`, and keeps completed thoughts expanded
     await controller.submitInput('/thinking on');
