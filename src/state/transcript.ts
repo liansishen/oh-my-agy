@@ -411,6 +411,7 @@ export interface BackgroundJobItem {
   readonly title?: string;
   readonly outputText: string;
   readonly exitCode?: number;
+  readonly isDaemon?: boolean;
   readonly startedAt: number;
   readonly endedAt?: number;
   readonly tookMs?: number;
@@ -431,6 +432,8 @@ export interface BackgroundJobsSnapshot {
   readonly all: readonly BackgroundJobItem[];
   /** Running non-agent jobs (`agentId === undefined`) counted by HUD `jobs` segment. */
   readonly runningJobCount: number;
+  /** Running non-blocking daemon jobs included in `runningJobCount`. */
+  readonly runningDaemonCount: number;
   /** Running non-swarm subagent count (`invoke_subagent`) tracked in transcript. */
   readonly runningSubagentCount: number;
   /** Running swarm entries tracked in transcript. */
@@ -441,7 +444,7 @@ export interface BackgroundJobsSnapshot {
   readonly inspectableAgentCount: number;
   /** Running detached background tasks that continue after `end_turn` (async bash, subagent, schedule, workflow). */
   readonly detachedTaskCount: number;
-  /** True when any running tool call, subagent, or detached background task is still active. */
+  /** True when any running tool call, subagent, or non-daemon detached background task is still active. */
   readonly hasActiveBackgroundTasks: boolean;
   /** Concise single-line summaries for running non-agent jobs (used in HUD `jobs` tooltip). */
   readonly runningJobSummaries: readonly string[];
@@ -459,6 +462,7 @@ export interface DetachedBackgroundTask {
   readonly title?: string;
   readonly agentKind?: 'subagent';
   readonly model?: string;
+  isDaemon?: boolean;
   readonly startedAt: number;
   readonly turnIndex: number;
   status: BackgroundJobStatus;
@@ -892,16 +896,6 @@ function classifyNonAgentJobType(tool: ToolCallItem): BackgroundJobType | null {
     return 'bash';
   }
 
-  if (
-    inputRec &&
-    (typeof inputRec.CommandLine === 'string' ||
-      inputRec.WaitMsBeforeAsync !== undefined ||
-      inputRec.IsDaemon !== undefined ||
-      inputRec.isDaemon !== undefined)
-  ) {
-    return 'bash';
-  }
-
   if (rawName === 'call_mcp_tool' || titleLower === 'call_mcp_tool' || titleLower.startsWith('call_mcp_tool')) {
     const mcpToolName = firstStringField(inputRec, ['ToolName', 'toolName', 'tool_name']);
     const mcpType = classifyMcpCommandToken(mcpToolName);
@@ -925,6 +919,15 @@ function classifyNonAgentJobType(tool: ToolCallItem): BackgroundJobType | null {
   }
   if (rawName === 'run_workflow' || rawName.includes('workflow') || titleLower.includes('run_workflow') || titleLower.startsWith('workflow')) {
     return 'workflow';
+  }
+  if (
+    inputRec &&
+    (typeof inputRec.CommandLine === 'string' ||
+      inputRec.WaitMsBeforeAsync !== undefined ||
+      inputRec.IsDaemon !== undefined ||
+      inputRec.isDaemon !== undefined)
+  ) {
+    return 'bash';
   }
   if (
     rawName === 'manage_task' ||
@@ -1034,6 +1037,76 @@ function extractBackgroundHeaderText(outText: string): string {
     /(?:^|\r?\n)\s*Task\s+Description:\s*[\s\S]*?(?=(?:\r?\n\s*(?:Task\s+logs\s+are\s+available\s+at:|YOU\s+MUST\s+TAKE\s+ONE)|$))/gi,
     '',
   );
+}
+
+/**
+ * Parses `IsDaemon` / `isDaemon` / `is_daemon` flags from either boolean or
+ * stringified (`"true"` / `"\"true\""`) tool payloads.
+ */
+export function isDaemonFlag(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+  const cleaned = value.trim().replace(/^["']|["']$/g, '').trim().toLowerCase();
+  return cleaned === 'true';
+}
+
+function isToolDaemon(tool: ToolCallItem): boolean {
+  const records = [asRecord(tool.args), asRecord(tool.rawInput), asRecord(tool.rawOutput)];
+  for (const rec of records) {
+    if (!rec) continue;
+    if (isDaemonFlag(rec.IsDaemon ?? rec.isDaemon ?? rec.is_daemon)) {
+      return true;
+    }
+  }
+  const outText = tool.outputText || '';
+  return /["']isDaemon["']\s*:\s*true\b|\bis_daemon\s*[:=]\s*true\b/i.test(outText);
+}
+
+const MANAGE_TASK_LIST_JSON_RE =
+  /You\s+have\s+\d+\s+background\s+task\(s\)\s+currently\s+running:\s*(\[[\s\S]*\])/i;
+
+function parseManageTaskListOutput(
+  text: string,
+): ReadonlyArray<{ readonly taskId: string; readonly isDaemon?: boolean; readonly description?: string }> | null {
+  const match = MANAGE_TASK_LIST_JSON_RE.exec(text);
+  if (!match?.[1]) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const out: Array<{ readonly taskId: string; readonly isDaemon?: boolean; readonly description?: string }> = [];
+  for (const item of parsed) {
+    const rec = asRecord(item);
+    if (!rec) continue;
+    const rawId = rec['taskId'] ?? rec['task_id'] ?? rec['TaskId'];
+    const taskId = typeof rawId === 'string' ? rawId.trim() : '';
+    if (!taskId) continue;
+    const isDaemon = isDaemonFlag(rec['isDaemon'] ?? rec['IsDaemon'] ?? rec['is_daemon']);
+    const rawDesc = rec['description'] ?? rec['Description'] ?? rec['toolSummary'];
+    const description = typeof rawDesc === 'string' && rawDesc.trim().length > 0 ? rawDesc.trim() : undefined;
+    out.push({
+      taskId,
+      ...(isDaemon ? { isDaemon: true } : {}),
+      ...(description ? { description } : {}),
+    });
+  }
+  return out;
+}
+
+function matchesDescriptionFields(
+  fields: readonly (string | undefined)[],
+  description: string | undefined,
+): boolean {
+  if (!description) return false;
+  const normDesc = description.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (normDesc.length === 0) return false;
+  return fields
+    .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+    .map((v) => v.replace(/\s+/g, ' ').trim().toLowerCase())
+    .some((f) => f === normDesc || f.includes(normDesc) || normDesc.includes(f));
 }
 
 function extractTaskIdFromTool(tool: ToolCallItem, textOverride?: string): string | undefined {
@@ -1188,12 +1261,14 @@ function detectDetachedBackgroundTask(
     const command = firstStringField(inputRec, ['CronExpression', 'cronExpression']);
     const desc =
       firstStringField(inputRec, ['Prompt', 'prompt', 'Description', 'description']) ?? tool.title;
+    const isDaemon = isToolDaemon(tool);
     return {
       id: tool.toolCallId,
       toolCallId: tool.toolCallId,
       ...(taskId ? { taskId } : {}),
       type: 'schedule',
       ...(scheduleKind ? { scheduleKind } : {}),
+      ...(isDaemon ? { isDaemon: true } : {}),
       label: collapseSingleLine(desc || 'schedule', 88),
       ...(command ? { command } : {}),
       ...(desc ? { title: desc } : {}),
@@ -1252,12 +1327,12 @@ function detectDetachedBackgroundTask(
     titleLower.startsWith('run_command');
   if (isBash) {
     const taskId = extractTaskIdFromTool(tool, headerText);
+    const isDaemon = isToolDaemon(tool);
     if (isSynchronousMcpCommandTool(tool)) {
       if (!(explicitlyBgInObj || hasAuthoritativeBgHeader) || hasTerminalHeader) {
         return null;
       }
     } else {
-      const isDaemon = inputRec?.IsDaemon === true || inputRec?.isDaemon === true;
       const hasOutputBgCue =
         hasAuthoritativeBgHeader ||
         /\b(?:is\s+running|running|started|launched|moved|continuing)\s+(?:as\s+a\s+|in\s+the\s+)?background\b/i.test(
@@ -1281,6 +1356,7 @@ function detectDetachedBackgroundTask(
       toolCallId: tool.toolCallId,
       ...(taskId ? { taskId } : {}),
       type: 'bash',
+      ...(isDaemon ? { isDaemon: true } : {}),
       label: collapseSingleLine(command ?? tool.title ?? 'bash', 88),
       ...(command ? { command } : {}),
       ...(desc ? { title: desc } : {}),
@@ -1299,11 +1375,13 @@ function detectDetachedBackgroundTask(
       tool.target ||
       firstStringField(inputRec, ['CommandLine', 'command', 'cmd', 'script']);
     const label = collapseSingleLine(command || tool.title || tool.rawName || fallbackType, 88);
+    const isDaemon = isToolDaemon(tool);
     return {
       id: tool.toolCallId,
       toolCallId: tool.toolCallId,
       ...(taskId ? { taskId } : {}),
       type: fallbackType,
+      ...(isDaemon ? { isDaemon: true } : {}),
       label,
       ...(command ? { command } : {}),
       ...(tool.title && tool.title !== command ? { title: tool.title } : {}),
@@ -2359,7 +2437,9 @@ export class TranscriptStore {
         for (const tool of stillRunningTools) {
           this.registerInFlightToolAsBackgroundTask(turn.index, tool);
         }
-        return turn;
+        if (stillRunningTools.some((tool) => !isToolDaemon(tool))) {
+          return turn;
+        }
       }
     }
 
@@ -3248,11 +3328,12 @@ export class TranscriptStore {
    */
   hasActiveBackgroundTasks(): boolean {
     for (const task of this._detachedBgTasks.values()) {
-      if (task.status === 'running') return true;
+      if (task.status === 'running' && !task.isDaemon) return true;
     }
     const turn = this.activeTurn;
     if (turn && turn.status === 'streaming') {
       for (const tool of turn.toolCalls) {
+        if (this._detachedBgTasks.get(tool.toolCallId)?.isDaemon === true) continue;
         if (
           (tool.status === 'pending' || tool.status === 'running' || tool.status === 'ask') &&
           tool.endedAt === undefined
@@ -3267,6 +3348,42 @@ export class TranscriptStore {
       }
     }
     return false;
+  }
+
+  /**
+   * Returns `true` when at least one non-blocking daemon task is currently running.
+   */
+  hasRunningDaemonTasks(): boolean {
+    for (const task of this._detachedBgTasks.values()) {
+      if (task.status === 'running' && task.isDaemon === true) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Demote a running non-daemon background task to a non-blocking daemon without
+   * cancelling or terminating the underlying process.
+   */
+  markBackgroundTaskAsDaemon(idOrTaskId: string): DetachedBackgroundTask | null {
+    const target = idOrTaskId.trim();
+    if (!target) return null;
+    for (const task of this._detachedBgTasks.values()) {
+      if (task.status !== 'running' || task.isDaemon) continue;
+      if (
+        task.id === target ||
+        task.toolCallId === target ||
+        task.taskId === target ||
+        task.conversationId === target
+      ) {
+        task.isDaemon = true;
+        const entry = this._toolIndex.get(task.toolCallId);
+        if (entry) {
+          this.bumpTurn(this._turns[entry.turnIndex]);
+        }
+        return task;
+      }
+    }
+    return null;
   }
 
   /**
@@ -3314,11 +3431,15 @@ export class TranscriptStore {
    * Cancel or settle all currently running detached background tasks (e.g. when the user
    * presses Stop / `Esc` / `Ctrl+C` during background execution).
    */
-  cancelActiveBackgroundTasks(status: 'cancelled' | 'completed' = 'cancelled'): number {
+  cancelActiveBackgroundTasks(
+    status: 'cancelled' | 'completed' = 'cancelled',
+    options?: { readonly includeDaemons?: boolean },
+  ): number {
     const now = this._now();
+    const includeDaemons = options?.includeDaemons === true;
     let count = 0;
     for (const task of this._detachedBgTasks.values()) {
-      if (task.status === 'running') {
+      if (task.status === 'running' && (includeDaemons || !task.isDaemon)) {
         task.status = status;
         task.endedAt = now;
         if (task.taskId) {
@@ -3419,14 +3540,20 @@ export class TranscriptStore {
       if (rec.status !== 'running') continue;
       if (this._settledTranscriptTaskIds.has(rec.taskId)) continue;
 
-      let alreadyTracked = false;
+      let existingTracked: DetachedBackgroundTask | undefined;
       for (const task of this._detachedBgTasks.values()) {
         if (task.taskId === rec.taskId) {
-          alreadyTracked = true;
+          existingTracked = task;
           break;
         }
       }
-      if (alreadyTracked) continue;
+      if (existingTracked) {
+        if (rec.isDaemon === true && existingTracked.status === 'running' && !existingTracked.isDaemon) {
+          existingTracked.isDaemon = true;
+          changed = true;
+        }
+        continue;
+      }
 
       const matched = this.findMatchingInFlightToolForTranscriptTask(rec);
       if (matched) {
@@ -3444,12 +3571,14 @@ export class TranscriptStore {
           firstStringField(inputRec, ['CommandLine', 'command', 'cmd', 'script']) ||
           (matched.tool.title.toLowerCase() !== 'bash' ? matched.tool.title : undefined);
         const label = collapseSingleLine(command ?? matched.tool.title ?? rec.taskId, 88);
+        const isDaemon = Boolean(rec.isDaemon || isToolDaemon(matched.tool) || existing?.isDaemon);
         this._detachedBgTasks.set(matched.tool.toolCallId, {
           id: matched.tool.toolCallId,
           toolCallId: matched.tool.toolCallId,
           taskId: rec.taskId,
           type: jobType,
           ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
+          ...(isDaemon ? { isDaemon: true } : {}),
           label,
           ...(command ? { command } : {}),
           ...(matched.tool.title && matched.tool.title !== command ? { title: matched.tool.title } : {}),
@@ -3465,10 +3594,12 @@ export class TranscriptStore {
         // 1. Bind rec.taskId to an unlabeled running non-subagent detached task if present
         const targetTask = this.findMatchingUnlabeledRunningTask(rec, false);
         if (targetTask) {
+          const isDaemon = Boolean(rec.isDaemon || targetTask.isDaemon);
           this._detachedBgTasks.set(targetTask.id, {
             ...targetTask,
             taskId: rec.taskId,
             ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
+            ...(isDaemon ? { isDaemon: true } : {}),
           });
           this.syncToolBackgroundState(targetTask.toolCallId, true, rec.taskId);
           changed = true;
@@ -3513,6 +3644,7 @@ export class TranscriptStore {
           taskId: rec.taskId,
           type: rec.scheduleKind ? 'schedule' : 'bash',
           ...(rec.scheduleKind ? { scheduleKind: rec.scheduleKind } : {}),
+          ...(rec.isDaemon ? { isDaemon: true } : {}),
           label,
           ...(rec.description ? { command: rec.description } : {}),
           startedAt: rec.startedAt ?? this._now(),
@@ -3544,6 +3676,7 @@ export class TranscriptStore {
     const running: BackgroundJobItem[] = [];
     const recent: BackgroundJobItem[] = [];
     let runningJobCount = 0;
+    let runningDaemonCount = 0;
     let runningSubagentCount = 0;
     let runningSwarmAgentCount = 0;
     let inspectableAgentCount = 0;
@@ -3555,11 +3688,16 @@ export class TranscriptStore {
       detachedToolCallIds.add(task.toolCallId);
       const isRunning = task.status === 'running';
       if (isRunning) {
-        detachedTaskCount += 1;
-        if (task.agentKind === 'subagent') {
-          runningSubagentCount += 1;
-        } else {
+        if (task.isDaemon) {
+          runningDaemonCount += 1;
           runningJobCount += 1;
+        } else {
+          detachedTaskCount += 1;
+          if (task.agentKind === 'subagent') {
+            runningSubagentCount += 1;
+          } else {
+            runningJobCount += 1;
+          }
         }
       }
       if (task.agentKind === 'subagent') {
@@ -3578,6 +3716,7 @@ export class TranscriptStore {
         ...(task.command ? { command: task.command } : {}),
         ...(task.title ? { title: task.title } : {}),
         outputText: task.outputText,
+        ...(task.isDaemon ? { isDaemon: true } : {}),
         startedAt: task.startedAt,
         ...(task.endedAt !== undefined ? { endedAt: task.endedAt } : {}),
         ...(tookMs !== undefined ? { tookMs } : {}),
@@ -3721,19 +3860,22 @@ export class TranscriptStore {
 
     const runningJobSummaries = running
       .filter((j) => j.agentId === undefined)
-      .map((j) => `${j.type}: ${collapseSingleLine(j.label, 64)}`);
+      .map((j) => `${j.isDaemon ? '[daemon] ' : ''}${j.type}: ${collapseSingleLine(j.label, 64)}`);
+    const hasBlockingRunning = running.some((j) => !j.isDaemon);
 
     return {
       running,
       recent: cappedRecent,
       all: [...running, ...cappedRecent],
       runningJobCount,
+      runningDaemonCount,
       runningSubagentCount,
       runningSwarmAgentCount,
       runningAgentCount: runningSubagentCount + runningSwarmAgentCount,
       inspectableAgentCount,
       detachedTaskCount,
-      hasActiveBackgroundTasks: detachedTaskCount > 0 || running.length > 0 || this.hasActiveBackgroundTasks(),
+      hasActiveBackgroundTasks:
+        detachedTaskCount > 0 || hasBlockingRunning || this.hasActiveBackgroundTasks(),
       runningJobSummaries,
     };
   }
@@ -4661,6 +4803,8 @@ export class TranscriptStore {
       if (action === 'list') {
         if (NO_RUNNING_BG_TASKS_RE.test(outText)) {
           settleAllRunningNonSubagent('completed');
+        } else {
+          this.reconcileManageTaskListOutput(outText);
         }
         return;
       }
@@ -4668,7 +4812,7 @@ export class TranscriptStore {
       if (action === '') {
         if (NO_RUNNING_BG_TASKS_RE.test(outText)) {
           settleAllRunningNonSubagent('completed');
-        } else if (effectiveTaskId) {
+        } else if (!this.reconcileManageTaskListOutput(outText) && effectiveTaskId) {
           const terminal = inferTerminalBgStatusFromText(outText);
           if (terminal) {
             this.completeBackgroundTask(effectiveTaskId, terminal);
@@ -4703,8 +4847,10 @@ export class TranscriptStore {
       } else if (tool.status === 'done' && existingDetached.awaitingToolCompletion) {
         const handoff = detectDetachedBackgroundTask(tool, turnIndex);
         if (handoff && !(handoff.taskId && this._settledTranscriptTaskIds.has(handoff.taskId))) {
+          const isDaemon = Boolean(handoff.isDaemon || existingDetached.isDaemon);
           this._detachedBgTasks.set(tool.toolCallId, {
             ...handoff,
+            ...(isDaemon ? { isDaemon: true } : {}),
             startedAt: existingDetached.startedAt,
           });
           this.syncToolBackgroundState(tool.toolCallId, true, handoff.taskId);
@@ -4756,6 +4902,41 @@ export class TranscriptStore {
         this.syncToolBackgroundState(task.toolCallId, false, task.taskId);
       }
     }
+  }
+
+  private reconcileManageTaskListOutput(outText: string): boolean {
+    const listed = parseManageTaskListOutput(outText);
+    if (listed === null) return false;
+    const listedMap = new Map(listed.map((item) => [item.taskId, item]));
+    const now = this._now();
+    for (const task of this._detachedBgTasks.values()) {
+      if (task.status !== 'running' || task.agentKind === 'subagent') continue;
+      if (task.taskId) {
+        const match = listedMap.get(task.taskId);
+        if (match) {
+          if (match.isDaemon && !task.isDaemon) {
+            task.isDaemon = true;
+          }
+        } else {
+          task.status = 'completed';
+          task.endedAt = now;
+          this._settledTranscriptTaskIds.add(task.taskId);
+          this.syncToolBackgroundState(task.toolCallId, false, task.taskId, 'completed');
+        }
+      } else if (
+        listed.length === 1 &&
+        listed[0]?.isDaemon &&
+        matchesDescriptionFields([task.command, task.title, task.label], listed[0].description)
+      ) {
+        this._detachedBgTasks.set(task.id, {
+          ...task,
+          taskId: listed[0].taskId,
+          isDaemon: true,
+        });
+        this.syncToolBackgroundState(task.toolCallId, true, listed[0].taskId);
+      }
+    }
+    return true;
   }
 
   private matchesToolCommandDescription(
@@ -4929,6 +5110,8 @@ export class TranscriptStore {
       rawName === 'subagent' ||
       tool.title.toLowerCase().includes('invoke_subagent');
 
+    const isDaemon = isToolDaemon(tool);
+
     this._detachedBgTasks.set(tool.toolCallId, {
       id: tool.toolCallId,
       toolCallId: tool.toolCallId,
@@ -4937,6 +5120,7 @@ export class TranscriptStore {
       ...(command ? { command } : {}),
       ...(tool.title && tool.title !== command ? { title: tool.title } : {}),
       ...(isSubagent ? { agentKind: 'subagent' as const } : {}),
+      ...(isDaemon ? { isDaemon: true } : {}),
       startedAt: tool.startedAt,
       turnIndex,
       status: 'running',
@@ -4951,7 +5135,7 @@ export class TranscriptStore {
     const now = this._now();
 
     if (/\bAll\s+your\s+subagents\s+and\s+background\s+tasks\s+have\s+been\s+stopped\b/i.test(text)) {
-      this.cancelActiveBackgroundTasks('cancelled');
+      this.cancelActiveBackgroundTasks('cancelled', { includeDaemons: true });
       return;
     }
 

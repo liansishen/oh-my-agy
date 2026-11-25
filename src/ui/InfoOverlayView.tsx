@@ -29,6 +29,7 @@ export interface InfoOverlayCallbacks {
   readonly onOpenSettings?: () => void;
   readonly onSelectJob?: (jobId: string) => void;
   readonly onStopJob?: () => void;
+  readonly onDetachJob?: (jobId: string) => void;
 }
 
 export interface InfoOverlayViewProps {
@@ -261,6 +262,12 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
         ],
       });
     }
+    if (selected.isDaemon) {
+      facts.push({
+        k: [{ t: 'Mode', s: 'muted' }],
+        v: [{ t: 'daemon (non-blocking)', s: 'muted' }],
+      });
+    }
     if (selected.agentKind) {
       facts.push({
         k: [{ t: 'Agent', s: 'muted' }],
@@ -339,7 +346,10 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
                         : 0))
                     : Math.max(0, now - job.startedAt);
                   const oneLineLabel = job.label.replace(/\s+/g, ' ').trim();
-                  const statusText = JOB_STATUS_LABEL[job.status];
+                  const statusText =
+                    job.status === 'running' && job.isDaemon
+                      ? 'Daemon'
+                      : JOB_STATUS_LABEL[job.status];
                   return (
                     <item
                       key={key}
@@ -368,7 +378,13 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
                   wrap="none"
                   spans={[
                     JOB_STATUS_GLYPH[selected.status],
-                    { t: ` ${JOB_STATUS_LABEL[selected.status]}` },
+                    {
+                      t: ` ${
+                        selected.status === 'running' && selected.isDaemon
+                          ? 'Daemon'
+                          : JOB_STATUS_LABEL[selected.status]
+                      }`,
+                    },
                   ]}
                 />
                 {!settled ? (
@@ -396,7 +412,18 @@ export function InfoOverlayView(props: InfoOverlayViewProps): JSX.Element {
                   truncate="end"
                 />
                 <spacer key="sp" grow={1} />
-                {!settled && state.isStreaming && callbacks.onStopJob ? (
+                {!settled && !selected.isDaemon && !state.isStreaming && callbacks.onDetachJob ? (
+                  <button
+                    key="detach"
+                    role="omp.btn"
+                    keys={['d']}
+                    actions={{ click: 'job.detach' }}
+                    onClick={() => callbacks.onDetachJob?.(selected.id)}
+                  >
+                    Detach
+                  </button>
+                ) : null}
+                {!settled && (state.isStreaming || (!selected.isDaemon && state.isBusy)) && callbacks.onStopJob ? (
                   <button
                     key="stop"
                     role="omp.btn"

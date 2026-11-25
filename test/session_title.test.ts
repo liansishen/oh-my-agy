@@ -166,6 +166,7 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
     expect(capture.oscTitles).toEqual(['oma · Antigravity']);
 
     // 1. Backend pushes auto title -> updates store, OSC 2, and PreviewStore with titleSource='auto'
+    const streamBeforeAuto = capture.getRawStream().length;
     ctx.acp.sendUpdate('sess-title-1', {
       sessionUpdate: 'session_info_update',
       title: 'Fix Auth Flow',
@@ -177,6 +178,9 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
     );
     expect(ctx.controller.store.getState().sessionTitleSource).toBe('auto');
     expect(capture.oscTitles).toEqual(['oma · Antigravity', 'Fix Auth Flow']);
+    expect(capture.getRawStream().slice(streamBeforeAuto)).toContain(
+      `\x1b]2;Fix Auth Flow\x1b\\${HIDE_CURSOR}`,
+    );
     expect((await ctx.previewStore.load('sess-title-1'))?.title).toBe('Fix Auth Flow');
 
     // Duplicate identical session_info_update does not emit redundant OSC 2 sequence
@@ -187,7 +191,8 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
     await Bun.sleep(30);
     expect(capture.oscTitles).toEqual(['oma · Antigravity', 'Fix Auth Flow']);
 
-    // 2. /rename locks title locally with control chars stripped
+    // 2. /rename locks title locally with control chars stripped and keeps HIDE_CURSOR atomic
+    const streamBeforeRename = capture.getRawStream().length;
     await ctx.controller.submitInput('/rename Custom\nFocus\x1bTitle');
     expect(ctx.controller.store.getState().sessionTitle).toBe('Custom FocusTitle');
     expect(ctx.controller.store.getState().sessionTitleSource).toBe('user');
@@ -196,6 +201,9 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
       'Fix Auth Flow',
       'Custom FocusTitle',
     ]);
+    expect(capture.getRawStream().slice(streamBeforeRename)).toContain(
+      `\x1b]2;Custom FocusTitle\x1b\\${HIDE_CURSOR}`,
+    );
     const lockedAnchor = await ctx.previewStore.load('sess-title-1');
     expect(lockedAnchor?.title).toBe('Custom FocusTitle');
     expect(lockedAnchor?.titleSource).toBe('user');
@@ -219,14 +227,18 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
     expect(resetAnchor?.title).toBe('Later Backend Summary');
     expect(resetAnchor?.titleSource).toBe('auto');
 
-    // 4. /new resets terminal title back to default and clears user lock
+    // 4. /new resets terminal title back to default (with atomic HIDE_CURSOR) and clears user lock
     await ctx.controller.submitInput('/title Locked Before New');
     expect(ctx.controller.store.getState().sessionTitleSource).toBe('user');
+    const streamBeforeNew = capture.getRawStream().length;
     await ctx.controller.submitInput('/new');
     await waitFor(() => ctx.controller.store.getState().sessionId === 'sess-title-2');
     expect(ctx.controller.store.getState().sessionTitle).toBeNull();
     expect(ctx.controller.store.getState().sessionTitleSource).toBeNull();
     expect(capture.oscTitles[capture.oscTitles.length - 1]).toBe('oma · Antigravity');
+    expect(capture.getRawStream().slice(streamBeforeNew)).toContain(
+      `\x1b]2;oma · Antigravity\x1b\\${HIDE_CURSOR}`,
+    );
 
     // Auto updates work again on the fresh session
     ctx.acp.sendUpdate('sess-title-2', {
@@ -326,6 +338,26 @@ describe('Controller dynamic OSC terminal title & local /rename', () => {
 
     const afterLoginStream = capture.getRawStream().slice(streamLenBeforeLogin);
     expect(afterLoginStream).toContain(`\x1b]2;Active Before Login\x1b\\${HIDE_CURSOR}`);
+
+    await ctx.shutdown();
+  });
+
+  test('re-asserts HIDE_CURSOR on TSP focus events after the throttle window', async () => {
+    let clock = 50_000;
+    const capture = createTitleCaptureHost();
+    const ctx = await createTestController({
+      host: capture.base,
+      newSessionId: 'sess-focus-cursor',
+      controllerOptions: {
+        now: () => clock,
+      },
+    });
+
+    await ctx.boot();
+    clock += 300;
+    const beforeFocus = capture.getRawStream().length;
+    capture.base.input.emitTspEvent({ ev: 'focus', sf: 'oma', id: 'dock.composer.line.input' });
+    await waitFor(() => capture.getRawStream().slice(beforeFocus).includes(HIDE_CURSOR));
 
     await ctx.shutdown();
   });

@@ -1897,7 +1897,7 @@ export class AppController {
         }
       }
       if (settledAny) {
-        this.osc.reassertCursorHidden();
+        this.osc.reassertCursorHidden({ force: true });
       }
       this.#drainPendingReplayedServerRequests(bufferedRequests, loaded.sessionId, loadEpoch);
       this.#ensureSwarmWatcher(loaded.sessionId, { forceRestart: true });
@@ -2678,12 +2678,14 @@ export class AppController {
       if (this.store.getFocusMode() !== prevMode) {
         this.scheduler.renderNow();
       }
+      this.osc.reassertCursorHidden();
       return;
     }
     if (this.store.getFocusMode() !== prevMode) {
       this.scheduler.renderNow();
       this.syncFocus();
     }
+    this.osc.reassertCursorHidden();
   }
 
   /**
@@ -2771,10 +2773,29 @@ export class AppController {
           }
           return;
         }
+        if (name === 'd' && !key.ctrl && !key.alt && !key.meta) {
+          const selected =
+            items.find(j => j.id === state.infoOverlay?.selectedJobId) ?? items[0];
+          if (
+            selected &&
+            selected.status === 'running' &&
+            selected.endedAt === undefined &&
+            !selected.isDaemon &&
+            !state.isStreaming
+          ) {
+            this.#detachBackgroundJob(selected.id);
+          }
+          return;
+        }
         if (name === 'x' && !key.ctrl && !key.alt && !key.meta) {
           const selected =
             items.find(j => j.id === state.infoOverlay?.selectedJobId) ?? items[0];
-          if (selected && selected.status === 'running' && selected.endedAt === undefined && state.isBusy) {
+          if (
+            selected &&
+            selected.status === 'running' &&
+            selected.endedAt === undefined &&
+            (state.isStreaming || (!selected.isDaemon && state.isBusy))
+          ) {
             await this.cancelPendingAndTurn();
           }
           return;
@@ -4374,7 +4395,7 @@ export class AppController {
           this.scheduler.renderNow();
           if (!stillBusy && finishedTurn) {
             this.scheduler.settleTurn(finishedTurn.index);
-            this.osc.reassertCursorHidden();
+            this.osc.reassertCursorHidden({ force: true });
           }
 
           if (stillBusy) {
@@ -4627,6 +4648,47 @@ export class AppController {
     this.#clearToolWatchTimer();
     this.scheduler.renderNow();
     this.syncFocus();
+  }
+
+  #detachBackgroundJob(jobId: string): void {
+    const detached = this.store.transcript.markBackgroundTaskAsDaemon(jobId);
+    if (!detached) return;
+
+    if (!this.store.isBusy && !this.store.getState().isStreaming) {
+      this.#pendingBackgroundDone = false;
+      this.#awaitingPostToolWakeup = false;
+      this.#backgroundResumeAnchorStepSeq = 0;
+      this.#backgroundWaitLastProgressAt = 0;
+      this.#workingStartedAt = undefined;
+      this.#clearBackgroundDoneTimer();
+
+      const finalizedTurn = this.store.transcript.finalizeBackgroundTurn({
+        autoCollapseThought: this.store.autoCollapseThought,
+        expandAllTools: this.store.getState().expandAllTools,
+        terminalToolStatus: 'done',
+        terminalTurnStatus: 'done',
+      });
+      if (this.#metricsTracker.isStreaming) {
+        const endedSnap = this.#metricsTracker.endStreamTurn();
+        this.#applySessionMetricsSnapshot(endedSnap);
+      }
+      const settleIdx = finalizedTurn?.index ?? this.#deferredSettleTurnIndex;
+      this.#deferredSettleTurnIndex = null;
+      this.scheduler.renderNow();
+      if (settleIdx !== null) {
+        this.scheduler.settleTurn(settleIdx);
+        this.osc.reassertCursorHidden({ force: true });
+      }
+      if (!this.store.approvals.hasPending() && !this.store.getState().activeQuestion) {
+        this.osc.setStatusIdle();
+      }
+    }
+
+    this.#syncToolWatchTimer();
+    this.store.pushToast(`Detached "${detached.label}" as background daemon`, 'info', {
+      ttl: 2500,
+    });
+    this.scheduler.renderNow();
   }
 
   #getSwarmPathOptions(): SwarmPathOptions {
@@ -7998,7 +8060,11 @@ export class AppController {
     if (!options?.force && nextTitle === this.#lastEmittedTerminalTitle) {
       return;
     }
-    this.osc.setTitle(nextTitle);
+    if (this.osc.cursorHidden) {
+      this.osc.setTitleAndHideCursor(nextTitle);
+    } else {
+      this.osc.setTitle(nextTitle);
+    }
     this.#lastEmittedTerminalTitle = nextTitle;
   }
 
@@ -8214,7 +8280,7 @@ export class AppController {
         this.scheduler.renderNow();
         if (settleIdx !== null) {
           this.scheduler.settleTurn(settleIdx);
-          this.osc.reassertCursorHidden();
+          this.osc.reassertCursorHidden({ force: true });
         }
         if (!this.store.approvals.hasPending() && !state.activeQuestion) {
           this.osc.setStatusDone();
@@ -8240,6 +8306,7 @@ export class AppController {
       !this.store.getState().isReplaying &&
       (this.store.transcript.hasInFlightToolCall() ||
         this.store.hasActiveBackgroundTasks() ||
+        this.store.transcript.hasRunningDaemonTasks() ||
         this.#pendingBackgroundDone);
     if (!shouldWatch) {
       this.#clearToolWatchTimer();
@@ -8256,6 +8323,7 @@ export class AppController {
         this.store.getState().isReplaying ||
         (!this.store.transcript.hasInFlightToolCall() &&
           !this.store.hasActiveBackgroundTasks() &&
+          !this.store.transcript.hasRunningDaemonTasks() &&
           !this.#pendingBackgroundDone)
       ) {
         this.#clearToolWatchTimer();
@@ -9256,6 +9324,9 @@ export class AppController {
           },
           onStopJob: () => {
             void this.cancelPendingAndTurn();
+          },
+          onDetachJob: jobId => {
+            this.#detachBackgroundJob(jobId);
           },
         },
       },
