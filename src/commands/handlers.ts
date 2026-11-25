@@ -52,6 +52,7 @@ export type CommandAction =
   | { readonly type: 'set_thinking_display'; readonly mode: 'on' | 'off' | 'toggle' }
   | { readonly type: 'set_mode'; readonly mode: string }
   | { readonly type: 'todo'; readonly argsText: string }
+  | { readonly type: 'rename_session'; readonly title: string }
   | { readonly type: 'open_help' }
   | { readonly type: 'quit' }
   | {
@@ -101,6 +102,7 @@ export interface CommandActionExecutor {
   setThinkingDisplay?(mode: 'on' | 'off' | 'toggle'): void | Promise<void>;
   setMode(mode: string): void | Promise<void>;
   handleTodo?(argsText: string): void | Promise<void>;
+  renameSession?(title: string): void | Promise<void>;
   openHelp(): void | Promise<void>;
   quit(): void | Promise<void>;
   passthroughPrompt(text: string, commandName: string, source: 'oma' | 'agy'): void | Promise<void>;
@@ -414,6 +416,8 @@ function buildBuiltinAction(
       return { type: 'open_git' };
     case 'todo':
       return { type: 'todo', argsText: parsed.argsText };
+    case 'rename':
+      return { type: 'rename_session', title: parsed.argsText };
   }
 }
 
@@ -494,6 +498,9 @@ export async function executeCommandAction(
       return;
     case 'todo':
       await executor.handleTodo?.(action.argsText);
+      return;
+    case 'rename_session':
+      await executor.renameSession?.(action.title);
       return;
     case 'open_help':
       await executor.openHelp();

@@ -16,11 +16,14 @@ export interface PersistedSessionTodoState {
   readonly source?: 'auto' | 'user';
 }
 
+export type SessionTitleSource = 'auto' | 'user';
+
 export interface SessionAnchorRecord {
   readonly version: 1;
   readonly sessionId: string;
   readonly cwd: string;
   readonly title: string;
+  readonly titleSource?: SessionTitleSource;
   readonly model?: string;
   readonly thoughtLevel?: string;
   readonly mode?: string;
@@ -248,6 +251,9 @@ export function parseSessionAnchorJson(raw: unknown): SessionAnchorRecord | null
 
   const cwd = typeof obj['cwd'] === 'string' ? obj['cwd'] : '';
   const title = typeof obj['title'] === 'string' ? obj['title'] : '';
+  const rawTitleSource = obj['titleSource'];
+  const titleSource: SessionTitleSource | undefined =
+    rawTitleSource === 'auto' || rawTitleSource === 'user' ? rawTitleSource : undefined;
   const updatedAt =
     typeof obj['updatedAt'] === 'string' && obj['updatedAt'].trim().length > 0
       ? obj['updatedAt']
@@ -272,6 +278,7 @@ export function parseSessionAnchorJson(raw: unknown): SessionAnchorRecord | null
     sessionId,
     cwd,
     title,
+    ...(titleSource !== undefined ? { titleSource } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(thoughtLevel !== undefined ? { thoughtLevel } : {}),
     ...(mode !== undefined ? { mode } : {}),
@@ -445,6 +452,9 @@ export async function saveSessionPreview(
     sessionId: input.sessionId.trim(),
     cwd: input.cwd,
     title: input.title,
+    ...(input.titleSource === 'auto' || input.titleSource === 'user'
+      ? { titleSource: input.titleSource }
+      : {}),
     ...(input.model ? { model: input.model } : {}),
     ...(input.thoughtLevel ? { thoughtLevel: input.thoughtLevel } : {}),
     ...(input.mode ? { mode: input.mode } : {}),

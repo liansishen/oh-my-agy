@@ -50,6 +50,7 @@ import {
   detectCompletionTrigger,
   type CompletionTrigger,
 } from '../editor/trigger';
+import type { SessionTitleSource } from '../preview/store';
 import type { SwarmBoardMessage, SwarmBoardSnapshot } from '../swarm/board';
 import { ApprovalQueue } from './approval';
 import { areGitStatusEqual, type GitStatusSnapshot } from './git_status';
@@ -76,7 +77,20 @@ import {
   type TranscriptUpdateOutcome,
 } from './transcript';
 
-export type { SettingsPageId };
+export type { SessionTitleSource, SettingsPageId };
+
+/**
+ * Strips C0/DEL/C1 control characters and collapses whitespace/newlines in
+ * session titles so terminal titles and UI labels remain single-line.
+ */
+export function normalizeSessionTitle(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
 
 // ---------------------------------------------------------------------------
 // Focus State Machine
@@ -422,6 +436,7 @@ export interface SessionSnapshotInput {
   readonly sessionId: string;
   readonly cwd?: string;
   readonly title?: string | null;
+  readonly titleSource?: SessionTitleSource | null;
   readonly configOptions?: ConfigOption[];
   readonly models?: SessionModelState;
   readonly modes?: SessionModeState;
@@ -462,6 +477,7 @@ export interface AppState {
   readonly desiredSurfaceFocus: string | null;
   readonly sessionId: string | null;
   readonly sessionTitle: string | null;
+  readonly sessionTitleSource: SessionTitleSource | null;
   readonly cwd: string;
   readonly displayCwd: string;
   readonly agentInfo?: ImplementationInfo;
@@ -619,6 +635,7 @@ export class AppStore {
   private _sessionPhase: 'none' | 'creating' | 'replaying' | 'ready' = 'none';
   private _sessionId: string | null = null;
   private _sessionTitle: string | null = null;
+  private _sessionTitleSource: SessionTitleSource | null = null;
   private _cwd: string;
   private _agentInfo: ImplementationInfo | undefined;
   private _agentVersion: string | undefined;
@@ -1131,6 +1148,7 @@ export class AppStore {
       desiredSurfaceFocus: this.getDesiredSurfaceFocus(),
       sessionId: this._sessionId,
       sessionTitle: this._sessionTitle,
+      sessionTitleSource: this._sessionTitleSource,
       cwd: this._cwd,
       displayCwd: normalizeDisplayPath(this._cwd),
       ...(this._agentInfo ? { agentInfo: this._agentInfo } : {}),
@@ -1296,6 +1314,25 @@ export class AppStore {
     }
   }
 
+  setSessionTitle(
+    title: string | null,
+    source: SessionTitleSource | null = 'user',
+    options?: { readonly force?: boolean },
+  ): boolean {
+    if (!options?.force && source === 'auto' && this._sessionTitleSource === 'user') {
+      return false;
+    }
+    const nextTitle = normalizeSessionTitle(title);
+    const nextSource: SessionTitleSource | null = nextTitle !== null ? (source ?? 'user') : null;
+    if (this._sessionTitle === nextTitle && this._sessionTitleSource === nextSource) {
+      return false;
+    }
+    this._sessionTitle = nextTitle;
+    this._sessionTitleSource = nextSource;
+    this.emit();
+    return true;
+  }
+
   applySessionSnapshot(snapshot: SessionSnapshotInput): void {
     this._sessionId = snapshot.sessionId;
     if (this._sessionPhase === 'none') {
@@ -1304,8 +1341,16 @@ export class AppStore {
     if (snapshot.cwd !== undefined) {
       this._cwd = snapshot.cwd;
     }
-    if (snapshot.title !== undefined) {
-      this._sessionTitle = snapshot.title;
+    if (snapshot.titleSource === 'user') {
+      const next = normalizeSessionTitle(snapshot.title);
+      this._sessionTitle = next;
+      this._sessionTitleSource = next !== null ? 'user' : null;
+    } else if (snapshot.title !== undefined && this._sessionTitleSource !== 'user') {
+      const incoming = normalizeSessionTitle(snapshot.title);
+      if (!this._sessionTitle && incoming !== null) {
+        this._sessionTitle = incoming;
+        this._sessionTitleSource = snapshot.titleSource ?? 'auto';
+      }
     }
     if (snapshot.configOptions !== undefined) {
       this._configOptions = [...snapshot.configOptions];
@@ -1406,7 +1451,16 @@ export class AppStore {
       this.updateConfigOptions(outcome.configOptions);
     }
     if (outcome.sessionInfo && outcome.sessionInfo.title !== undefined) {
-      this._sessionTitle = outcome.sessionInfo.title;
+      if (this._sessionTitleSource !== 'user') {
+        const incoming = normalizeSessionTitle(outcome.sessionInfo.title);
+        if (incoming !== null) {
+          this._sessionTitle = incoming;
+          this._sessionTitleSource = 'auto';
+        } else if (outcome.sessionInfo.title === null) {
+          this._sessionTitle = null;
+          this._sessionTitleSource = null;
+        }
+      }
     }
 
     // Automatically enter swarm mode hint if a `swarm` tool call is observed in live stream
@@ -1466,6 +1520,7 @@ export class AppStore {
     this._usage = null;
     this._sessionMetrics = null;
     this._sessionTitle = null;
+    this._sessionTitleSource = null;
     this._isStreaming = false;
     this._pendingAttachments = [];
     this._completion = EMPTY_COMPLETION;
