@@ -797,6 +797,486 @@ export async function listAgents(
 }
 
 // ---------------------------------------------------------------------------
+// Usage Quota (`agy -p /usage`)
+// ---------------------------------------------------------------------------
+
+export interface UsageQuotaBucket {
+  readonly id?: string;
+  readonly name: string;
+  readonly window?: 'weekly' | '5h' | (string & {});
+  readonly description?: string;
+  /** Remaining quota fraction clamped to `[0, 1]`. */
+  readonly remainingFraction: number;
+  /** Remaining percentage rounded to 2 decimal places in `[0, 100]`. */
+  readonly remainingPercent: number;
+  /** Raw reset timestamp string (omitted for epoch-zero / unset sentinel values). */
+  readonly resetTime?: string;
+  /** Parsed reset epoch ms when valid and after 1970-01-01. */
+  readonly resetAtMs?: number;
+}
+
+export interface UsageQuotaGroup {
+  readonly name: string;
+  readonly description?: string;
+  readonly buckets: readonly UsageQuotaBucket[];
+}
+
+export interface UsageQuotaSnapshot {
+  readonly description?: string;
+  readonly groups: readonly UsageQuotaGroup[];
+  readonly fetchedAt: number;
+}
+
+export interface FetchUsageQuotaResult {
+  readonly ok: boolean;
+  readonly quota: UsageQuotaSnapshot | null;
+  readonly rawOutput: string;
+  readonly error?: string;
+}
+
+const DEFAULT_USAGE_TIMEOUT_MS = 20_000;
+const DEFAULT_VERSION_PROBE_TIMEOUT_MS = 800;
+
+/**
+ * Extracts a semver-like `agy` version string from `agy --version` stdout.
+ */
+export function parseAgyVersionOutput(stdout: string): string | undefined {
+  const clean = stripAnsi(stdout).trim();
+  if (!clean) return undefined;
+  const match = /\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(clean);
+  return match?.[1];
+}
+
+/**
+ * Quickly probes `agy --version` during CLI startup so the welcome screen can
+ * display the installed `agy` version immediately before ACP finishes booting.
+ */
+export async function probeAgyVersion(
+  agyBin?: string,
+  options: EcosystemCliOptions = {},
+): Promise<string | undefined> {
+  const exec = options.execCommand ?? defaultExecCommand;
+  const bin = resolveBin(agyBin);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERSION_PROBE_TIMEOUT_MS;
+  try {
+    const res = await exec([bin, '--version'], {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs,
+    });
+    if (res.exitCode !== 0) return undefined;
+    return parseAgyVersionOutput(res.stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+function isUnambiguousResetTimestamp(value: string): boolean {
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) {
+    return true;
+  }
+  if (/(?:Z|[+-]\d{2}:?\d{2}|\b(?:UTC|GMT))$/i.test(value)) {
+    return true;
+  }
+  return /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(value);
+}
+
+function parseQuotaResetTime(raw: string | undefined): {
+  readonly resetTime?: string;
+  readonly resetAtMs?: number;
+} {
+  const trimmed = raw?.trim();
+  if (!trimmed || trimmed.startsWith('1970-01-01')) {
+    return {};
+  }
+  if (!isUnambiguousResetTimestamp(trimmed)) {
+    return { resetTime: trimmed };
+  }
+  const parsedMs = Date.parse(trimmed);
+  if (Number.isFinite(parsedMs)) {
+    if (parsedMs <= 86_400_000) {
+      return {};
+    }
+    return { resetTime: trimmed, resetAtMs: parsedMs };
+  }
+  return { resetTime: trimmed };
+}
+
+function inferQuotaWindow(name: string): 'weekly' | '5h' | undefined {
+  if (/weekly/i.test(name)) return 'weekly';
+  if (/five\s*hour|5[\s-]*h/i.test(name)) return '5h';
+  return undefined;
+}
+
+function parseQuotaPercentToken(raw: string): number | null {
+  const match = /^(\d+(?:\.\d+)?)\s*%$/.exec(raw.trim());
+  if (!match?.[1]) return null;
+  const pct = Number(match[1]);
+  return Number.isFinite(pct) ? pct : null;
+}
+
+function clampQuotaFraction(fraction: number): number {
+  if (!Number.isFinite(fraction)) return 0;
+  return Math.min(1, Math.max(0, fraction));
+}
+
+function parseUsageQuotaTextLines(text: string, nowMs: number): UsageQuotaSnapshot | null {
+  const clean = stripAnsi(text).trim();
+  if (!clean) return null;
+
+  const groupOrder: string[] = [];
+  const bucketsByGroup = new Map<string, UsageQuotaBucket[]>();
+
+  for (const rawLine of clean.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^quota:?$/i.test(line) || /^[-─═]+$/.test(line)) {
+      continue;
+    }
+
+    let groupName = '';
+    let bucketName = '';
+    let pct: number | null = null;
+    let resetRaw: string | undefined;
+
+    if (line.includes('\t')) {
+      const cols = line.split('\t').map((c) => c.trim());
+      if (cols.length >= 3) {
+        groupName = cols[0] ?? '';
+        bucketName = cols[1] ?? '';
+        pct = parseQuotaPercentToken(cols[2] ?? '');
+        resetRaw = cols.slice(3).join(' ').trim() || undefined;
+      }
+    } else {
+      const cols = line.split(/\s{2,}/).map((c) => c.trim()).filter(Boolean);
+      if (cols.length >= 3) {
+        groupName = cols[0] ?? '';
+        bucketName = cols[1] ?? '';
+        pct = parseQuotaPercentToken(cols[2] ?? '');
+        resetRaw = cols.slice(3).join(' ').trim() || undefined;
+      } else {
+        const inlineMatch = /^(.+?)\s{2,}(.+?)\s+(\d+(?:\.\d+)?%)(?:\s+(.+))?$/.exec(line);
+        if (inlineMatch) {
+          groupName = inlineMatch[1]!.trim();
+          bucketName = inlineMatch[2]!.trim();
+          pct = parseQuotaPercentToken(inlineMatch[3]!);
+          resetRaw = inlineMatch[4]?.trim() || undefined;
+        }
+      }
+    }
+
+    if (!groupName || !bucketName || pct === null) {
+      continue;
+    }
+
+    const remainingFraction = clampQuotaFraction(pct / 100);
+    const remainingPercent = Math.round(remainingFraction * 10_000) / 100;
+    const windowKind = inferQuotaWindow(bucketName);
+    const { resetTime, resetAtMs } = parseQuotaResetTime(resetRaw);
+
+    let list = bucketsByGroup.get(groupName);
+    if (!list) {
+      list = [];
+      bucketsByGroup.set(groupName, list);
+      groupOrder.push(groupName);
+    }
+    list.push({
+      name: bucketName,
+      ...(windowKind ? { window: windowKind } : {}),
+      remainingFraction,
+      remainingPercent,
+      ...(resetTime !== undefined ? { resetTime } : {}),
+      ...(resetAtMs !== undefined ? { resetAtMs } : {}),
+    });
+  }
+
+  if (groupOrder.length === 0) return null;
+  const groups: UsageQuotaGroup[] = groupOrder.map((name) => ({
+    name,
+    buckets: bucketsByGroup.get(name) ?? [],
+  }));
+  return { groups, fetchedAt: nowMs };
+}
+
+function parseUsageQuotaGroupObject(raw: unknown): UsageQuotaGroup | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const name = typeof rec['name'] === 'string' ? rec['name'].trim() : '';
+  if (!name) return null;
+
+  const description =
+    typeof rec['description'] === 'string' && rec['description'].trim()
+      ? rec['description'].trim()
+      : undefined;
+  const rawBuckets = Array.isArray(rec['buckets']) ? rec['buckets'] : [];
+  const buckets: UsageQuotaBucket[] = [];
+
+  for (const item of rawBuckets) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
+    const b = item as Record<string, unknown>;
+    const bucketName = typeof b['name'] === 'string' ? b['name'].trim() : '';
+    const fracRaw = b['remaining_fraction'] ?? b['remainingFraction'];
+    if (!bucketName || typeof fracRaw !== 'number' || !Number.isFinite(fracRaw)) continue;
+
+    const remainingFraction = clampQuotaFraction(fracRaw);
+    const remainingPercent = Math.round(remainingFraction * 10_000) / 100;
+    const id = typeof b['id'] === 'string' && b['id'].trim() ? b['id'].trim() : undefined;
+    const windowRaw = typeof b['window'] === 'string' && b['window'].trim() ? b['window'].trim() : undefined;
+    const windowKind = windowRaw ?? inferQuotaWindow(bucketName);
+    const bucketDesc =
+      typeof b['description'] === 'string' && b['description'].trim()
+        ? b['description'].trim()
+        : undefined;
+    const rawReset =
+      typeof b['reset_time'] === 'string'
+        ? b['reset_time']
+        : typeof b['resetTime'] === 'string'
+          ? b['resetTime']
+          : undefined;
+    const { resetTime, resetAtMs } = parseQuotaResetTime(rawReset);
+
+    buckets.push({
+      ...(id ? { id } : {}),
+      name: bucketName,
+      ...(windowKind ? { window: windowKind } : {}),
+      ...(bucketDesc ? { description: bucketDesc } : {}),
+      remainingFraction,
+      remainingPercent,
+      ...(resetTime !== undefined ? { resetTime } : {}),
+      ...(resetAtMs !== undefined ? { resetAtMs } : {}),
+    });
+  }
+
+  if (buckets.length === 0) return null;
+  return {
+    name,
+    ...(description ? { description } : {}),
+    buckets,
+  };
+}
+
+/**
+ * Parses stdout from `agy -p /usage --output-format json` or plain-text `agy -p /usage`.
+ */
+export function parseUsageQuotaOutput(
+  stdout: string,
+  nowMs = Date.now(),
+): UsageQuotaSnapshot | null {
+  const clean = stripAnsi(stdout).trim();
+  if (!clean) return null;
+
+  let jsonCandidate = clean;
+  if (!clean.startsWith('{')) {
+    const jsonLine = clean
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.startsWith('{') && l.endsWith('}'));
+    if (jsonLine) {
+      jsonCandidate = jsonLine;
+    }
+  }
+
+  if (jsonCandidate.startsWith('{')) {
+    try {
+      const parsed: unknown = JSON.parse(jsonCandidate);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        const rec = parsed as Record<string, unknown>;
+        const command = rec['command'];
+        const data =
+          typeof command === 'object' && command !== null && !Array.isArray(command)
+            ? (command as Record<string, unknown>)['data']
+            : undefined;
+        if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+          const dataRec = data as Record<string, unknown>;
+          const description =
+            typeof dataRec['description'] === 'string' && dataRec['description'].trim()
+              ? dataRec['description'].trim()
+              : undefined;
+          const rawGroups = Array.isArray(dataRec['groups']) ? dataRec['groups'] : [];
+          const groups = rawGroups
+            .map((g) => parseUsageQuotaGroupObject(g))
+            .filter((g): g is UsageQuotaGroup => g !== null);
+          if (groups.length > 0) {
+            return {
+              ...(description ? { description } : {}),
+              groups,
+              fetchedAt: nowMs,
+            };
+          }
+        }
+        if (typeof rec['response'] === 'string' && rec['response'].trim()) {
+          return parseUsageQuotaTextLines(rec['response'], nowMs);
+        }
+        return null;
+      }
+    } catch {
+      // Fall through to plain-text parser
+    }
+  }
+
+  return parseUsageQuotaTextLines(clean, nowMs);
+}
+
+/**
+ * Formats a quota bucket reset timestamp into a concise countdown matching `agy 1.5.17`
+ * (e.g. `in 5d 11h 12m`, `in 2h 49m`, `in 15m`, or `Full`).
+ */
+export function formatQuotaResetCountdown(
+  bucket: Pick<UsageQuotaBucket, 'remainingPercent' | 'resetTime' | 'resetAtMs'>,
+  nowMs = Date.now(),
+): string {
+  if (bucket.resetAtMs === undefined && !bucket.resetTime) {
+    return bucket.remainingPercent >= 100 ? 'Full' : '—';
+  }
+  if (bucket.resetAtMs !== undefined) {
+    const diffMs = bucket.resetAtMs - nowMs;
+    if (diffMs <= 0) {
+      return bucket.remainingPercent >= 100 ? 'Full' : 'Refreshing soon';
+    }
+    const totalMin = Math.ceil(diffMs / 60_000);
+    const days = Math.floor(totalMin / 1440);
+    const hours = Math.floor((totalMin % 1440) / 60);
+    const mins = totalMin % 60;
+    if (days > 0) {
+      return `in ${days}d ${hours}h ${mins}m`;
+    }
+    if (hours > 0) {
+      return `in ${hours}h ${mins}m`;
+    }
+    return `in ${Math.max(1, mins)}m`;
+  }
+  return bucket.resetTime ?? '—';
+}
+
+/**
+ * Formats a quota remaining fraction into a 2-decimal percentage string (e.g. `87.08%`).
+ */
+export function formatQuotaPercent(remainingFraction: number): string {
+  return `${(clampQuotaFraction(remainingFraction) * 100).toFixed(2)}%`;
+}
+
+function padTwoDigits(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * Formats a quota reset epoch timestamp into compact local wall-clock time
+ * (`Today HH:MM`, `MM-DD HH:MM`, or `YYYY-MM-DD HH:MM` across years).
+ */
+export function formatQuotaResetClock(resetAtMs: number, nowMs = Date.now()): string {
+  const resetDate = new Date(resetAtMs);
+  const nowDate = new Date(nowMs);
+  const hhmm = `${padTwoDigits(resetDate.getHours())}:${padTwoDigits(resetDate.getMinutes())}`;
+  const sameYear = resetDate.getFullYear() === nowDate.getFullYear();
+  if (!sameYear) {
+    return `${resetDate.getFullYear()}-${padTwoDigits(resetDate.getMonth() + 1)}-${padTwoDigits(resetDate.getDate())} ${hhmm}`;
+  }
+  const sameDay =
+    resetDate.getMonth() === nowDate.getMonth() &&
+    resetDate.getDate() === nowDate.getDate();
+  if (sameDay) {
+    return `Today ${hhmm}`;
+  }
+  return `${padTwoDigits(resetDate.getMonth() + 1)}-${padTwoDigits(resetDate.getDate())} ${hhmm}`;
+}
+
+export interface QuotaResetDisplay {
+  readonly kind: 'scheduled' | 'refreshing' | 'full' | 'raw' | 'unknown';
+  readonly countdown?: string;
+  readonly localTime?: string;
+  readonly text: string;
+}
+
+/**
+ * Formats a quota bucket's reset state with both relative countdown and local wall-clock time.
+ */
+export function formatQuotaResetDisplay(
+  bucket: Pick<UsageQuotaBucket, 'remainingPercent' | 'resetTime' | 'resetAtMs'>,
+  nowMs = Date.now(),
+): QuotaResetDisplay {
+  if (bucket.resetAtMs !== undefined) {
+    const diffMs = bucket.resetAtMs - nowMs;
+    if (diffMs <= 0) {
+      return bucket.remainingPercent >= 100
+        ? { kind: 'full', text: 'Full' }
+        : { kind: 'refreshing', text: 'Refreshing soon' };
+    }
+    const countdown = formatQuotaResetCountdown(bucket, nowMs);
+    const localTime = formatQuotaResetClock(bucket.resetAtMs, nowMs);
+    return {
+      kind: 'scheduled',
+      countdown,
+      localTime,
+      text: `Resets ${countdown} · ${localTime}`,
+    };
+  }
+  if (bucket.resetTime) {
+    return {
+      kind: 'raw',
+      localTime: bucket.resetTime,
+      text: `Resets ${bucket.resetTime}`,
+    };
+  }
+  if (bucket.remainingPercent >= 100) {
+    return { kind: 'full', text: 'Full' };
+  }
+  return { kind: 'unknown', text: '—' };
+}
+
+/**
+ * Fetches model quota windows by invoking `agy -p /usage --output-format json`
+ * (falling back to plain `agy -p /usage` on older builds without `--output-format`).
+ */
+export async function fetchUsageQuota(
+  agyBin?: string,
+  options: EcosystemCliOptions = {},
+): Promise<FetchUsageQuotaResult> {
+  const exec = options.execCommand ?? defaultExecCommand;
+  const bin = resolveBin(agyBin);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS;
+  const execOpts: ExecCommandOptions = {
+    cwd: options.cwd,
+    env: options.env,
+    timeoutMs,
+  };
+
+  let res = await exec([bin, '-p', '/usage', '--output-format', 'json'], execOpts);
+  if (
+    res.exitCode !== 0 &&
+    /output-format|unknown flag|flag provided but not defined/i.test(`${res.stderr}\n${res.stdout}`)
+  ) {
+    res = await exec([bin, '-p', '/usage'], execOpts);
+  }
+
+  if (res.exitCode !== 0) {
+    return {
+      ok: false,
+      quota: null,
+      rawOutput: res.stdout,
+      error:
+        res.stderr.trim() ||
+        res.stdout.trim() ||
+        `agy -p /usage exited with code ${res.exitCode}`,
+    };
+  }
+
+  const quota = parseUsageQuotaOutput(res.stdout);
+  if (!quota) {
+    return {
+      ok: false,
+      quota: null,
+      rawOutput: res.stdout,
+      error: 'No quota data returned by agy -p /usage',
+    };
+  }
+
+  return {
+    ok: true,
+    quota,
+    rawOutput: res.stdout,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Local & ACP Skills (`scanLocalSkills`)
 // ---------------------------------------------------------------------------
 

@@ -33,6 +33,7 @@ import {
   resolveModeSelection,
   resolveModelSelection,
   resolveOrchestratorRoleThoughtLevels,
+  resolveOrchestratorSingleAgentSelection,
   resolveThoughtLevel,
   resolveThoughtLevelsForModel,
 } from '../acp/model';
@@ -81,6 +82,7 @@ import {
 } from '../config/config';
 import {
   exportTranscriptMarkdown,
+  fetchUsageQuota,
   listAgents,
   listMcpServers,
   listPlugins,
@@ -298,6 +300,8 @@ export interface AppControllerOptions {
   readonly replayDrainQuietMs?: number;
   /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
   readonly terminalRows?: number;
+  /** Optional pre-probed `agy` version so the welcome card displays it on the first frame. */
+  readonly initialAgentVersion?: string;
   /** Optional delay override (ms) before auto-hiding completed HUD todos (< 0 disables auto-hide). Default: 60000. */
   readonly todoAutoClearDelayMs?: number;
   /** Enable embedded HTTP MCP `todo` tool server injection (default: true). */
@@ -671,6 +675,7 @@ export class AppController {
   #configSaveChain: Promise<void> = Promise.resolve();
   #anchorSaveChains = new Map<string, Promise<void>>();
   #pickerLoadToken = 0;
+  #usageQuotaLoadToken = 0;
   #attachmentSeq = 0;
   #shutdownPromise: Promise<void> | null = null;
   #shuttingDown = false;
@@ -782,6 +787,7 @@ export class AppController {
         this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
       ...(options.terminalRows !== undefined ? { terminalRows: options.terminalRows } : {}),
+      ...(options.initialAgentVersion ? { initialAgentVersion: options.initialAgentVersion } : {}),
       ...(autoCompactOverrideRaw ? { autoCompactOverrideRaw } : {}),
       now: this.#now,
     });
@@ -1341,11 +1347,15 @@ export class AppController {
       });
       if (!isBootstrapActive()) return;
       this.#authMethods = initRes.authMethods ?? [];
+      const prevAgentVersion = this.store.getState().agentVersion;
       this.store.setAgentInitializeInfo(
         initRes.agentInfo,
         initRes.agentCapabilities?.promptCapabilities,
         { supportsLogout: client.supportsLogout }
       );
+      if (this.store.getState().agentVersion !== prevAgentVersion) {
+        this.scheduler.renderNow();
+      }
       this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
       const initialOutcome = await this.#openInitialSession(
@@ -2750,6 +2760,13 @@ export class AppController {
     if (state.infoOverlay) {
       if (name === 'escape' || name === 'q') {
         this.#closeInfoOverlay();
+        return;
+      }
+      if (
+        state.infoOverlay.kind === 'usage' &&
+        ((name === 'r' && key.ctrl) || (name === 'r' && !key.ctrl && !key.alt && !key.meta))
+      ) {
+        void this.#loadUsageQuota(++this.#usageQuotaLoadToken);
         return;
       }
       if (state.infoOverlay.kind === 'jobs') {
@@ -4999,23 +5016,40 @@ export class AppController {
     } else if (kind === 'planner' || kind === 'executor') {
       const curState = this.store.getState();
       const candidates = filterOrchestratorRoleModels(kind, curState.controls.availableModels);
-      const parsedRole = parseOrchestratorModelSpec(curState.orchestratorSettings[kind]);
+      const rawRoleSpec = curState.orchestratorSettings[kind]?.trim();
+      const parsedRole = parseOrchestratorModelSpec(rawRoleSpec);
       const fallbackRole =
         kind === 'planner'
           ? inferOrchestratorDefaultPlannerModel(curState.controls.currentModelId)
           : inferOrchestratorDefaultExecutorModel(curState.controls.currentModelId);
-      const targetName = parsedRole?.modelName ?? fallbackRole?.modelName;
-      if (targetName) {
-        const matched = candidates.find(
-          c =>
-            c.name.toLowerCase() === targetName.toLowerCase() ||
-            c.value.toLowerCase() === targetName.toLowerCase()
-        );
-        if (matched) {
-          initialSelectedId = matched.value;
+      const directFixed = rawRoleSpec
+        ? candidates.find(
+            c =>
+              (c.name.toLowerCase() === rawRoleSpec.toLowerCase() ||
+                c.value.toLowerCase() === rawRoleSpec.toLowerCase()) &&
+              resolveThoughtLevelsForModel(
+                c.value,
+                curState.controls,
+                curState.modelThoughtLevels
+              ).length === 0
+          )
+        : undefined;
+      if (directFixed) {
+        initialSelectedId = directFixed.value;
+      } else {
+        const targetName = parsedRole?.modelName ?? fallbackRole?.modelName;
+        if (targetName) {
+          const matched = candidates.find(
+            c =>
+              c.name.toLowerCase() === targetName.toLowerCase() ||
+              c.value.toLowerCase() === targetName.toLowerCase()
+          );
+          if (matched) {
+            initialSelectedId = matched.value;
+          }
         }
+        initialModelThinking = parsedRole?.thoughtLevel ?? 'high';
       }
-      initialModelThinking = parsedRole?.thoughtLevel ?? 'high';
     }
 
     this.store.openPicker(kind, {
@@ -5525,14 +5559,23 @@ export class AppController {
     } else if (kind === 'model') {
       if (itemId === ORCHESTRATOR_PICKER_ID) {
         const curState = this.store.getState();
-        const parsedPlan = parseOrchestratorModelSpec(curState.orchestratorSettings.planner);
-        const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
-          parsedPlan?.modelName,
-          curState.controls.availableModels,
-          curState.controls.currentModelId
+        const singleAgent = resolveOrchestratorSingleAgentSelection(
+          curState.orchestratorSettings,
+          curState.controls,
+          curState.modelThoughtLevels
         );
-        if (targetOrchId) {
-          await this.#applyModelQuery(targetOrchId);
+        if (singleAgent) {
+          await this.#applyModelQuery(singleAgent.modelId, singleAgent.thoughtLevel);
+        } else {
+          const parsedPlan = parseOrchestratorModelSpec(curState.orchestratorSettings.planner);
+          const targetOrchId = resolveAcpOrchestratorModelIdForPlanner(
+            parsedPlan?.modelName,
+            curState.controls.availableModels,
+            curState.controls.currentModelId
+          );
+          if (targetOrchId) {
+            await this.#applyModelQuery(targetOrchId);
+          }
         }
       } else {
         await this.#applyModelQuery(itemId, desiredModelThinking);
@@ -6275,6 +6318,56 @@ export class AppController {
     this.scheduler.renderNow();
   }
 
+  async #collapseOrchestratorToSingleAgentIfMatched(
+    orchestratorSettings: { readonly planner?: string; readonly executor?: string }
+  ): Promise<{ readonly modelName: string; readonly thoughtLevel?: string } | null> {
+    const curState = this.store.getState();
+    const client = this.#acpClient;
+    if (!client || !curState.sessionId || !isOrchestratorModelId(curState.controls.currentModelId)) {
+      return null;
+    }
+    const singleAgent = resolveOrchestratorSingleAgentSelection(
+      orchestratorSettings,
+      curState.controls,
+      curState.modelThoughtLevels
+    );
+    if (!singleAgent) return null;
+
+    const resolved = resolveModelSelection(singleAgent.modelId, {
+      configOptions: [...curState.configOptions],
+      models: curState.models,
+      modes: curState.modes,
+    });
+    if (!resolved) return null;
+
+    try {
+      const applied = await applyModelSelection(
+        client,
+        curState.sessionId,
+        resolved,
+        singleAgent.thoughtLevel
+      );
+      if (applied.configOptions) {
+        this.store.updateConfigOptions(applied.configOptions);
+      } else {
+        this.store.updateCurrentModelId(applied.appliedModelId);
+      }
+      const updatedRecent = this.store.recordRecentModel(applied.appliedModelId);
+      this.#config = {
+        ...this.#config,
+        recent_models: [...updatedRecent],
+      };
+      void this.#saveConfigSafe();
+      await this.#persistSessionAnchorAndOsc();
+      return {
+        modelName: singleAgent.modelName,
+        ...(applied.appliedThoughtLevel ? { thoughtLevel: applied.appliedThoughtLevel } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async #applyOrchestratorRoleModel(
     role: 'planner' | 'executor',
     modelId: string,
@@ -6310,6 +6403,21 @@ export class AppController {
         this.store.setSettingsAgySettings(saved.settings);
       }
 
+      const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
+      const collapsed = await this.#collapseOrchestratorToSingleAgentIfMatched(
+        saved.settings.orchestrator
+      );
+      if (collapsed) {
+        const thoughtSuffix = collapsed.thoughtLevel ? ` (${collapsed.thoughtLevel})` : '';
+        this.store.pushToast(
+          `Orchestrator ${roleLabel} set to ${spec} — switched to single-agent ${collapsed.modelName}${thoughtSuffix}`,
+          'success',
+          { ttl: 2800 }
+        );
+        this.scheduler.renderNow();
+        return;
+      }
+
       // When updating Planner while currently in Orchestrator mode, keep the active ACP
       // Orchestrator variant aligned (Neon / Carbon / Argon) whenever a matching variant exists.
       if (
@@ -6338,7 +6446,6 @@ export class AppController {
         }
       }
 
-      const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
       this.store.pushToast(
         `Orchestrator ${roleLabel} set to ${spec}`,
         'success',
@@ -6419,13 +6526,25 @@ export class AppController {
       if (this.store.getState().settings) {
         this.store.setSettingsAgySettings(saved.settings);
       }
+      const collapsed = await this.#collapseOrchestratorToSingleAgentIfMatched(
+        saved.settings.orchestrator
+      );
       if (!silent) {
         const roleLabel = role === 'planner' ? 'Planner' : 'Executor';
-        this.store.pushToast(
-          `${roleLabel} thinking set to ${targetChoice.name} (${modelName})`,
-          'success',
-          { ttl: 2200 }
-        );
+        if (collapsed) {
+          const thoughtSuffix = collapsed.thoughtLevel ? ` (${collapsed.thoughtLevel})` : '';
+          this.store.pushToast(
+            `${roleLabel} thinking set to ${targetChoice.name} (${modelName}) — switched to single-agent ${collapsed.modelName}${thoughtSuffix}`,
+            'success',
+            { ttl: 2800 }
+          );
+        } else {
+          this.store.pushToast(
+            `${roleLabel} thinking set to ${targetChoice.name} (${modelName})`,
+            'success',
+            { ttl: 2200 }
+          );
+        }
       }
       this.scheduler.renderNow();
       return targetChoice.value;
@@ -7014,15 +7133,55 @@ export class AppController {
 
   #openInfoOverlay(kind: 'status' | 'context' | 'usage' | 'logout_confirm' | 'jobs'): void {
     this.#pickerLoadToken += 1;
+    this.#usageQuotaLoadToken += 1;
+    const usageToken = this.#usageQuotaLoadToken;
     this.store.openInfoOverlay(kind, {
       configPath: this.#configPath,
       agySettingsPath: this.#agySettingsPath,
+      ...(kind === 'usage' ? { quotaLoading: true } : {}),
     });
     this.scheduler.renderNow();
     this.syncFocus();
+    if (kind === 'usage') {
+      void this.#loadUsageQuota(usageToken);
+    }
+  }
+
+  async #loadUsageQuota(loadToken: number): Promise<void> {
+    const isStale = (): boolean =>
+      this.#shuttingDown ||
+      loadToken !== this.#usageQuotaLoadToken ||
+      this.store.getState().infoOverlay?.kind !== 'usage';
+
+    this.store.setUsageQuotaLoading(true);
+    this.scheduler.renderNow();
+
+    try {
+      const res = await fetchUsageQuota(this.#resolveAgyBin(), {
+        execCommand: this.#ecosystemRunner,
+        cwd: this.store.getState().cwd,
+      });
+      if (isStale()) return;
+      if (res.ok && res.quota) {
+        this.store.setUsageQuota(res.quota);
+      } else {
+        this.store.setUsageQuota(
+          null,
+          res.error ?? 'Failed to fetch quota via agy -p /usage'
+        );
+      }
+    } catch (err) {
+      if (isStale()) return;
+      this.store.setUsageQuota(
+        null,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+    this.scheduler.renderNow();
   }
 
   #closeInfoOverlay(): void {
+    this.#usageQuotaLoadToken += 1;
     if (!this.store.closeInfoOverlay()) return;
     this.scheduler.renderNow();
     this.syncFocus();
@@ -7067,6 +7226,7 @@ export class AppController {
         abortError: new Error('Signed out'),
         resetStore: true,
       });
+      this.store.clearUsageQuota();
       this.osc.setStatusBlocked('auth');
       this.store.setAuthRequired({
         message: 'Signed out of Antigravity. Run /login or click Sign in to reconnect.',
@@ -9327,6 +9487,9 @@ export class AppController {
           },
           onDetachJob: jobId => {
             this.#detachBackgroundJob(jobId);
+          },
+          onRefreshUsage: () => {
+            void this.#loadUsageQuota(++this.#usageQuotaLoadToken);
           },
         },
       },

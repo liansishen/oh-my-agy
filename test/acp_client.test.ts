@@ -24,6 +24,7 @@ import {
   resolveModeSelection,
   resolveModelSelection,
   resolveOrchestratorRoleThoughtLevels,
+  resolveOrchestratorSingleAgentSelection,
   resolveThoughtLevel,
   resolveThoughtLevelsForModel,
   splitModelThoughtSuffix,
@@ -461,7 +462,7 @@ describe("src/acp/model.ts 双轨模型 ID 与动态 configOptions", () => {
     expect(clampThoughtLevelForChoices("medium", threeChoices)).toBe("medium");
     expect(clampThoughtLevelForChoices("high", [])).toBeUndefined();
 
-    // Orchestrator 角色严格白名单过滤（Planner 4 选 1 / Executor 2 选 1）、短名格式化与 ACP 变体映射
+    // Orchestrator 共享非 Orchestrator 模型池（保留角色推荐顺序）与单模型直跑判定
     const fullModels = [
       { value: "gemini-4-neon", name: "Gemini 4 Neon" },
       { value: "gemini-4-carbon", name: "Gemini 4 Carbon" },
@@ -480,11 +481,68 @@ describe("src/acp/model.ts 双轨模型 ID 与动态 configOptions", () => {
       "gemini-4-carbon",
       "gemini-4-argon",
       "claude-opus-5-5",
+      "gemini-4-hydrogen",
+      "gemini-3.8-flash",
+      "claude-sonnet-5-5",
+      "gpt-oss-120b-medium",
     ]);
     expect(filterOrchestratorRoleModels("executor", fullModels).map((c) => c.value)).toEqual([
       "gemini-4-hydrogen",
       "claude-sonnet-5-5",
+      "gemini-4-neon",
+      "gemini-4-carbon",
+      "gemini-4-argon",
+      "gemini-3.8-flash",
+      "claude-opus-5-5",
+      "gpt-oss-120b-medium",
     ]);
+    const orchControls = {
+      currentModelId: "gemini-pro-orchestrator-neon",
+      supportsThoughtLevel: false,
+      availableThoughtLevels: [],
+      availableModels: fullModels,
+    };
+    expect(
+      resolveOrchestratorSingleAgentSelection(
+        { planner: "Gemini 4 Neon (Extra)", executor: "Gemini 4 Neon (XHigh)" },
+        orchControls,
+      ),
+    ).toEqual({
+      modelId: "gemini-4-neon",
+      modelName: "Gemini 4 Neon",
+      thoughtLevel: "xhigh",
+    });
+    expect(
+      resolveOrchestratorSingleAgentSelection(
+        { planner: "Gemini 4 Neon (Extra)", executor: "Gemini 4 Neon (Medium)" },
+        orchControls,
+      ),
+    ).toBeNull();
+    expect(
+      resolveOrchestratorSingleAgentSelection(
+        { planner: "Gemini 4 Neon (High)", executor: "Gemini 4 Hydrogen (High)" },
+        orchControls,
+      ),
+    ).toBeNull();
+    expect(
+      resolveOrchestratorSingleAgentSelection(
+        { planner: "Gemini 4 Hydrogen (High)" },
+        orchControls,
+      ),
+    ).toEqual({
+      modelId: "gemini-4-hydrogen",
+      modelName: "Gemini 4 Hydrogen",
+      thoughtLevel: "high",
+    });
+    expect(
+      resolveOrchestratorSingleAgentSelection(
+        { planner: "GPT-OSS 120B (Medium)", executor: "GPT-OSS 120B (Medium)" },
+        orchControls,
+      ),
+    ).toEqual({
+      modelId: "gpt-oss-120b-medium",
+      modelName: "GPT-OSS 120B (Medium)",
+    });
     expect(formatShortOrchestratorModelName("Gemini 4 Carbon")).toBe("Carbon");
     expect(formatShortOrchestratorModelName("Gemini 4 Hydrogen")).toBe("Hydrogen");
     expect(formatShortOrchestratorModelName("Claude Opus 5.5")).toBe("Opus 5.5");

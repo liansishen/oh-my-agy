@@ -22,6 +22,7 @@ import {
   isOrchestratorModelId,
   ORCHESTRATOR_PICKER_ID,
   resolveOrchestratorRoleThoughtLevels,
+  resolveOrchestratorSingleAgentSelection,
   resolveThoughtLevelsForModel,
 } from '../acp/model';
 import { sameDir } from '../acp/path';
@@ -487,7 +488,14 @@ export function computePickerData(
       const lvlLabel = lvl === 'xhigh' ? 'Extra' : lvl.charAt(0).toUpperCase() + lvl.slice(1);
       return `${short} (${lvlLabel})`;
     };
-    const orchestratorSummaryDetail = `${formatRoleBrief('planner')} → ${formatRoleBrief('executor')}`;
+    const singleAgent = resolveOrchestratorSingleAgentSelection(
+      state.orchestratorSettings,
+      state.controls,
+      state.modelThoughtLevels
+    );
+    const orchestratorSummaryDetail = singleAgent
+      ? `${formatRoleBrief('planner')} (single-agent)`
+      : `${formatRoleBrief('planner')} → ${formatRoleBrief('executor')}`;
 
     let choices: typeof rawChoices;
     if (picker.kind === 'planner' || picker.kind === 'executor') {
@@ -513,16 +521,34 @@ export function computePickerData(
       choices = merged;
     }
 
-    const currentRoleSpec = isOrchestratorRole
-      ? parseOrchestratorModelSpec(state.orchestratorSettings[picker.kind])
-      : null;
-    const currentRoleChoice = currentRoleSpec
-      ? choices.find(
-          c =>
-            c.name.toLowerCase() === currentRoleSpec.modelName.toLowerCase() ||
-            c.value.toLowerCase() === currentRoleSpec.modelName.toLowerCase()
-        )
+    const rawRoleSpec = isOrchestratorRole
+      ? state.orchestratorSettings[picker.kind]?.trim()
       : undefined;
+    const currentRoleSpec = isOrchestratorRole
+      ? parseOrchestratorModelSpec(rawRoleSpec)
+      : null;
+    const directFixedRoleChoice =
+      isOrchestratorRole && rawRoleSpec
+        ? choices.find(
+            c =>
+              (c.name.toLowerCase() === rawRoleSpec.toLowerCase() ||
+                c.value.toLowerCase() === rawRoleSpec.toLowerCase()) &&
+              resolveThoughtLevelsForModel(
+                c.value,
+                state.controls,
+                state.modelThoughtLevels
+              ).length === 0
+          )
+        : undefined;
+    const currentRoleChoice =
+      directFixedRoleChoice ??
+      (currentRoleSpec
+        ? choices.find(
+            c =>
+              c.name.toLowerCase() === currentRoleSpec.modelName.toLowerCase() ||
+              c.value.toLowerCase() === currentRoleSpec.modelName.toLowerCase()
+          )
+        : undefined);
     const activeCurrentModelId = isOrchestratorRole
       ? (currentRoleChoice?.value ?? null)
       : isOrchestratorModelId(state.controls.currentModelId)

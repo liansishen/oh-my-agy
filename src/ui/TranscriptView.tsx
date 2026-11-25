@@ -1381,6 +1381,18 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
   const lastTurn = turns[turns.length - 1];
   const isEvicted = (key: string): boolean => Boolean(evictedNodeIds?.has(`main.${key}`));
 
+  const rawAgyVersion = (state.agentVersion ?? state.agentInfo?.version)?.trim();
+  const agyVersionLabel = rawAgyVersion
+    ? `Antigravity Cli v${rawAgyVersion.replace(/^v/i, '')}`
+    : undefined;
+  const welcomeVersionSpans: readonly SpanData[] = agyVersionLabel
+    ? [
+        { t: `v${version}`, s: 'dim mono' },
+        { t: ' · ', s: 'dim' },
+        { t: agyVersionLabel, s: 'dim mono' },
+      ]
+    : [{ t: `v${version}`, s: 'dim mono' }];
+
   const welcomeTipSpans: readonly (string | SpanData)[] = [
     { t: 'Type ', s: 'muted' },
     { t: '/resume', s: 'code' },
@@ -1427,7 +1439,7 @@ export function TranscriptView(props: TranscriptViewProps): JSX.Element {
                 key="omp.welcome.version"
                 wrap="none"
                 role="omp.welcome.version"
-                spans={[{ t: `v${version}`, s: 'dim mono' }]}
+                spans={welcomeVersionSpans}
               />
             </col>
           </row>

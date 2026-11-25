@@ -111,6 +111,12 @@ describe('parseCliArgs', () => {
     const r3 = parseCliArgs(['--fork', 'uuid-fork']);
     expect(r3.resume).toBe('uuid-fork');
     expect(r3.resumeKind).toBe('fork');
+
+    const rEffort = parseCliArgs(['--effort', 'high']);
+    expect(rEffort.thought).toBe('high');
+    const rEffortEq = parseCliArgs(['--effort=xhigh']);
+    expect(rEffortEq.thought).toBe('xhigh');
+    expect(translateFallbackArgs(rEffortEq).args).toEqual(['--effort', 'xhigh']);
   });
 
   test('handles -- positional delimiter so flag-like words become prompt', () => {
@@ -132,6 +138,7 @@ describe('parseCliArgs', () => {
     expect(() => parseCliArgs(['--does-not-exist'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--model'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--thought'])).toThrow(CliParseError);
+    expect(() => parseCliArgs(['--effort'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--mode'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--resume'])).toThrow(CliParseError);
     expect(() => parseCliArgs(['--conversation'])).toThrow(CliParseError);

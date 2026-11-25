@@ -1149,6 +1149,38 @@ describe('SessionMetricsTracker background task tracking & resume baseline', () 
       expect(realVariants.find(t => t.taskId === `${sessionId}/task-11`)?.status).toBe('failed');
       expect(realVariants.find(t => t.taskId === `${sessionId}/task-12`)?.status).toBe('cancelled');
 
+      // NotificationTimeoutSeconds `still running` wakeup notices keep running tasks alive,
+      // while genuine `timed out after 120s` notices still mark failed
+      await appendFile(
+        transcriptFile,
+        [
+          runningLine(16, `${sessionId}/task-16`, 'sleep 120 && echo still running'),
+          JSON.stringify({
+            step_index: 17,
+            source: 'SYSTEM',
+            type: 'SYSTEM_MESSAGE',
+            status: 'DONE',
+            created_at: '2026-11-25T11:00:00Z',
+            content: `<SYSTEM_MESSAGE>\nTask id "${sessionId}/task-16" notification timeout reached (still running after 30s).\n</SYSTEM_MESSAGE>`,
+          }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(
+        tracker.getTranscriptBackgroundTasks().find(t => t.taskId === `${sessionId}/task-16`)?.status,
+      ).toBe('running');
+
+      await appendFile(
+        transcriptFile,
+        `${sysDoneLine(18, `${sessionId}/task-16`, 'finished', ' with exit code 0')}\n`,
+        'utf8',
+      );
+      await tracker.syncFromTranscript();
+      expect(
+        tracker.getTranscriptBackgroundTasks().find(t => t.taskId === `${sessionId}/task-16`)?.status,
+      ).toBe('completed');
+
       // Truncation clears background task tracker and baseline cleanly
       await writeFile(transcriptFile, JSON.stringify({ type: 'USER_INPUT', step_index: 0, content: 'hi' }) + '\n', 'utf8');
       await tracker.syncFromTranscript();

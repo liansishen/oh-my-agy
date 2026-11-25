@@ -50,7 +50,7 @@ function resolveCompletionIcon(entry: CompletionPopupItem): IconName {
   if (entry.kind === 'file') {
     return entry.isDirectory ? 'folder' : 'file';
   }
-  return entry.isSkillGroup ? 'skill' : 'action';
+  return entry.isPluginGroup ? 'package' : entry.isSkillGroup ? 'skill' : 'action';
 }
 
 function formatCompletionLabel(entry: CompletionPopupItem): string | readonly (string | SpanData)[] {

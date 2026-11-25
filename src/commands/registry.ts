@@ -55,6 +55,8 @@ export interface SlashCommandDef {
   readonly statusKey?: string;
   /** True when a dynamic ACP command represents a collapsible skill. */
   readonly isSkill?: boolean;
+  /** True when a dynamic ACP command represents a collapsible `plugin:` command. */
+  readonly isPlugin?: boolean;
   /** Optional parameter hint shown in completion & /help, e.g. "[query]". */
   readonly argHint?: string;
   /** Whether this command accepts optional or required arguments. */
@@ -441,9 +443,18 @@ function stripLeadingSlash(name: string): string {
 }
 
 /**
+ * Determine whether a dynamic ACP command uses the `plugin:` namespace prefix.
+ */
+export function isAcpPluginCommand(name: string): boolean {
+  const key = stripLeadingSlash(name).toLowerCase();
+  return key.startsWith('plugin:');
+}
+
+/**
  * Resolve the semantic Tern `IconName` for a dynamic ACP command.
  */
 export function resolveAcpCommandIcon(name: string): string {
+  if (isAcpPluginCommand(name)) return 'package';
   const key = stripLeadingSlash(name).toLowerCase();
   return ACP_NON_SKILL_COMMAND_ICONS[key] ?? 'skill';
 }
@@ -455,6 +466,7 @@ export function resolveAcpCommandIcon(name: string): string {
 export function isAcpSkillCommand(name: string): boolean {
   const key = stripLeadingSlash(name).toLowerCase();
   if (!key) return false;
+  if (isAcpPluginCommand(name)) return false;
   if (key.startsWith('skill:')) return true;
   return !(key in ACP_NON_SKILL_COMMAND_ICONS);
 }
@@ -598,7 +610,8 @@ export class CommandRegistry {
 
       const hint = raw.input?.hint?.trim();
       const takesArgs = Boolean(hint && hint.length > 0);
-      const isSkill = isAcpSkillCommand(name);
+      const isPlugin = isAcpPluginCommand(name);
+      const isSkill = !isPlugin && isAcpSkillCommand(name);
       next.push({
         name,
         aliases: [],
@@ -606,6 +619,7 @@ export class CommandRegistry {
         source: 'agy',
         icon: resolveAcpCommandIcon(name),
         isSkill,
+        ...(isPlugin ? { isPlugin: true } : {}),
         ...(hint ? { argHint: hint } : {}),
         takesArgs,
         autoExecuteOnEnter: !takesArgs,
@@ -634,6 +648,13 @@ export class CommandRegistry {
    */
   getAcpSkillCommands(): readonly SlashCommandDef[] {
     return this._merged.filter((cmd) => cmd.source === 'agy' && cmd.isSkill === true);
+  }
+
+  /**
+   * Return dynamic ACP commands classified under `plugin:` (non-conflicting with built-ins).
+   */
+  getAcpPluginCommands(): readonly SlashCommandDef[] {
+    return this._merged.filter((cmd) => cmd.source === 'agy' && cmd.isPlugin === true);
   }
 
   /**
