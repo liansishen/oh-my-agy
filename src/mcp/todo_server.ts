@@ -121,7 +121,7 @@ export class EmbeddedTodoMcpServer {
   #disposed = false;
 
   constructor(options: EmbeddedTodoMcpServerOptions = {}) {
-    this.#version = options.version ?? '0.3.3';
+    this.#version = options.version ?? '0.3.4';
     this.#requireSessionRoute = Boolean(options.requireSessionRoute);
     this.#onTodoChanged = options.onTodoChanged;
     this.#secretPath = `/mcp/${crypto.randomUUID()}`;
