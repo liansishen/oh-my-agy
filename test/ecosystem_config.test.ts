@@ -58,9 +58,11 @@ import {
   listMcpServers,
   listPlugins,
   parseAgentsOutput,
+  parseAgyVersionOutput,
   parseMcpListOutput,
   parsePluginsJsonOutput,
   parseUsageQuotaOutput,
+  probeAgyVersion,
   removeMcpServer,
   scanLocalSkills,
   setMcpServerEnabled,
@@ -1294,5 +1296,36 @@ describe('Usage quota parsing & fetching (agy -p /usage)', () => {
     });
     expect(errRes.ok).toBe(false);
     expect(errRes.error).toContain('Not signed in');
+  });
+
+  test('parseAgyVersionOutput and probeAgyVersion extract version quickly with safe error handling', async () => {
+    expect(parseAgyVersionOutput('1.5.17\n')).toBe('1.5.17');
+    expect(parseAgyVersionOutput('\x1b[32mantigravity-cli v1.5.17-rc.1\x1b[0m\n')).toBe('1.5.17-rc.1');
+    expect(parseAgyVersionOutput('')).toBeUndefined();
+    expect(parseAgyVersionOutput('no version here')).toBeUndefined();
+
+    const calls: Array<{ cmd: readonly string[]; timeoutMs?: number }> = [];
+    const ok = await probeAgyVersion('/custom/agy', {
+      execCommand: async (cmd, opts) => {
+        calls.push({ cmd, timeoutMs: opts?.timeoutMs });
+        return { exitCode: 0, stdout: '1.5.17\n', stderr: '' };
+      },
+    });
+    expect(ok).toBe('1.5.17');
+    expect(calls).toEqual([{ cmd: ['/custom/agy', '--version'], timeoutMs: 800 }]);
+
+    expect(
+      await probeAgyVersion('agy', {
+        execCommand: async () => ({ exitCode: 1, stdout: '1.5.17', stderr: 'failed' }),
+      }),
+    ).toBeUndefined();
+
+    expect(
+      await probeAgyVersion('agy', {
+        execCommand: async () => {
+          throw new Error('spawn failed');
+        },
+      }),
+    ).toBeUndefined();
   });
 });

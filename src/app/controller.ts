@@ -300,6 +300,8 @@ export interface AppControllerOptions {
   readonly replayDrainQuietMs?: number;
   /** Optional initial terminal row count override (for deterministic Swarm Overview height tests). */
   readonly terminalRows?: number;
+  /** Optional pre-probed `agy` version so the welcome card displays it on the first frame. */
+  readonly initialAgentVersion?: string;
   /** Optional delay override (ms) before auto-hiding completed HUD todos (< 0 disables auto-hide). Default: 60000. */
   readonly todoAutoClearDelayMs?: number;
   /** Enable embedded HTTP MCP `todo` tool server injection (default: true). */
@@ -785,6 +787,7 @@ export class AppController {
         this.session.caps.kinds.length === 0 || this.session.caps.kinds.includes('prefs'),
       welcomeLogoBlobId: initialWelcomeLogoBlobId,
       ...(options.terminalRows !== undefined ? { terminalRows: options.terminalRows } : {}),
+      ...(options.initialAgentVersion ? { initialAgentVersion: options.initialAgentVersion } : {}),
       ...(autoCompactOverrideRaw ? { autoCompactOverrideRaw } : {}),
       now: this.#now,
     });
@@ -1344,11 +1347,15 @@ export class AppController {
       });
       if (!isBootstrapActive()) return;
       this.#authMethods = initRes.authMethods ?? [];
+      const prevAgentVersion = this.store.getState().agentVersion;
       this.store.setAgentInitializeInfo(
         initRes.agentInfo,
         initRes.agentCapabilities?.promptCapabilities,
         { supportsLogout: client.supportsLogout }
       );
+      if (this.store.getState().agentVersion !== prevAgentVersion) {
+        this.scheduler.renderNow();
+      }
       this.store.transcript.setPreferNativeSteps(this.#getEffectiveTodoProvider() === 'native');
 
       const initialOutcome = await this.#openInitialSession(

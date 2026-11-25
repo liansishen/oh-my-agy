@@ -559,6 +559,7 @@ export interface AppStoreOptions {
   readonly toolDisplayMode?: ToolDisplayMode;
   readonly orchestratorSettings?: AgyOrchestratorSettings;
   readonly terminalRows?: number;
+  readonly initialAgentVersion?: string;
   readonly autoCompactOverrideRaw?: string;
   readonly draft?: DraftEngineOptions;
   readonly history?: InputHistoryOptions;
@@ -710,6 +711,7 @@ export class AppStore {
   constructor(options: AppStoreOptions = {}) {
     this._now = options.now ?? (() => Date.now());
     this._cwd = options.cwd ?? process.cwd();
+    this._agentVersion = options.initialAgentVersion?.trim() || undefined;
     this._autoCollapseThought = options.autoCollapseThought ?? true;
     this._collapseCompacted = options.collapseCompacted ?? true;
     this._recentModels = normalizeRecentModels(options.recentModels);

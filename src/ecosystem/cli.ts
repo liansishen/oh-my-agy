@@ -835,6 +835,41 @@ export interface FetchUsageQuotaResult {
 }
 
 const DEFAULT_USAGE_TIMEOUT_MS = 20_000;
+const DEFAULT_VERSION_PROBE_TIMEOUT_MS = 800;
+
+/**
+ * Extracts a semver-like `agy` version string from `agy --version` stdout.
+ */
+export function parseAgyVersionOutput(stdout: string): string | undefined {
+  const clean = stripAnsi(stdout).trim();
+  if (!clean) return undefined;
+  const match = /\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(clean);
+  return match?.[1];
+}
+
+/**
+ * Quickly probes `agy --version` during CLI startup so the welcome screen can
+ * display the installed `agy` version immediately before ACP finishes booting.
+ */
+export async function probeAgyVersion(
+  agyBin?: string,
+  options: EcosystemCliOptions = {},
+): Promise<string | undefined> {
+  const exec = options.execCommand ?? defaultExecCommand;
+  const bin = resolveBin(agyBin);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERSION_PROBE_TIMEOUT_MS;
+  try {
+    const res = await exec([bin, '--version'], {
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs,
+    });
+    if (res.exitCode !== 0) return undefined;
+    return parseAgyVersionOutput(res.stdout);
+  } catch {
+    return undefined;
+  }
+}
 
 function isUnambiguousResetTimestamp(value: string): boolean {
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) {

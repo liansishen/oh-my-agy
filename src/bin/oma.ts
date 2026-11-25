@@ -12,6 +12,7 @@ import {
 } from '../app/fallback';
 import { cleanupStaleWindowsBackup, runUpdateCommand } from '../app/updater';
 import { loadConfig } from '../config/config';
+import { probeAgyVersion } from '../ecosystem/cli';
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   cleanupStaleWindowsBackup();
@@ -43,12 +44,12 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 
   const { config, warnings, parseError } = await loadConfig();
   const cwd = process.cwd();
+  const agyBin = cli.agyBin?.trim() || config.agy_bin?.trim() || 'agy';
 
   if (cli.plain) {
     for (const w of warnings) {
       process.stderr.write(`[oma] config warning: ${w}\n`);
     }
-    const agyBin = cli.agyBin?.trim() || config.agy_bin?.trim() || 'agy';
     const adapter = createAcpPlainAdapter({
       agyBin,
       addDirs: cli.addDirs,
@@ -62,6 +63,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     });
   }
 
+  const agyVersionPromise = probeAgyVersion(agyBin, { cwd });
   const connected = await connectTernSession();
   if (!connected) {
     if (cli.noFallback) {
@@ -79,10 +81,12 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     });
   }
 
+  const initialAgentVersion = await agyVersionPromise;
   const controller = new AppController({
     cli,
     config,
     ...(parseError ? { configParseError: parseError } : {}),
+    ...(initialAgentVersion ? { initialAgentVersion } : {}),
     cwd,
     session: connected.session,
     output: connected.output,

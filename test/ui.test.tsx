@@ -527,6 +527,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         op => op[0] === 'set' && op[1] === EDITOR_NODE_ID && op[2]['sendable'] === true && op[2]['typeahead'] === false
       )
     );
+    const welcomeVersionNode = replayWire(host).get('main.welcome.lockup.mark.omp.welcome.version');
+    expect(welcomeVersionNode?.p?.['spans']).toEqual([
+      { t: expect.stringMatching(/^v\d+\.\d+\.\d+/), s: 'dim mono' },
+      { t: ' · ', s: 'dim' },
+      { t: 'Antigravity Cli v1.5.13', s: 'dim mono' },
+    ]);
     expect(host.osc7501).toContain('state=idle');
     expect(host.osc1337.some(v => v.startsWith('omp_restore=MQ=='))).toBe(true);
     expect(host.osc1337.some(v => v.startsWith('omp_session_file=') && v.length > 'omp_session_file='.length)).toBe(true);
@@ -543,6 +549,86 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(host.tspMessages.some(m => m.verb === 'x')).toBe(true);
     expect(host.input.isRaw).toBe(false);
     expect(host.safeOutput.closed).toBe(true);
+  });
+
+  test('welcome card displays initialAgentVersion on Frame #1 and refreshes immediately when initialize reports a new version', async () => {
+    const tmp = makeTempDir();
+    const host = new FakeTernHost();
+    const session = await createConnectedSession(host);
+    const acp = new MockAcpHarness();
+
+    const releaseInit = Promise.withResolvers<void>();
+    const releaseNewSession = Promise.withResolvers<void>();
+
+    acp.setHandler((msg, h) => {
+      if (msg.method === 'initialize') {
+        void releaseInit.promise.then(() => {
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              protocolVersion: 1,
+              agentInfo: { name: 'Antigravity', version: '1.5.18' },
+              agentCapabilities: { promptCapabilities: { image: true, embeddedContext: true } },
+            },
+          });
+        });
+      } else if (msg.method === 'session/new') {
+        void releaseNewSession.promise.then(() => {
+          h.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              sessionId: 'sess-init-ver-1',
+              configOptions: DEFAULT_CONFIG_OPTIONS,
+            },
+          });
+        });
+      } else if (msg.method === 'session/close') {
+        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
+        h.crash(0);
+      }
+    });
+
+    const controller = new AppController({
+      cli: parseCliArgs([]),
+      config: DEFAULT_CONFIG,
+      initialAgentVersion: '1.5.17',
+      cwd: tmp,
+      session,
+      output: host.safeOutput,
+      acpSpawn: acp.createSpawnFn(),
+      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
+      installSignals: false,
+      throttleMs: 5,
+    });
+
+    const runPromise = controller.run();
+
+    // Frame #1 renders BEFORE initialize resolves, showing pre-probed initialAgentVersion immediately
+    await waitFor(() => host.findWireNodes(n => n.id === EDITOR_NODE_ID).length > 0);
+    expect(
+      replayWire(host).get('main.welcome.lockup.mark.omp.welcome.version')?.p?.['spans'],
+    ).toEqual([
+      { t: expect.stringMatching(/^v\d+\.\d+\.\d+/), s: 'dim mono' },
+      { t: ' · ', s: 'dim' },
+      { t: 'Antigravity Cli v1.5.17', s: 'dim mono' },
+    ]);
+
+    // Resolving initialize with a newer version updates welcome card immediately while session/new is still pending
+    releaseInit.resolve();
+    await waitFor(() => {
+      const spans = replayWire(host).get('main.welcome.lockup.mark.omp.welcome.version')?.p?.['spans'] as
+        | Array<{ t?: string }>
+        | undefined;
+      return Boolean(spans?.some(s => s.t === 'Antigravity Cli v1.5.18'));
+    });
+
+    releaseNewSession.resolve();
+    await controller.readyPromise;
+
+    await controller.submitInput('/quit');
+    expect(await runPromise).toBe(0);
   });
 
   test('dual-track Key + EditEvent (strict len guard) + UndoEvent + caret completion popup', async () => {
