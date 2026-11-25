@@ -1786,7 +1786,23 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(controller.store.isSwarmWorking).toBe(true);
     expect(controller.store.swarmWorkingNames).toContain('swarm-ui');
 
-    // `oma-swarm-fx` stylesheet dynamically installed & 4 orbiting bees + HUD bee button rendered
+    // Pre-existing swarm directory on disk before any swarm trigger in this session:
+    // HUD bee button is available, while `oma-swarm-fx` animation MUST NOT show until triggered in this session
+    expect(controller.store.getState().hasSwarm).toBe(true);
+    expect(controller.store.getState().swarmTriggeredInSession).toBe(false);
+    expect(
+      host.tspMessages.find(
+        m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx' && typeof m.body['css'] === 'string'
+      )
+    ).toBeUndefined();
+    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.swarm.fx')).toHaveLength(0);
+    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.bee.hud').length).toBeGreaterThan(0);
+
+    // 1. `/swarm 做点事` MUST pass through untouched to `agy acp`, NEVER open Swarm Board overlay,
+    //    and trigger `oma-swarm-fx` while the swarm is actively running (`isSwarmWorking === true`)
+    await controller.submitInput('/swarm 做点事');
+    await waitFor(() => receivedPrompts.includes('/swarm 做点事') && !controller.store.getState().isStreaming);
+    expect(controller.store.getState().swarmTriggeredInSession).toBe(true);
     const fxSheet = host.tspMessages.find(
       m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx' && typeof m.body['css'] === 'string'
     );
@@ -1795,11 +1811,6 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(String(fxSheet?.body['css'] ?? '')).not.toContain('url(');
     expect(String(fxSheet?.body['css'] ?? '')).not.toContain('position: fixed');
     expect(host.findWireNodes(n => n.p?.['role'] === 'oma.swarm.fx').length).toBeGreaterThan(0);
-    expect(host.findWireNodes(n => n.p?.['role'] === 'oma.bee.hud').length).toBeGreaterThan(0);
-
-    // 1. `/swarm 做点事` MUST pass through untouched to `agy acp` and NEVER open Swarm Board overlay
-    await controller.submitInput('/swarm 做点事');
-    await waitFor(() => receivedPrompts.includes('/swarm 做点事') && !controller.store.getState().isStreaming);
     expect(controller.store.getState().swarmBoardOpen).toBe(false);
     expect(controller.store.getState().picker).toBeNull();
     expect(controller.isSwarmWatcherActive).toBe(true);
@@ -3972,7 +3983,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     //   before the coordinator emits a user-facing reply (avoids false finish notifications on
     //   worker pauses, subtask handoffs, or monitor checks!)
     // - bottom button switches back to Send!
-    // - because session is STILL in swarm mode (`hasSwarm`), perimeter bee animation STAYS visible with 2 idle bees!
+    // - because swarm is no longer actively running (`isSwarmWorking === false`), perimeter bee animation unmounts & unloads `oma-swarm-fx`!
     writeFileSync(
       join(swarmDir, 'members.json'),
       JSON.stringify({
@@ -4010,11 +4021,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => host.osc7501.slice(oscLenBeforeSwarm).includes('state=done'));
 
     current = replayCurrentWireNodes();
-    // Swarm mode stays active visually with 2 idle orbiting bees (coordinator + monitor)
-    expect(current.has('dock.composer.swarm-fx')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-1')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-2')).toBe(true);
-    expect(current.has('dock.composer.swarm-fx.bee-3')).toBe(false);
+    // Swarm animation (`oma.swarm.fx` / `oma-swarm-fx`) unmounts and unloads once swarm stops running, while static HUD bee stays
+    expect(current.has('dock.composer.swarm-fx')).toBe(false);
+    const fxUnloadMsg = host.tspMessages.filter(m => m.verb === 's' && m.body['name'] === 'oma-swarm-fx').pop();
+    expect(fxUnloadMsg).toBeDefined();
+    expect(fxUnloadMsg?.body['css'] ?? null).toBeNull();
+    expect(current.has('dock.hud.running.agents.bee')).toBe(true);
     expect(current.has('dock.composer.bar.send')).toBe(true);
     expect(current.has('dock.composer.bar.stop')).toBe(false);
 

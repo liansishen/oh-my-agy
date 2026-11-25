@@ -58,6 +58,7 @@ import {
   SHOW_CURSOR,
 } from '../src/termio/osc';
 import { SafeTermOutput } from '../src/termio/output';
+import { resolveOrbitSwarmBees } from '../src/ui/ComposerView';
 
 // ---------------------------------------------------------------------------
 // 1. DraftEngine: UTF-16 Key Track, CJK, Multi-line, Emoji Surrogate Pairs
@@ -2183,10 +2184,18 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
       loadedAt: 1000,
     };
 
-    // Background snapshot updates persistent swarm state & keeps isBusy=true even when isStreaming=false
+    // Pre-existing initial snapshot (`fromInitialLoad: true`) sets `hasSwarm` without triggering orbit animation
+    app.setSwarmSnapshot(snapshotActive, { fromInitialLoad: true });
+    expect(app.getState().hasSwarm).toBe(true);
+    expect(app.getState().swarmTriggeredInSession).toBe(false);
+    expect(resolveOrbitSwarmBees(app.getState())).toEqual([]);
+
+    // Live snapshot updates persistent swarm state, triggers orbit animation while working, & keeps isBusy=true
     app.setSwarmSnapshot(snapshotActive);
     expect(app.getState().hasSwarm).toBe(true);
+    expect(app.getState().swarmTriggeredInSession).toBe(true);
     expect(app.getState().isSwarmWorking).toBe(true);
+    expect(resolveOrbitSwarmBees(app.getState()).map((b) => b.name)).toEqual(['coordinator', 'alpha']);
     expect(app.getState().swarmWorkingNames).toEqual(['alpha']);
     expect(app.getState().isStreaming).toBe(false);
     expect(app.getState().isBusy).toBe(true);
@@ -2226,7 +2235,7 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(app.getState().focusMode).toBe('editor');
     expect(app.getState().desiredSurfaceFocus).toBe(EDITOR_NODE_ID);
 
-    // Swarm settles -> isSwarmWorking and isBusy return to false while hasSwarm stays true
+    // Swarm settles -> isSwarmWorking and isBusy return to false while hasSwarm stays true, and orbit animation clears
     app.setSwarmSnapshot({
       ...snapshotActive,
       isSwarmActive: false,
@@ -2236,6 +2245,7 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(app.getState().hasSwarm).toBe(true);
     expect(app.getState().isSwarmWorking).toBe(false);
     expect(app.getState().isBusy).toBe(false);
+    expect(resolveOrbitSwarmBees(app.getState())).toEqual([]);
 
     // Session reset clears all swarm state
     app.resetSessionState();

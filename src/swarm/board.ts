@@ -982,6 +982,13 @@ function computeFingerprintSync(swarmDir: string): string {
   return `${a}|${b}|${c}|${d}`;
 }
 
+export interface SwarmWatchChangeMeta {
+  /** True on the initial baseline check emitted when the watcher first mounts. */
+  readonly isInitial: boolean;
+  /** True when swarm files on disk changed after the watcher's initial baseline check. */
+  readonly changed: boolean;
+}
+
 /**
  * Watch a session's swarm directory via lightweight stat polling (`mtimeMs + ctimeMs + size`
  * across `swarm.json`, `members.json`, and `board.jsonl`). When the directory has not been
@@ -990,7 +997,7 @@ function computeFingerprintSync(swarmDir: string): string {
  */
 export function watchSwarmBoard(
   sessionId: string,
-  onChange: (snapshot: SwarmBoardSnapshot | null) => void,
+  onChange: (snapshot: SwarmBoardSnapshot | null, meta: SwarmWatchChangeMeta) => void,
   opts?: SwarmWatchOptions,
 ): SwarmBoardWatcher {
   const swarmDir = getSwarmDir(sessionId, opts);
@@ -1003,6 +1010,7 @@ export function watchSwarmBoard(
 
   let isStopped = false;
   let inFlight = false;
+  let initialChecked = !emitInitial;
   let lastSnapshot: SwarmBoardSnapshot | null = null;
   let lastFingerprint: string | null = emitInitial ? null : computeFingerprintSync(swarmDir);
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -1016,7 +1024,11 @@ export function watchSwarmBoard(
       const nextFingerprint = await computeFingerprintAsync(swarmDir);
       if (isStopped) return lastSnapshot;
 
-      if (!forceEmit && nextFingerprint === lastFingerprint) {
+      const isInitial = !initialChecked;
+      initialChecked = true;
+      const prevFingerprint = lastFingerprint;
+
+      if (!forceEmit && nextFingerprint === prevFingerprint) {
         return lastSnapshot;
       }
 
@@ -1036,9 +1048,10 @@ export function watchSwarmBoard(
       }
 
       lastSnapshot = snapshot;
+      const changed = !isInitial && nextFingerprint !== prevFingerprint;
       if (forceEmit || snapshot !== null || prevSnapshot !== null) {
         try {
-          onChange(snapshot);
+          onChange(snapshot, { isInitial, changed });
         } catch (err) {
           opts?.onError?.(err);
         }

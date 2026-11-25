@@ -440,6 +440,8 @@ export interface AppState {
   readonly swarmSnapshot: SwarmBoardSnapshot | null;
   /** True once the active session has entered swarm mode (snapshot exists or swarm tool detected). */
   readonly hasSwarm: boolean;
+  /** True only when a swarm run has been triggered during the current live session (not merely inherited from pre-existing disk files). */
+  readonly swarmTriggeredInSession?: boolean;
   /** True when at least one non-killed, non-stopped swarm member is currently `working`. */
   readonly isSwarmWorking: boolean;
   /** Roster names of swarm members currently in `working` status. */
@@ -625,6 +627,7 @@ export class AppStore {
   private _activeSwarmCount: number | undefined;
   private _swarmSnapshot: SwarmBoardSnapshot | null = null;
   private _hasSwarmHint = false;
+  private _swarmTriggeredInSession = false;
   private _swarmBoardOpen = false;
   private _swarmBoardFilterAgent: string | null = null;
   private _swarmBoardQuery = '';
@@ -940,8 +943,12 @@ export class AppStore {
   }
 
   setHasSwarm(hasSwarm: boolean): void {
-    if (this._hasSwarmHint === hasSwarm) return;
+    const nextTriggered = hasSwarm ? true : false;
+    if (this._hasSwarmHint === hasSwarm && this._swarmTriggeredInSession === nextTriggered) {
+      return;
+    }
     this._hasSwarmHint = hasSwarm;
+    this._swarmTriggeredInSession = nextTriggered;
     this.emit();
   }
 
@@ -1111,6 +1118,7 @@ export class AppStore {
       hasActiveBackgroundTasks,
       swarmSnapshot: this._swarmSnapshot,
       hasSwarm,
+      swarmTriggeredInSession: this._swarmTriggeredInSession,
       isSwarmWorking,
       swarmWorkingNames,
       isBusy,
@@ -1416,6 +1424,27 @@ export class AppStore {
           : '';
       if (uName === 'swarm' || uTitle === 'swarm' || uTitle.startsWith('swarm ')) {
         this._hasSwarmHint = true;
+        const rawRec =
+          typeof (update as { rawInput?: unknown }).rawInput === 'object' &&
+          (update as { rawInput?: unknown }).rawInput !== null
+            ? ((update as { rawInput: Record<string, unknown> }).rawInput)
+            : typeof (update as { args?: unknown }).args === 'object' &&
+                (update as { args?: unknown }).args !== null
+              ? ((update as { args: Record<string, unknown> }).args)
+              : undefined;
+        const action = typeof rawRec?.action === 'string' ? rawRec.action.trim().toLowerCase() : '';
+        if (action !== 'status' && action !== 'models') {
+          this._swarmTriggeredInSession = true;
+        }
+      } else if (
+        uName === 'post_message' ||
+        uTitle === 'post_message' ||
+        uName === 'swarm_wait' ||
+        uTitle === 'swarm_wait' ||
+        uTitle.includes('swarm_wait')
+      ) {
+        this._hasSwarmHint = true;
+        this._swarmTriggeredInSession = true;
       }
     }
 
@@ -1442,6 +1471,7 @@ export class AppStore {
     this._completion = EMPTY_COMPLETION;
     this._swarmSnapshot = null;
     this._hasSwarmHint = false;
+    this._swarmTriggeredInSession = false;
     this._activeSwarmCount = undefined;
     this._swarmBoardOpen = false;
     this._swarmBoardFilterAgent = null;
@@ -1912,13 +1942,16 @@ export class AppStore {
    */
   setSwarmSnapshot(
     snapshot: SwarmBoardSnapshot | null,
-    options: { autoFollow?: boolean } = {},
+    options: { autoFollow?: boolean; fromInitialLoad?: boolean } = {},
   ): void {
     const prevLatestSeq = this._swarmSnapshot?.latestSeq ?? 0;
     this._swarmSnapshot = snapshot;
     if (snapshot) {
       this._hasSwarmHint = true;
       this._activeSwarmCount = snapshot.counts.activeMembers;
+      if (snapshot.isSwarmActive && !options.fromInitialLoad) {
+        this._swarmTriggeredInSession = true;
+      }
     } else {
       this._activeSwarmCount = undefined;
     }

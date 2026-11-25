@@ -913,7 +913,7 @@ export class AppController {
   #syncSwarmFxStylesheet(features: readonly string[] = this.session.caps.features): void {
     const supportsStyles = features.includes('styles');
     const state = this.store.getState();
-    const orbitBees = supportsStyles && state.hasSwarm ? resolveOrbitSwarmBees(state) : [];
+    const orbitBees = supportsStyles ? resolveOrbitSwarmBees(state) : [];
 
     if (orbitBees.length > 0) {
       const nextSig = orbitBees.map(b => (b.isWorking ? 'W' : 'S')).join(',');
@@ -2158,7 +2158,9 @@ export class AppController {
           rawTitle.includes('swarm_wait');
         const isSwarmTool =
           rawName === 'swarm' || rawTitle === 'swarm' || /^swarm[\s:(]/.test(rawTitle);
-        if (isSwarmTool || isSwarmWait) {
+        const isPostMessage = rawName === 'post_message' || rawTitle === 'post_message';
+        if (isSwarmTool || isSwarmWait || isPostMessage) {
+          this.#syncSwarmFxStylesheet();
           this.#ensureSwarmWatcher(undefined, { refreshNow: true });
         }
         if (isSwarmWait) {
@@ -4624,12 +4626,12 @@ export class AppController {
     const pathOpts = this.#getSwarmPathOptions();
     const watcher = watchSwarmBoard(
       sid,
-      snapshot => {
+      (snapshot, meta) => {
         if (this.#shuttingDown || this.#swarmWatcher !== watcher) {
           watcher.stop();
           return;
         }
-        this.#applySwarmSnapshot(snapshot);
+        this.#applySwarmSnapshot(snapshot, { fromInitialLoad: !meta.changed });
       },
       {
         ...pathOpts,
@@ -4750,7 +4752,10 @@ export class AppController {
     }
   }
 
-  #applySwarmSnapshot(snapshot: SwarmBoardSnapshot | null): void {
+  #applySwarmSnapshot(
+    snapshot: SwarmBoardSnapshot | null,
+    options: { fromInitialLoad?: boolean } = {}
+  ): void {
     const prevState = this.store.getState();
     const prevBusy = prevState.isBusy;
 
@@ -4771,7 +4776,7 @@ export class AppController {
       }
     }
 
-    this.store.setSwarmSnapshot(snapshot);
+    this.store.setSwarmSnapshot(snapshot, { fromInitialLoad: options.fromInitialLoad });
     this.#syncSwarmFxStylesheet();
     this.#reconcileBackgroundActivity(prevBusy);
 
@@ -4806,7 +4811,7 @@ export class AppController {
       const sessionId = this.store.getState().sessionId ?? '';
       const snapshot = await loadSwarmBoard(sessionId, this.#getSwarmPathOptions());
       if (!this.#shuttingDown && snapshot !== null) {
-        this.#applySwarmSnapshot(snapshot);
+        this.#applySwarmSnapshot(snapshot, { fromInitialLoad: true });
       }
     }
   }
@@ -4827,7 +4832,7 @@ export class AppController {
     const sessionId = state.sessionId ?? '';
     const snapshot = await loadSwarmBoard(sessionId, this.#getSwarmPathOptions());
     if (this.#shuttingDown) return;
-    this.#applySwarmSnapshot(snapshot);
+    this.#applySwarmSnapshot(snapshot, { fromInitialLoad: true });
   }
 
   #toggleSwarmFollow(): void {

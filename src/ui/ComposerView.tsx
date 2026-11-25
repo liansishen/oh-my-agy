@@ -40,13 +40,12 @@ export interface OrbitBeeEntry extends OrbitBeeSpec {
 
 /**
  * Resolves the exact list of orbiting pixel bees to display around `omp.editor`
- * whenever the session is in swarm mode (`hasSwarm`), matching the real count
- * of non-killed members in the swarm (capped at `MAX_ORBIT_BEES`), each using
- * that member's colored sprite (`active` while working, `sleep` while waiting).
+ * strictly while the swarm is actively running (`isSwarmWorking`) and has been
+ * triggered in the current session (`swarmTriggeredInSession !== false`),
+ * matching the real count of non-killed members in the swarm (capped at `MAX_ORBIT_BEES`).
  */
 export function resolveOrbitSwarmBees(state: AppState): readonly OrbitBeeEntry[] {
-  const hasSwarm = Boolean(state.hasSwarm || state.swarmSnapshot !== null);
-  if (!hasSwarm) return [];
+  if (!state.isSwarmWorking || state.swarmTriggeredInSession === false) return [];
 
   const fallbackActive = state.beeActiveBlobId;
   const fallbackSleep = state.beeSleepBlobId ?? fallbackActive;
@@ -58,7 +57,7 @@ export function resolveOrbitSwarmBees(state: AppState): readonly OrbitBeeEntry[]
   if (activeMembers.length === 0) {
     const blobId = fallbackActive ?? fallbackSleep;
     if (!blobId) return [];
-    return [{ name: 'coordinator', isWorking: Boolean(state.isSwarmWorking), blobId }];
+    return [{ name: 'coordinator', isWorking: true, blobId }];
   }
 
   const out: OrbitBeeEntry[] = [];
