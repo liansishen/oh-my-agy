@@ -16,6 +16,8 @@ import {
   clampThoughtLevelForChoices,
   extractSessionControlState,
   filterOrchestratorRoleModels,
+  inferOrchestratorDefaultExecutorModel,
+  inferOrchestratorDefaultPlannerModel,
   isOrchestratorModelId,
   ORCHESTRATOR_PICKER_ID,
   resolveThoughtLevelsForModel,
@@ -1730,17 +1732,20 @@ export class AppStore {
           ? 'all'
           : 'default';
 
+    const configuredRole =
+      kind === 'planner' || kind === 'executor'
+        ? this.getConfiguredOrchestratorRole(kind)
+        : null;
     const targetModelId =
-      options.selectedId ?? (kind === 'model' ? this._controls.currentModelId : null);
+      options.selectedId ??
+      (kind === 'model' ? this._controls.currentModelId : configuredRole?.modelId ?? null);
     const targetThoughtChoices = isModelLikePicker
       ? resolveThoughtLevelsForModel(targetModelId, this._controls, this._modelThoughtLevels)
       : [];
     const currentEffectiveThought =
       kind === 'model' && !isOrchestratorModelId(targetModelId)
         ? this._controls.currentThoughtLevel
-        : kind === 'planner' || kind === 'executor'
-          ? 'high'
-          : undefined;
+        : configuredRole?.thoughtLevel;
     const defaultModelThinking = isModelLikePicker
       ? clampThoughtLevelForChoices(
           options.modelPickerThinking ?? currentEffectiveThought,
@@ -1851,9 +1856,15 @@ export class AppStore {
     ) {
       return null;
     }
+    const configuredRole =
+      this._picker.kind === 'planner' || this._picker.kind === 'executor'
+        ? this.getConfiguredOrchestratorRole(this._picker.kind)
+        : null;
     const targetModelId =
       this._picker.selectedId ??
-      (this._picker.kind === 'model' ? this._controls.currentModelId : null);
+      (this._picker.kind === 'model'
+        ? this._controls.currentModelId
+        : configuredRole?.modelId ?? null);
     const choices = resolveThoughtLevelsForModel(
       targetModelId,
       this._controls,
@@ -1863,9 +1874,7 @@ export class AppStore {
     const defaultActive =
       this._picker.kind === 'model' && !isOrchestratorModelId(targetModelId)
         ? this._controls.currentThoughtLevel
-        : this._picker.kind === 'planner' || this._picker.kind === 'executor'
-          ? 'high'
-          : undefined;
+        : configuredRole?.thoughtLevel;
     const rawCurrent =
       this._picker.modelPickerThinking ?? defaultActive ?? choices[0]!.value;
     const current = clampThoughtLevelForChoices(rawCurrent, choices) ?? choices[0]!.value;
@@ -2256,13 +2265,22 @@ export class AppStore {
       if (choices.length === 0) {
         this._picker.modelPickerThinking = undefined;
       } else {
+        const configuredRole =
+          this._picker.kind === 'planner' || this._picker.kind === 'executor'
+            ? this.getConfiguredOrchestratorRole(this._picker.kind)
+            : null;
+        const matchesConfiguredRole = Boolean(
+          configuredRole?.modelId &&
+          selectedId &&
+          selectedId.toLowerCase() === configuredRole.modelId.toLowerCase()
+        );
         const currentThoughtForSelected =
           this._picker.kind === 'model' &&
           !isOrchestratorModelId(selectedId) &&
           selectedId === this._controls.currentModelId
             ? this._controls.currentThoughtLevel
-            : this._picker.kind === 'planner' || this._picker.kind === 'executor'
-              ? 'high'
+            : matchesConfiguredRole
+              ? configuredRole?.thoughtLevel
               : undefined;
         const preferred =
           !this._picker.modelPickerThinkingDirty && currentThoughtForSelected !== undefined
@@ -2675,6 +2693,34 @@ export class AppStore {
   // -------------------------------------------------------------------------
   // Caret Completion Popup (`/` & `@`) — Aligned 1:1 with `omp` Figure 3
   // -------------------------------------------------------------------------
+
+  private getConfiguredOrchestratorRole(role: 'planner' | 'executor'): {
+    readonly modelId: string | null;
+    readonly thoughtLevel: string;
+  } {
+    const parsed = parseOrchestratorModelSpec(this._orchestratorSettings[role]);
+    const fallback =
+      role === 'planner'
+        ? inferOrchestratorDefaultPlannerModel(this._controls.currentModelId)
+        : inferOrchestratorDefaultExecutorModel(this._controls.currentModelId);
+    const targetName = parsed?.modelName ?? fallback?.modelName;
+    let modelId: string | null = fallback?.modelId ?? null;
+    if (targetName) {
+      const candidates = filterOrchestratorRoleModels(role, this._controls.availableModels);
+      const matched = candidates.find(
+        (c) =>
+          c.name.toLowerCase() === targetName.toLowerCase() ||
+          c.value.toLowerCase() === targetName.toLowerCase()
+      );
+      if (matched) {
+        modelId = matched.value;
+      }
+    }
+    return {
+      modelId,
+      thoughtLevel: parsed?.thoughtLevel ?? 'high',
+    };
+  }
 
   private resolveCommandStatusValue(cmd: SlashCommandDef): string | undefined {
     switch (cmd.statusKey) {

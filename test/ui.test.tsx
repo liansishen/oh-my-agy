@@ -8840,7 +8840,20 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     await waitFor(() => replayNodes().get('dock.composer.bar.planner.name')?.p['text'] === 'Opus 5.5');
     expect(replayNodes().get('dock.composer.bar.planner.effort')?.p['level']).toBe('medium');
 
-    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5)
+    // Re-opening `Plan` capsule preserves saved `medium` instead of falling back to `high`
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const reopenedOpusData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(reopenedOpusData.selectedId).toBe('claude-opus-5-5');
+    expect(reopenedOpusData.level?.value).toBe('medium');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
+
+    // Click `Exec` capsule -> strictly restricted to 2 Executor models (Hydrogen, Sonnet 5.5) and preserves saved `xhigh` (Extra)
     host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.executor', act: 'status.executor' });
     await waitFor(() => controller.store.getState().picker?.kind === 'executor');
     const execData = computePickerData(
@@ -8849,7 +8862,20 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       [],
     );
     expect(execData.items.map(i => i.id)).toEqual(['gemini-4-hydrogen', 'claude-sonnet-5-5']);
+    expect(execData.selectedId).toBe('gemini-4-hydrogen');
+    expect(execData.level?.value).toBe('xhigh');
+    expect(execData.level?.steps.find(s => s.id === 'xhigh')?.label).toBe('Extra');
     expect(execData.level?.steps.map(s => s.id)).toEqual(['low', 'medium', 'high', 'xhigh']);
+
+    // Moving onto a 3-level Executor clamps to `high`, and moving back restores saved `xhigh` (`Extra`)
+    controller.store.setPickerSelected('claude-sonnet-5-5');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('high');
+    controller.store.setPickerSelected('gemini-4-hydrogen');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('xhigh');
 
     // Select `claude-sonnet-5-5` (clamps xhigh -> high) and press Enter -> persists & shows short name `Sonnet 5.5`
     controller.store.setPickerSelected('claude-sonnet-5-5');
@@ -8865,6 +8891,39 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     });
     await waitFor(() => replayNodes().get('dock.composer.bar.executor.name')?.p['text'] === 'Sonnet 5.5');
     expect(replayNodes().get('dock.composer.bar.executor.effort')?.p['level']).toBe('high');
+
+    // Selecting 4-level Planner `gemini-4-neon` at `xhigh` (`Extra`) persists & re-opens at `xhigh` (`Extra`)
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    controller.store.setPickerSelected('gemini-4-neon');
+    controller.store.setModelPickerThinking('xhigh');
+    host.input.emit('\r');
+    await waitFor(() => controller.store.getState().picker === null);
+    await waitFor(
+      () => controller.store.getState().orchestratorSettings.planner === 'Gemini 4 Neon (Extra)',
+    );
+    await waitFor(() => replayNodes().get('dock.composer.bar.planner.effort')?.p['level'] === 'xhigh');
+
+    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'dock.composer.bar.planner', act: 'status.planner' });
+    await waitFor(() => controller.store.getState().picker?.kind === 'planner');
+    const reopenedNeonData = computePickerData(
+      controller.store.getState(),
+      controller.store.getState().picker!,
+      [],
+    );
+    expect(reopenedNeonData.selectedId).toBe('gemini-4-neon');
+    expect(reopenedNeonData.level?.value).toBe('xhigh');
+    expect(reopenedNeonData.level?.steps.find(s => s.id === 'xhigh')?.label).toBe('Extra');
+    controller.store.setPickerSelected('gemini-4-carbon');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('high');
+    controller.store.setPickerSelected('gemini-4-neon');
+    expect(
+      computePickerData(controller.store.getState(), controller.store.getState().picker!, []).level?.value,
+    ).toBe('xhigh');
+    host.input.emit('\x1b');
+    await waitFor(() => controller.store.getState().picker === null);
 
     // 3) `/thinking on` enables live thinking stream, persists `showThinking: true`, and keeps completed thoughts expanded
     await controller.submitInput('/thinking on');
