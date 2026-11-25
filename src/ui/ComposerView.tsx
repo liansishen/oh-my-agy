@@ -382,7 +382,13 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
   const showStopButton = state.isStreaming || (isBackgroundBusy && !hasDraftOrAttachments);
 
   const placeholder: string | readonly (string | SpanData)[] = !state.isReady
-    ? 'Connecting to agy acp… (you can start typing)'
+    ? state.connectionStatus === 'ready'
+      ? state.isReplaying
+        ? 'Restoring session… (you can start typing)'
+        : state.sessionId === null && !state.isCreatingSession
+          ? 'No active session — use /new or /resume'
+          : 'Starting session… (you can start typing)'
+      : 'Connecting to agy acp… (you can start typing)'
     : hasActiveQuestion
       ? 'Answer above, or type here to skip the questions'
       : hasPendingApproval && draft.text.length === 0
@@ -731,7 +737,7 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
             decor={decor}
             ghost={ghost}
             sendable={state.isReady}
-            typeahead={!state.isReady}
+            typeahead={state.connectionStatus !== 'ready'}
             placeholder={placeholder}
             maxLines={8}
             onEdit={ev => callbacks.onEdit(ev)}
@@ -773,8 +779,8 @@ export function ComposerView(props: ComposerViewProps): JSX.Element {
                 {
                   t: isOrchestratorActive
                     ? 'Orchestrator'
-                    : controls.currentModelName || (state.isReady ? 'model' : 'connecting…'),
-                  ...(state.isReady ? {} : { s: 'muted' }),
+                    : controls.currentModelName || (state.connectionStatus === 'ready' ? 'model' : 'connecting…'),
+                  ...(state.connectionStatus === 'ready' ? {} : { s: 'muted' }),
                 },
               ]}
               wrap="none"

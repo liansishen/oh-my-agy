@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { callTodoMcp, createTestController, replayWire } from './helpers/controller_harness';
 import {
   appendFileSync,
   existsSync,
@@ -11282,6 +11283,8 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     let failNextPrompt = false;
     let replayReminderText = '';
     let loadCount = 0;
+    let newCount = 0;
+    let todoMcpUrl: string | undefined;
     let pendingExternalPromptId: number | string | undefined;
 
     acp.setHandler((msg, h) => {
@@ -11299,10 +11302,17 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }
 
       if (msg.method === 'session/new') {
+        newCount += 1;
+        const p = msg.params as { mcpServers?: Array<{ name?: string; url?: string }> } | undefined;
+        const url = p?.mcpServers?.find(s => s.name === 'oma_todo')?.url;
+        if (url) todoMcpUrl = url;
         h.send({
           jsonrpc: '2.0',
           id: msg.id,
-          result: { sessionId: sessId, configOptions: DEFAULT_CONFIG_OPTIONS },
+          result: {
+            sessionId: newCount === 1 ? sessId : 'sess-todo-other',
+            configOptions: DEFAULT_CONFIG_OPTIONS,
+          },
         });
         return;
       }
@@ -11378,22 +11388,44 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
 
         const joined = blocks.map(b => b.text ?? '').join('\n');
         if (joined.includes('Retry succeeds')) {
-          h.send({
-            jsonrpc: '2.0',
-            method: 'session/update',
-            params: {
-              sessionId: sessId,
-              update: {
-                sessionUpdate: 'tool_call',
-                toolCallId: 'old-todo-1',
-                name: 'mcp_oma_todo_todo',
-                title: 'Run mcp_oma_todo_todo',
-                kind: 'other',
-                status: 'completed',
-                rawInput: { op: 'init', items: ['Old phantom task'] },
+          void (async () => {
+            if (todoMcpUrl) {
+              await fetch(todoMcpUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 777,
+                  method: 'tools/call',
+                  params: {
+                    _meta: {
+                      'antigravity.google/root_conversation_id': sessId,
+                    },
+                    name: 'todo',
+                    arguments: { op: 'init', items: ['Old phantom task'] },
+                  },
+                }),
+              });
+            }
+            h.send({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sessId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'old-todo-1',
+                  name: 'mcp_oma_todo_todo',
+                  title: 'Run mcp_oma_todo_todo',
+                  kind: 'other',
+                  status: 'completed',
+                  rawInput: { op: 'init', items: ['Old phantom task'] },
+                },
               },
-            },
-          });
+            });
+            h.send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+          })();
+          return;
         }
         if (joined.includes('Ask external todo')) {
           pendingExternalPromptId = msg.id;
@@ -11525,7 +11557,14 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       }
       await Bun.sleep(10);
     }
-    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1 });
+    expect(persistedTodo?.todoState).toEqual({ phases: [], toolCallCount: 1, source: 'user' });
+
+    await controller.submitInput('/new');
+    await waitFor(
+      () =>
+        controller.store.getState().sessionId === 'sess-todo-other' &&
+        controller.store.getState().isReady
+    );
 
     await controller.submitInput('/resume');
     await waitFor(
@@ -11533,10 +11572,12 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
         controller.store.getState().picker?.kind === 'resume' &&
         !controller.store.getState().picker?.loading
     );
+    controller.store.setPickerSelected(sessId);
     host.input.emit('\r');
     await waitFor(
       () =>
         loadCount === 1 &&
+        controller.store.getState().sessionId === sessId &&
         !controller.store.getState().isReplaying &&
         controller.store.transcript.turns.length === 1
     );
@@ -12290,56 +12331,58 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
           return;
         }
         currentSessionId = p.sessionId;
-        server.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: p.sessionId,
-            update: {
-              sessionUpdate: 'user_message_chunk',
-              content: { type: 'text', text: '/plan build feature\n\n<system-reminder>\nThe user manually modified the todo list (manual).\nCurrent todo list:\n\n# Todos\n- [/] First task\n</system-reminder>' },
+        if (p.sessionId === 'sess-attach') {
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text: '/plan build feature\n\n<system-reminder>\nThe user manually modified the todo list (manual).\nCurrent todo list:\n\n# Todos\n- [/] First task\n</system-reminder>' },
+              },
             },
-          },
-        });
-        server.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: p.sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId: 'tc-attach-perm',
-              name: 'run_command',
-              kind: 'execute',
-              status: 'pending',
-              title: 'Run echo ok',
+          });
+          server.send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: p.sessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-attach-perm',
+                name: 'run_command',
+                kind: 'execute',
+                status: 'pending',
+                title: 'Run echo ok',
+              },
             },
-          },
-        });
-        // Reattached active permission & foreign-session stale permission during session/load replay
-        server.send({
-          jsonrpc: '2.0',
-          id: 7001,
-          method: 'session/request_permission',
-          params: {
-            sessionId: p.sessionId,
-            toolCall: { toolCallId: 'tc-attach-perm', name: 'run_command', kind: 'execute', title: 'Run echo ok' },
-            options: [
-              { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-              { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-            ],
-          },
-        });
-        server.send({
-          jsonrpc: '2.0',
-          id: 7002,
-          method: 'session/request_permission',
-          params: {
-            sessionId: 'sess-other-stale',
-            toolCall: { toolCallId: 'tc-stale', title: 'Stale' },
-            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
-          },
-        });
+          });
+          // Reattached active permission & foreign-session stale permission during session/load replay
+          server.send({
+            jsonrpc: '2.0',
+            id: 7001,
+            method: 'session/request_permission',
+            params: {
+              sessionId: p.sessionId,
+              toolCall: { toolCallId: 'tc-attach-perm', name: 'run_command', kind: 'execute', title: 'Run echo ok' },
+              options: [
+                { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+                { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+              ],
+            },
+          });
+          server.send({
+            jsonrpc: '2.0',
+            id: 7002,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'sess-other-stale',
+              toolCall: { toolCallId: 'tc-stale', title: 'Stale' },
+              options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+            },
+          });
+        }
         server.send({
           jsonrpc: '2.0',
           id: msg.id,
@@ -12526,7 +12569,7 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     expect(modelNodes.get('layer.modal')?.p['subtitle']).toBe('Auto-compact: 800k (80%) (override)');
     controller.store.closePicker();
 
-    // 3. Switching to deleted session (-32002) cleans stale local anchor and warns cleanly
+    // 3. Switching to deleted session (-32002) cleans stale local anchor, restores previous session, and warns cleanly
     await controller.submitInput('/resume');
     await waitFor(
       () =>
@@ -12535,8 +12578,15 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     );
     controller.store.setPickerSelected('sess-missing');
     host.input.emit('\r');
-    await waitFor(() => loadCount === 1);
-    await waitFor(() => !existsSync(previewStore.getFilePath('sess-missing')));
+    await waitFor(
+      () =>
+        loadCount >= 2 &&
+        !existsSync(previewStore.getFilePath('sess-missing')) &&
+        controller.store.getState().sessionId === 'sess-init' &&
+        controller.store.getState().isReady &&
+        Boolean(controller.store.getState().activeToast?.text.includes('not found')) &&
+        Boolean(controller.store.getState().activeToast?.text.includes('restored previous session')),
+    );
     expect(controller.store.getState().activeToast?.text).toContain('not found');
 
     // 4. Reattaching to running session preserves buffered permission prompt, sets OSC blocked,
@@ -12573,567 +12623,203 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
     const sessionId = 'sess-1516';
     const swarmDir = join(tmp, 'swarm');
     mkdirSync(swarmDir, { recursive: true });
-    writeFileSync(
-      join(swarmDir, 'swarm.json'),
-      JSON.stringify({
-        version: 1,
-        backend: 'local',
-        swarm_id: sessionId,
-        created_at: '2026-11-24T00:00:00Z',
-      }),
-      'utf8',
-    );
-    writeFileSync(
-      join(swarmDir, 'members.json'),
-      JSON.stringify({
-        title: '1.5.16 Swarm',
-        members: {
-          coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions' },
-        },
-      }),
-      'utf8',
-    );
-    writeFileSync(
-      join(swarmDir, 'board.jsonl'),
-      JSON.stringify({
-        seq: 1,
-        agent: 'system',
-        text: 'Board wakeup scheduled',
-        time: '2026-11-24 12:00:00',
-      }) + '\n',
-      'utf8',
-    );
+    writeFileSync(join(swarmDir, 'swarm.json'), JSON.stringify({ version: 1, backend: 'local', swarm_id: sessionId, created_at: '2026-11-24T00:00:00Z' }), 'utf8');
+    writeFileSync(join(swarmDir, 'members.json'), JSON.stringify({ title: '1.5.16 Swarm', members: { coordinator: { role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions' } } }), 'utf8');
+    writeFileSync(join(swarmDir, 'board.jsonl'), `${JSON.stringify({ seq: 1, agent: 'system', text: 'Board wakeup scheduled', time: '2026-11-24 12:00:00' })}\n`, 'utf8');
 
-    const host = new FakeTernHost();
-    const session = await createConnectedSession(host);
-    const acp = new MockAcpHarness();
-    const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
     let fakeNow = 100_000;
-    const elicitationReplies: RpcEnvelope[] = [];
+    const elicitationReplies: Array<{ id?: string | number; result?: unknown }> = [];
     let promptResolver: ((res: { stopReason: string }) => void) | null = null;
-    let promptId: string | number | undefined;
 
-    acp.setHandler((msg, h) => {
-      if (msg.method === 'initialize') {
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            protocolVersion: 1,
-            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
-            agentCapabilities: { loadSession: true },
-          },
-        });
-      } else if (msg.method === 'session/new') {
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            sessionId,
-            configOptions: DEFAULT_CONFIG_OPTIONS,
-          },
-        });
-      } else if (msg.method === 'session/prompt') {
-        promptId = msg.id;
-        new Promise<{ stopReason: string }>((resolve) => {
-          promptResolver = resolve;
-        }).then((res) => {
-          h.send({ jsonrpc: '2.0', id: promptId, result: res });
-        });
-      } else if (msg.result !== undefined) {
-        elicitationReplies.push(msg);
-      } else if (msg.method === 'session/close') {
-        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-        h.crash(0);
-      }
+    const ctx = await createTestController({
+      tmp,
+      newSessionId: sessionId,
+      controllerOptions: { swarmDir, now: () => fakeNow },
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
+      },
+      onRpc: msg => {
+        if (msg.result !== undefined) {
+          elicitationReplies.push({ id: msg.id, result: msg.result });
+          return true;
+        }
+      },
     });
+    await ctx.boot();
 
-    const controller = new AppController({
-      cli: parseCliArgs([]),
-      config: DEFAULT_CONFIG,
-      cwd: tmp,
-      session,
-      output: host.safeOutput,
-      acpSpawn: acp.createSpawnFn(),
-      previewStore,
-      swarmDir,
-      configPath: join(tmp, 'config.toml'),
-      agySettingsPath: join(tmp, 'settings.json'),
-      workspaceSkillsDir: join(tmp, 'empty-ws'),
-      globalSkillsDir: join(tmp, 'empty-global'),
-      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
-      dataDir: join(tmp, 'data'),
-      gitExec: async () => ({ exitCode: 128, stdout: '' }),
-      now: () => fakeNow,
-      throttleMs: 5,
-      installSignals: false,
-    });
-
-    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
-      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
-      const addSub = (n: WireNode): void => {
-        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
-        if (n.c) {
-          for (const child of n.c) addSub(child);
-        }
-      };
-      const delSub = (id: string): void => {
-        nodes.delete(id);
-        const prefix = `${id}.`;
-        for (const k of [...nodes.keys()]) {
-          if (k.startsWith(prefix)) nodes.delete(k);
-        }
-      };
-      for (const op of host.allOps) {
-        if (op[0] === 'add') addSub(op[4]);
-        else if (op[0] === 'del') delSub(op[1]);
-        else if (op[0] === 'set') {
-          const entry = nodes.get(op[1]);
-          if (entry) {
-            for (const [k, v] of Object.entries(op[2])) {
-              if (v === null) delete entry.p[k];
-              else entry.p[k] = v;
-            }
-          }
-        }
-      }
-      return nodes;
-    };
-
-    const runPromise = controller.run();
-    await controller.readyPromise;
-    await waitFor(() => controller.store.getState().isReady);
-
-    // 1. Phase-aware omp.working: Thinking -> Running command -> Responding
-    await controller.submitInput('Check phase timers');
+    await ctx.controller.submitInput('Check phase timers');
     await waitFor(() => promptResolver !== null);
 
     fakeNow = 102_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning…' } },
-      },
-    });
-    await waitFor(() => {
-      const labelNode = replayWire().get('dock.activity.status.working.label');
-      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Thinking…');
-    });
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning…' } });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Thinking…'));
     fakeNow = 107_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ' more' } },
-      },
-    });
-    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 5000);
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: ' more' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 5000);
 
     fakeNow = 108_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId: 'tc-phase-bash',
-          kind: 'execute',
-          name: 'run_command',
-          status: 'in_progress',
-          title: 'echo hi',
-        },
-      },
-    });
-    await waitFor(() => {
-      const labelNode = replayWire().get('dock.activity.status.working.label');
-      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Running command…');
-    });
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-phase-bash', kind: 'execute', name: 'run_command', status: 'in_progress', title: 'echo hi' });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Running command…'));
     fakeNow = 111_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: 'tc-phase-bash',
-          status: 'in_progress',
-          rawOutput: { output: 'hi\n' },
-        },
-      },
-    });
-    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 3000);
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-phase-bash', status: 'in_progress', rawOutput: { output: 'hi\n' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 3000);
 
-    // Update steps with done/skipped/failed renders extended status & target
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId: 'tc-steps-ui',
-          name: 'update_steps',
-          status: 'completed',
-          rawInput: {
-            steps: [
-              { title: 'Step A', status: 'done' },
-              { title: 'Step B', status: 'skipped' },
-              { title: 'Step C', status: 'failed' },
-            ],
-          },
-        },
-      },
+    ctx.acp.sendUpdate(sessionId, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-steps-ui',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Step A', status: 'done' }, { title: 'Step B', status: 'skipped' }, { title: 'Step C', status: 'failed' }] },
     });
-    await waitFor(() => replayWire().get('main.t0-tc-steps-ui')?.p['target'] === '1/3 (1 skipped, 1 failed)');
-    const stepsToolUi = replayWire().get('main.t0-tc-steps-ui');
+    await waitFor(() => ctx.replayWire().get('main.t0-tc-steps-ui')?.p['target'] === '1/3 (1 skipped, 1 failed)');
+    const stepsToolUi = ctx.replayWire().get('main.t0-tc-steps-ui');
     expect(stepsToolUi?.p['role']).toBe('omp.tool.todo');
     expect(stepsToolUi?.p['title']).toBe('Todo');
     expect(stepsToolUi?.p['status']).toBe('error');
     expect(stepsToolUi?.p['collapsed']).toBe(true);
     expect(stepsToolUi?.p['collapsible']).toBe(true);
     expect(stepsToolUi?.p['frame']).toBe('inline');
-    expect(replayWire().has('main.plan')).toBe(false);
-    expect(replayWire().get('dock.activity.todo')?.p['role']).toBe('omp.hud.todo');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
+    expect(ctx.replayWire().get('dock.activity.todo')?.p['role']).toBe('omp.hud.todo');
 
     fakeNow = 112_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: 'tc-phase-bash',
-          status: 'completed',
-          rawOutput: { output: 'hi', exit_code: 0 },
-        },
-      },
-    });
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } },
-      },
-    });
-    await waitFor(() => {
-      const labelNode = replayWire().get('dock.activity.status.working.label');
-      return JSON.stringify(labelNode?.p['spans'] ?? '').includes('Responding…');
-    });
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-phase-bash', status: 'completed', rawOutput: { output: 'hi', exit_code: 0 } });
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } });
+    await waitFor(() => JSON.stringify(ctx.replayWire().get('dock.activity.status.working.label')?.p['spans'] ?? '').includes('Responding…'));
     fakeNow = 114_000;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' done' } },
-      },
-    });
-    await waitFor(() => replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 2000);
+    ctx.acp.sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' done' } });
+    await waitFor(() => ctx.replayWire().get('dock.activity.status.working.elapsed')?.p['age'] === 2000);
 
-    // 2. Concurrent elicitation/create requests queue cleanly and show message + queued badge
-    acp.send({
+    ctx.acp.send({
       jsonrpc: '2.0',
       id: 9001,
       method: 'elicitation/create',
-      params: {
-        sessionId,
-        mode: 'form',
-        message: 'Subagent researcher asks:',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            choice1: { type: 'string', title: 'Pick mode', enum: ['fast', 'deep'] },
-          },
-        },
-      },
+      params: { sessionId, mode: 'form', message: 'Subagent researcher asks:', requestedSchema: { type: 'object', properties: { choice1: { type: 'string', title: 'Pick mode', enum: ['fast', 'deep'] } } } },
     });
-    await waitFor(() => controller.store.getState().activeQuestion?.requestId === 9001);
+    await waitFor(() => ctx.controller.store.getState().activeQuestion?.requestId === 9001);
 
-    acp.send({
+    ctx.acp.send({
       jsonrpc: '2.0',
       id: 9002,
       method: 'elicitation/create',
-      params: {
-        sessionId,
-        mode: 'form',
-        message: 'Subagent verifier asks:',
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            note2: { type: 'string', title: 'Provide note' },
-          },
-        },
-      },
+      params: { sessionId, mode: 'form', message: 'Subagent verifier asks:', requestedSchema: { type: 'object', properties: { note2: { type: 'string', title: 'Provide note' } } } },
     });
-    await waitFor(() => controller.store.getState().queuedQuestionCount === 1);
+    await waitFor(() => ctx.controller.store.getState().queuedQuestionCount === 1);
     expect(elicitationReplies).toHaveLength(0);
-    const metaNodes = replayWire();
-    expect(metaNodes.get('main.questions-meta.msg')?.p['spans']).toEqual([
-      { t: 'Subagent researcher asks:', s: 'muted' },
-    ]);
+    const metaNodes = ctx.replayWire();
+    expect(metaNodes.get('main.questions-meta.msg')?.p['spans']).toEqual([{ t: 'Subagent researcher asks:', s: 'muted' }]);
     expect(metaNodes.get('main.questions-meta.queued')?.p['text']).toBe('+1 queued');
 
-    // Submit first -> promotes second and auto-focuses main.questions.note2.other
-    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { choice1: 'fast' } });
+    ctx.testHost!.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { choice1: 'fast' } });
     await waitFor(() => elicitationReplies.length === 1);
     expect(elicitationReplies[0]?.id).toBe(9001);
     expect(elicitationReplies[0]?.result).toEqual({ action: 'accept', content: { choice1: 'fast' } });
-    await waitFor(() => controller.store.getState().activeQuestion?.requestId === 9002);
-    expect(controller.currentSurfaceFocus).toBe('main.questions.note2.other');
+    await waitFor(() => ctx.controller.store.getState().activeQuestion?.requestId === 9002);
+    expect(ctx.controller.currentSurfaceFocus).toBe('main.questions.note2.other');
 
-    host.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { note2: 'looks good' } });
+    ctx.testHost!.input.emitTspEvent({ ev: 'action', sf: 'oma', id: 'main.questions', act: 'submit', value: { note2: 'looks good' } });
     await waitFor(() => elicitationReplies.length === 2);
     expect(elicitationReplies[1]?.id).toBe(9002);
     expect(elicitationReplies[1]?.result).toEqual({ action: 'accept', content: { note2: 'looks good' } });
 
     promptResolver!({ stopReason: 'end_turn' });
-    await waitFor(() => !controller.store.getState().isStreaming);
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
 
-    // 3. Swarm board displays "system" posts with bell icon & info badge instead of bee sprite
-    await controller.submitInput('/swarm board');
-    await waitFor(() => controller.store.getState().swarmBoardOpen);
-    const swarmNodes = replayWire();
+    await ctx.controller.submitInput('/swarm board');
+    await waitFor(() => ctx.controller.store.getState().swarmBoardOpen);
+    const swarmNodes = ctx.replayWire();
     expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['icon']).toBe('bell');
     expect(swarmNodes.get('layer.swarm.body.split.posts-pane.posts.seq-1')?.p['tone']).toBe('info');
     expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.head.who.icon')?.p['name']).toBe('bell');
     expect(swarmNodes.get('layer.swarm.body.split.detail-pane.detail-1.meta-row.system')?.p['text']).toBe('system');
 
-    await controller.shutdown({ cleanExit: true });
-    await runPromise;
+    await ctx.shutdown();
   });
 
   test('ui.todo_provider setting switches between native update_steps and embedded MCP oma_todo across /settings and /new', async () => {
     const tmp = makeTempDir();
     const configPath = join(tmp, 'config.toml');
-    const host = new FakeTernHost();
-    const session = await createConnectedSession(host);
-    const acp = new MockAcpHarness();
-    const newSessionParams: Array<Record<string, unknown>> = [];
     let promptResolver: ((res: { stopReason: string }) => void) | null = null;
-    let shuttingDown = false;
 
-    acp.setHandler((msg, h) => {
-      if (msg.method === 'initialize') {
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            protocolVersion: 1,
-            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
-            agentCapabilities: { loadSession: true },
-          },
-        });
-      } else if (msg.method === 'session/new') {
-        newSessionParams.push((msg.params ?? {}) as Record<string, unknown>);
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            sessionId: `sess-todo-mode-${newSessionParams.length}`,
-            configOptions: DEFAULT_CONFIG_OPTIONS,
-          },
-        });
-      } else if (msg.method === 'session/prompt') {
-        const promptId = msg.id;
-        new Promise<{ stopReason: string }>(resolve => {
-          promptResolver = resolve;
-        }).then(res => {
-          h.send({ jsonrpc: '2.0', id: promptId, result: res });
-        });
-      } else if (msg.method === 'session/close') {
-        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-        if (shuttingDown) {
-          h.crash(0);
-        }
-      } else if (msg.id !== undefined) {
-        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-      }
-    });
-
-    const controller = new AppController({
-      cli: parseCliArgs([]),
-      config: {
-        ...DEFAULT_CONFIG,
-        ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' },
+    const ctx = await createTestController({
+      tmp,
+      todoProvider: 'native',
+      newSessionId: n => `sess-todo-mode-${n}`,
+      controllerOptions: { configPath },
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
       },
-      cwd: tmp,
-      session,
-      output: host.safeOutput,
-      acpSpawn: acp.createSpawnFn(),
-      previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
-      configPath,
-      agySettingsPath: join(tmp, 'settings.json'),
-      workspaceSkillsDir: join(tmp, 'empty-ws'),
-      globalSkillsDir: join(tmp, 'empty-global'),
-      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
-      dataDir: join(tmp, 'data'),
-      gitExec: async () => ({ exitCode: 128, stdout: '' }),
-      installSignals: false,
-      throttleMs: 5,
     });
+    await ctx.boot();
 
-    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
-      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
-      const addSub = (n: WireNode): void => {
-        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
-        if (n.c) {
-          for (const child of n.c) addSub(child);
-        }
-      };
-      const delSub = (id: string): void => {
-        nodes.delete(id);
-        const prefix = `${id}.`;
-        for (const k of [...nodes.keys()]) {
-          if (k.startsWith(prefix)) nodes.delete(k);
-        }
-      };
-      for (const op of host.allOps) {
-        if (op[0] === 'add') addSub(op[4]);
-        else if (op[0] === 'del') delSub(op[1]);
-        else if (op[0] === 'set') {
-          const entry = nodes.get(op[1]);
-          if (entry) {
-            for (const [k, v] of Object.entries(op[2])) {
-              if (v === null) delete entry.p[k];
-              else entry.p[k] = v;
-            }
-          }
-        }
-      }
-      return nodes;
-    };
+    expect(ctx.acp.newParams).toHaveLength(1);
+    expect(ctx.acp.newParams[0]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.newParams[0]?.['_meta']).toBeUndefined();
 
-    const runPromise = controller.run();
-    await controller.readyPromise;
-    await waitFor(() => controller.store.getState().isReady);
-
-    // 1. Native mode startup skips oma_todo MCP server & systemPrompt.append
-    expect(newSessionParams).toHaveLength(1);
-    expect(newSessionParams[0]?.mcpServers).toEqual([]);
-    expect(newSessionParams[0]?._meta).toBeUndefined();
-
-    // 2. Receiving native update_steps renders HUD + collapsible in-turn todo row + supports read-only /todo & warns on mutating /todo
-    await controller.submitInput('Track with native update_steps');
+    await ctx.controller.submitInput('Track with native update_steps');
     await waitFor(() => promptResolver !== null);
-    const activeSessionId = controller.store.getState().sessionId;
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId: activeSessionId,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId: 'tc-native-steps',
-          name: 'update_steps',
-          status: 'completed',
-          rawInput: {
-            steps: [
-              { title: 'Step 1', status: 'done' },
-              { title: 'Step 2', status: 'in_progress' },
-            ],
-          },
-        },
-      },
+    ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-native-steps',
+      name: 'update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Step 1', status: 'done' }, { title: 'Step 2', status: 'in_progress' }] },
     });
     promptResolver!({ stopReason: 'end_turn' });
     promptResolver = null;
-    await waitFor(() => !controller.store.getState().isStreaming);
-    await waitFor(
-      () =>
-        replayWire().has('dock.activity.todo') &&
-        replayWire().get('main.t0-tc-native-steps')?.p['target'] === '1/2',
-    );
-    expect(replayWire().has('main.plan')).toBe(false);
-    const nativeStepsNode = replayWire().get('main.t0-tc-native-steps');
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
+    await waitFor(() => ctx.replayWire().has('dock.activity.todo') && ctx.replayWire().get('main.t0-tc-native-steps')?.p['target'] === '1/2');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
+    const nativeStepsNode = ctx.replayWire().get('main.t0-tc-native-steps');
     expect(nativeStepsNode?.p['role']).toBe('omp.tool.todo');
     expect(nativeStepsNode?.p['status']).toBe('done');
     expect(nativeStepsNode?.p['collapsed']).toBe(true);
     expect(nativeStepsNode?.p['frame']).toBe('inline');
-    expect(controller.store.transcript.getToolById('tc-native-steps')?.target).toBe('1/2');
 
-    host.input.emitTspEvent({
-      ev: 'toggle',
-      sf: 'oma',
-      id: 'main.t0-tc-native-steps',
-      collapsed: false,
-    });
-    await waitFor(() => replayWire().get('main.t0-tc-native-steps')?.p['collapsed'] === false);
-    expect(replayWire().get('main.t0-tc-native-steps')?.p['frame']).toBe('card');
-    expect(replayWire().get('main.t0-tc-native-steps.checklist')?.p['mode']).toBe('full');
+    ctx.testHost!.input.emitTspEvent({ ev: 'toggle', sf: 'oma', id: 'main.t0-tc-native-steps', collapsed: false });
+    await waitFor(() => ctx.replayWire().get('main.t0-tc-native-steps')?.p['collapsed'] === false);
+    expect(ctx.replayWire().get('main.t0-tc-native-steps')?.p['frame']).toBe('card');
+    expect(ctx.replayWire().get('main.t0-tc-native-steps.checklist')?.p['mode']).toBe('full');
 
-    await controller.submitInput('/todo');
-    const latestNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    await ctx.controller.submitInput('/todo');
+    const latestNotice = ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
     expect(latestNotice?.text).toContain('# Plan');
     expect(latestNotice?.text).toContain('- [x] Step 1');
     expect(latestNotice?.text).toContain('- [/] Step 2');
 
-    await controller.submitInput('/todo done Step 2');
-    expect(
-      controller.store
-        .getState()
-        .toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)')),
-    ).toBe(true);
+    await ctx.controller.submitInput('/todo done Step 2');
+    expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)'))).toBe(true);
 
-    // 3. Switching ui.todo_provider -> 'mcp' in /settings persists to config.toml and injects oma_todo on /new
-    await controller.submitInput('/settings interface');
-    await waitFor(() => controller.store.getState().settings?.page === 'interface');
-    host.input.emitTspEvent({
-      ev: 'change',
-      sf: 'oma',
-      id: 'layer.settings',
-      item: 'ui.todo_provider',
-      value: 'mcp',
-    });
-    await waitFor(
-      () =>
-        existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'),
-    );
-    expect(
-      controller.store
-        .getState()
-        .toasts.some(t => t.tone === 'info' && t.text.includes('/new')),
-    ).toBe(true);
+    await ctx.controller.submitInput('/settings interface');
+    await waitFor(() => ctx.controller.store.getState().settings?.page === 'interface');
+    ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'mcp' });
+    await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'));
+    expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'info' && t.text.includes('/new'))).toBe(true);
 
-    host.input.emit('\x1b');
-    await waitFor(() => controller.store.getState().settings === null);
-    await controller.submitInput('/new');
-    await waitFor(() => newSessionParams.length === 2);
-    const mcpServers = newSessionParams[1]?.mcpServers as Array<{ name?: string }> | undefined;
+    ctx.testHost!.input.emit('\x1b');
+    await waitFor(() => ctx.controller.store.getState().settings === null);
+    await ctx.controller.submitInput('/new');
+    await waitFor(() => ctx.acp.newParams.length === 2);
+    const mcpServers = ctx.acp.newParams[1]?.['mcpServers'] as Array<{ name?: string }> | undefined;
     expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
-    const meta1 = newSessionParams[1]?._meta as
-      | { antigravity?: { systemPrompt?: { append?: string } } }
-      | undefined;
+    const meta1 = ctx.acp.newParams[1]?.['_meta'] as { antigravity?: { systemPrompt?: { append?: string } } } | undefined;
     expect(meta1?.antigravity?.systemPrompt?.append).toContain('mcp_oma_todo_todo');
 
-    // 4. Switching ui.todo_provider -> 'native' in /settings stops injecting oma_todo on next /new
-    await controller.submitInput('/settings interface');
-    await waitFor(() => controller.store.getState().settings?.page === 'interface');
-    host.input.emitTspEvent({
-      ev: 'change',
-      sf: 'oma',
-      id: 'layer.settings',
-      item: 'ui.todo_provider',
-      value: 'native',
-    });
+    await ctx.controller.submitInput('/settings interface');
+    await waitFor(() => ctx.controller.store.getState().settings?.page === 'interface');
+    ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'native' });
     await waitFor(() => readFileSync(configPath, 'utf8').includes('todo_provider = "native"'));
-    host.input.emit('\x1b');
-    await waitFor(() => controller.store.getState().settings === null);
+    ctx.testHost!.input.emit('\x1b');
+    await waitFor(() => ctx.controller.store.getState().settings === null);
 
-    await controller.submitInput('/new');
-    await waitFor(() => newSessionParams.length === 3);
-    expect(newSessionParams[2]?.mcpServers).toEqual([]);
-    expect(newSessionParams[2]?._meta).toBeUndefined();
+    await ctx.controller.submitInput('/new');
+    await waitFor(() => ctx.acp.newParams.length === 3);
+    expect(ctx.acp.newParams[2]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.newParams[2]?.['_meta']).toBeUndefined();
 
-    shuttingDown = true;
-    await controller.shutdown({ cleanExit: true });
-    await runPromise;
+    await ctx.shutdown();
   });
 
   test('resuming an unfinished mcp_oma_todo session in native mode skips stale anchor reminder and lets update_steps take over HUD and /todo', async () => {
@@ -13147,525 +12833,358 @@ describe('UI + Controller + Real @stencil-hq/tern Session/Surface E2E', () => {
       turnCount: 1,
       updatedAt: '2026-11-24T06:00:00.000Z',
       preview: [{ role: 'user', text: 'Run legacy MCP tasks' }],
-      todoState: {
-        phases: [
-          {
-            name: 'Anchor Phase',
-            tasks: [{ content: 'Stale anchor task', status: 'in_progress' }],
-          },
-        ],
-        toolCallCount: 2,
-      },
+      todoState: { phases: [{ name: 'Anchor Phase', tasks: [{ content: 'Stale anchor task', status: 'in_progress' }] }], toolCallCount: 2, source: 'user' },
     });
 
-    const host = new FakeTernHost();
-    const session = await createConnectedSession(host);
-    const acp = new MockAcpHarness();
-    let capturedLoadParams: Record<string, unknown> | undefined;
-    const sentPrompts: Array<Array<{ type?: string; text?: string }>> = [];
     let promptResolver: ((res: { stopReason: string }) => void) | null = null;
-    let shuttingDown = false;
-
-    acp.setHandler((msg, h) => {
-      if (msg.method === 'initialize') {
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            protocolVersion: 1,
-            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
-            agentCapabilities: { loadSession: true },
-          },
-        });
-      } else if (msg.method === 'session/load') {
-        capturedLoadParams = (msg.params ?? {}) as Record<string, unknown>;
-        h.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: oldSessionId,
-            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Old MCP work' } },
-          },
-        });
-        h.send({
-          jsonrpc: '2.0',
-          method: 'session/update',
-          params: {
-            sessionId: oldSessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId: 'tc-legacy-oma',
-              name: 'mcp_oma_todo_todo',
-              status: 'completed',
-              rawInput: {
-                op: 'init',
-                items: ['Old MCP task A', 'Old MCP task B'],
-              },
-            },
-          },
-        });
-        h.send({
-          jsonrpc: '2.0',
-          id: msg.id,
-          result: {
-            sessionId: oldSessionId,
-            configOptions: DEFAULT_CONFIG_OPTIONS,
-          },
-        });
-      } else if (msg.method === 'session/prompt') {
-        const promptId = msg.id;
-        const p = (msg.params ?? {}) as { prompt?: Array<{ type?: string; text?: string }> };
-        sentPrompts.push(p.prompt ?? []);
-        new Promise<{ stopReason: string }>(resolve => {
-          promptResolver = resolve;
-        }).then(res => {
-          h.send({ jsonrpc: '2.0', id: promptId, result: res });
-        });
-      } else if (msg.method === 'session/close') {
-        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-        if (shuttingDown) h.crash(0);
-      } else if (msg.id !== undefined) {
-        h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-      }
-    });
-
-    const controller = new AppController({
-      cli: parseCliArgs(['--resume', oldSessionId]),
-      config: {
-        ...DEFAULT_CONFIG,
-        ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' },
-      },
-      cwd: tmp,
-      session,
-      output: host.safeOutput,
-      acpSpawn: acp.createSpawnFn(),
+    const ctx = await createTestController({
+      tmp,
       previewStore,
-      configPath: join(tmp, 'config.toml'),
-      agySettingsPath: join(tmp, 'settings.json'),
-      workspaceSkillsDir: join(tmp, 'empty-ws'),
-      globalSkillsDir: join(tmp, 'empty-global'),
-      agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
-      dataDir: join(tmp, 'data'),
-      gitExec: async () => ({ exitCode: 128, stdout: '' }),
-      installSignals: false,
-      throttleMs: 5,
+      cliArgs: ['--resume', oldSessionId],
+      todoProvider: 'native',
+      replayUpdates: () => [
+        { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Old MCP work' } },
+        { sessionUpdate: 'tool_call', toolCallId: 'tc-legacy-oma', name: 'mcp_oma_todo_todo', status: 'completed', rawInput: { op: 'init', items: ['Old MCP task A', 'Old MCP task B'] } },
+      ],
+      onPrompt: (_rec, msg, acp) => {
+        new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+        return true;
+      },
     });
+    await ctx.boot();
 
-    const replayWire = (): Map<string, { k: string; p: Record<string, unknown> }> => {
-      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
-      const addSub = (n: WireNode): void => {
-        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
-        if (n.c) {
-          for (const child of n.c) addSub(child);
-        }
-      };
-      const delSub = (id: string): void => {
-        nodes.delete(id);
-        const prefix = `${id}.`;
-        for (const k of [...nodes.keys()]) {
-          if (k.startsWith(prefix)) nodes.delete(k);
-        }
-      };
-      for (const op of host.allOps) {
-        if (op[0] === 'add') addSub(op[4]);
-        else if (op[0] === 'del') delSub(op[1]);
-        else if (op[0] === 'set') {
-          const entry = nodes.get(op[1]);
-          if (entry) {
-            for (const [k, v] of Object.entries(op[2])) {
-              if (v === null) delete entry.p[k];
-              else entry.p[k] = v;
-            }
-          }
-        }
-      }
-      return nodes;
-    };
+    expect(ctx.acp.loadParams[0]?.['mcpServers']).toEqual([]);
+    expect(ctx.acp.loadParams[0]?.['_meta']).toBeUndefined();
+    expect(ctx.controller.store.transcript.todoPhases[0]?.tasks[0]?.content).toBe('Old MCP task A');
 
-    const runPromise = controller.run();
-    await controller.readyPromise;
-    await waitFor(
-      () =>
-        controller.store.getState().isReady &&
-        !controller.store.getState().isReplaying,
-    );
-
-    expect(capturedLoadParams?.mcpServers).toEqual([]);
-    expect(capturedLoadParams?._meta).toBeUndefined();
-    expect(controller.store.transcript.todoPhases[0]?.tasks[0]?.content).toBe('Old MCP task A');
-
-    // Subsequent turn in native mode does NOT inject stale MCP `<system-reminder>`,
-    // and even if a failed `Run mcp_oma_todo_todo` occurs first, real `Run update_steps` (without `name`) takes over HUD + main.plan
-    await controller.submitInput('Continue with native update_steps');
+    await ctx.controller.submitInput('Continue with native update_steps');
     await waitFor(() => promptResolver !== null);
-    expect(sentPrompts).toHaveLength(1);
-    expect(sentPrompts[0]?.some(b => (b.text ?? '').includes('<system-reminder>'))).toBe(false);
+    expect(ctx.acp.sentPrompts).toHaveLength(1);
+    expect(ctx.acp.sentPrompts[0]?.text.includes('<system-reminder>')).toBe(false);
 
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId: oldSessionId,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId: 'tc-failed-legacy-oma',
-          title: 'Run mcp_oma_todo_todo',
-          status: 'failed',
-          rawInput: { op: 'init', items: ['Failed fallback attempt'] },
-        },
-      },
-    });
-    acp.send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId: oldSessionId,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId: 'tc-resumed-native-steps',
-          title: 'Run update_steps',
-          status: 'completed',
-          rawInput: {
-            steps: [
-              { title: 'Native Step 1', status: 'done' },
-              { title: 'Native Step 2', status: 'in_progress' },
-            ],
-          },
-        },
-      },
+    ctx.acp.sendUpdate(oldSessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-failed-legacy-oma', title: 'Run mcp_oma_todo_todo', status: 'failed', rawInput: { op: 'init', items: ['Failed fallback attempt'] } });
+    ctx.acp.sendUpdate(oldSessionId, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-resumed-native-steps',
+      title: 'Run update_steps',
+      status: 'completed',
+      rawInput: { steps: [{ title: 'Native Step 1', status: 'done' }, { title: 'Native Step 2', status: 'in_progress' }] },
     });
     promptResolver!({ stopReason: 'end_turn' });
     promptResolver = null;
-    await waitFor(() => !controller.store.getState().isStreaming);
-    await waitFor(() => replayWire().get('main.t1-tc-resumed-native-steps')?.p['target'] === '1/2');
-    expect(replayWire().has('main.plan')).toBe(false);
-    expect(controller.store.transcript.getToolById('tc-resumed-native-steps')?.target).toBe('1/2');
+    await waitFor(() => !ctx.controller.store.getState().isStreaming);
+    await waitFor(() => ctx.replayWire().get('main.t1-tc-resumed-native-steps')?.p['target'] === '1/2');
+    expect(ctx.replayWire().has('main.plan')).toBe(false);
 
-    const hudPhases = replayWire().get('dock.activity.todo')?.p['phases'] as Array<{
-      title: string;
-      items: Array<{ text: string; status: string }>;
-    }>;
+    const hudPhases = ctx.replayWire().get('dock.activity.todo')?.p['phases'] as Array<{ title: string; items: Array<{ text: string; status: string }> }>;
     expect(hudPhases).toHaveLength(1);
     expect(hudPhases[0]?.title).toBe('Plan');
-    expect(hudPhases[0]?.items.map(i => `${i.text}:${i.status}`)).toEqual([
-      'Native Step 1:done',
-      'Native Step 2:active',
-    ]);
+    expect(hudPhases[0]?.items.map(i => `${i.text}:${i.status}`)).toEqual(['Native Step 1:done', 'Native Step 2:active']);
 
-    await controller.submitInput('/todo');
-    const latestNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
+    await ctx.controller.submitInput('/todo');
+    const latestNotice = ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
     expect(latestNotice?.text).toContain('- [x] Native Step 1');
     expect(latestNotice?.text).toContain('- [/] Native Step 2');
     expect(latestNotice?.text).not.toContain('Old MCP task A');
     expect(latestNotice?.text).not.toContain('Stale anchor task');
 
-    await controller.submitInput('/todo done Native Step 2');
-    expect(
-      controller.store
-        .getState()
-        .toasts.some(t => t.tone === 'warning' && t.text.includes('Native (update_steps)')),
-    ).toBe(true);
-
-    shuttingDown = true;
-    await controller.shutdown({ cleanExit: true });
-    await runPromise;
+    await ctx.shutdown();
+    const anchorAfterNativeTurn = await previewStore.load(oldSessionId);
+    expect(anchorAfterNativeTurn?.turnCount).toBeGreaterThanOrEqual(2);
+    expect(anchorAfterNativeTurn?.todoState).toEqual({
+      phases: [{ name: 'Anchor Phase', tasks: [{ content: 'Stale anchor task', status: 'in_progress' }] }],
+      toolCallCount: 2,
+      source: 'user',
+    });
   });
 
   test('ui.todo_provider supports off mode and gates /settings options by agy version (1.5.15 Off/MCP vs 1.5.16 Off/MCP/Native)', async () => {
-    type PrefsSectionWire = {
-      id: string;
-      rows: Array<{
-        id: string;
-        warning?: string;
-        control?: { k: string; value?: unknown; options?: Array<{ value: string; label: string }> };
-      }>;
-    };
-    const findTodoProviderRow = (
-      nodes: Map<string, { k: string; p: Record<string, unknown> }>,
-    ) => {
-      const sections = (nodes.get('layer.settings')?.p['sections'] as PrefsSectionWire[] | undefined) ?? [];
-      return sections.flatMap(s => s.rows).find(r => r.id === 'ui.todo_provider');
-    };
+    type PrefsSectionWire = { id: string; rows: Array<{ id: string; warning?: string; control?: { k: string; value?: unknown; options?: Array<{ value: string; label: string }> } }> };
+    const findTodoProviderRow = (nodes: Map<string, { p: Record<string, unknown> }>) =>
+      ((nodes.get('layer.settings')?.p['sections'] as PrefsSectionWire[] | undefined) ?? []).flatMap(s => s.rows).find(r => r.id === 'ui.todo_provider');
 
-    const replayWireFor = (host: FakeTernHost): Map<string, { k: string; p: Record<string, unknown> }> => {
-      const nodes = new Map<string, { k: string; p: Record<string, unknown> }>();
-      const addSub = (n: WireNode): void => {
-        nodes.set(n.id, { k: n.k, p: { ...(n.p ?? {}) } });
-        if (n.c) {
-          for (const child of n.c) addSub(child);
-        }
-      };
-      const delSub = (id: string): void => {
-        nodes.delete(id);
-        const prefix = `${id}.`;
-        for (const k of [...nodes.keys()]) {
-          if (k.startsWith(prefix)) nodes.delete(k);
-        }
-      };
-      for (const op of host.allOps) {
-        if (op[0] === 'add') addSub(op[4]);
-        else if (op[0] === 'del') delSub(op[1]);
-        else if (op[0] === 'set') {
-          const entry = nodes.get(op[1]);
-          if (entry) {
-            for (const [k, v] of Object.entries(op[2])) {
-              if (v === null) delete entry.p[k];
-              else entry.p[k] = v;
-            }
-          }
-        }
-      }
-      return nodes;
-    };
-
-    // Part A: agy 1.5.16 shows Off/MCP/Native, and switching to 'off' hides HUD/main.plan + omits MCP
     {
       const tmp = makeTempDir();
       const configPath = join(tmp, 'config.toml');
-      const host = new FakeTernHost();
-      const session = await createConnectedSession(host);
-      const acp = new MockAcpHarness();
-      const newParams: Array<Record<string, unknown>> = [];
       let promptResolver: ((res: { stopReason: string }) => void) | null = null;
-      let shuttingDown = false;
-
-      acp.setHandler((msg, h) => {
-        if (msg.method === 'initialize') {
-          h.send({
-            jsonrpc: '2.0',
-            id: msg.id,
-            result: {
-              protocolVersion: 1,
-              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
-              agentCapabilities: { loadSession: true },
-            },
-          });
-        } else if (msg.method === 'session/new') {
-          newParams.push((msg.params ?? {}) as Record<string, unknown>);
-          h.send({
-            jsonrpc: '2.0',
-            id: msg.id,
-            result: { sessionId: `sess-new-${newParams.length}`, configOptions: DEFAULT_CONFIG_OPTIONS },
-          });
-        } else if (msg.method === 'session/prompt') {
-          const pid = msg.id;
-          new Promise<{ stopReason: string }>(resolve => {
-            promptResolver = resolve;
-          }).then(res => h.send({ jsonrpc: '2.0', id: pid, result: res }));
-        } else if (msg.method === 'session/close') {
-          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-          if (shuttingDown) h.crash(0);
-        } else if (msg.id !== undefined) {
-          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-        }
-      });
-
-      const controller = new AppController({
-        cli: parseCliArgs([]),
-        config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' } },
-        cwd: tmp,
-        session,
-        output: host.safeOutput,
-        acpSpawn: acp.createSpawnFn(),
-        previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
-        configPath,
-        agySettingsPath: join(tmp, 'settings.json'),
-        workspaceSkillsDir: join(tmp, 'empty-ws'),
-        globalSkillsDir: join(tmp, 'empty-global'),
-        agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
-        dataDir: join(tmp, 'data'),
-        gitExec: async () => ({ exitCode: 128, stdout: '' }),
-        installSignals: false,
-        throttleMs: 5,
-      });
-      const runPromise = controller.run();
-      await controller.readyPromise;
-      await waitFor(() => controller.store.getState().isReady);
-
-      await controller.submitInput('Show native plan');
-      await waitFor(() => promptResolver !== null);
-      acp.send({
-        jsonrpc: '2.0',
-        method: 'session/update',
-        params: {
-          sessionId: controller.store.getState().sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId: 'tc-on-off',
-            name: 'update_steps',
-            status: 'completed',
-            rawInput: { steps: [{ title: 'Active task', status: 'in_progress' }] },
-          },
+      const ctx = await createTestController({
+        tmp,
+        agentVersion: '1.5.16',
+        todoProvider: 'native',
+        controllerOptions: { configPath },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
         },
       });
+      await ctx.boot();
+
+      await ctx.controller.submitInput('Show native plan');
+      await waitFor(() => promptResolver !== null);
+      ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, { sessionUpdate: 'tool_call', toolCallId: 'tc-on-off', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Active task', status: 'in_progress' }] } });
       promptResolver!({ stopReason: 'end_turn' });
       promptResolver = null;
-      await waitFor(() => replayWireFor(host).has('dock.activity.todo'));
-      expect(replayWireFor(host).has('main.plan')).toBe(false);
+      await waitFor(() => ctx.replayWire().has('dock.activity.todo'));
+      expect(ctx.replayWire().has('main.plan')).toBe(false);
 
-      await controller.submitInput('/settings interface');
-      await waitFor(() => Boolean(findTodoProviderRow(replayWireFor(host))));
-      const rowNew = findTodoProviderRow(replayWireFor(host));
+      await ctx.controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(ctx.replayWire())));
+      const rowNew = findTodoProviderRow(ctx.replayWire());
       expect(rowNew?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp', 'native']);
       expect(rowNew?.control?.value).toBe('native');
       expect(rowNew?.warning).toBeUndefined();
 
-      host.input.emitTspEvent({
-        ev: 'change',
-        sf: 'oma',
-        id: 'layer.settings',
-        item: 'ui.todo_provider',
-        value: 'off',
-      });
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'off' });
       await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "off"'));
-      await waitFor(() => !replayWireFor(host).has('dock.activity.todo') && !replayWireFor(host).has('main.plan'));
-      host.input.emit('\x1b');
-      await waitFor(() => controller.store.getState().settings === null);
+      await waitFor(() => !ctx.replayWire().has('dock.activity.todo') && !ctx.replayWire().has('main.plan'));
+      ctx.testHost!.input.emit('\x1b');
+      await waitFor(() => ctx.controller.store.getState().settings === null);
 
-      await controller.submitInput('/todo');
-      expect(
-        controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Todo tracking is Off')),
-      ).toBe(true);
-      await controller.submitInput('/todo help');
-      const helpNotice = controller.store.transcript.turns.flatMap(t => t.notices).at(-1);
-      expect(helpNotice?.text).toContain('Usage: /todo');
+      await ctx.controller.submitInput('/todo');
+      expect(ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('Todo tracking is Off'))).toBe(true);
+      await ctx.controller.submitInput('/todo help');
+      expect(ctx.controller.store.transcript.turns.flatMap(t => t.notices).at(-1)?.text).toContain('Usage: /todo');
 
-      await controller.submitInput('/new');
-      await waitFor(() => newParams.length === 2);
-      expect(newParams[1]?.mcpServers).toEqual([]);
-      expect(newParams[1]?._meta).toBeUndefined();
-
-      shuttingDown = true;
-      await controller.shutdown({ cleanExit: true });
-      await runPromise;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.acp.newParams.length === 2);
+      expect(ctx.acp.newParams[1]?.['mcpServers']).toEqual([]);
+      await ctx.shutdown();
     }
 
-    // Part B: older agy 1.5.15 shows only Off/MCP, falls back configured 'native' -> 'off', rejects selecting 'native', and enables MCP on switch
     {
       const tmp = makeTempDir();
       const configPath = join(tmp, 'config.toml');
-      const host = new FakeTernHost();
-      const session = await createConnectedSession(host);
-      const acp = new MockAcpHarness();
-      const newParams: Array<Record<string, unknown>> = [];
       let promptResolver: ((res: { stopReason: string }) => void) | null = null;
-      let shuttingDown = false;
-
-      acp.setHandler((msg, h) => {
-        if (msg.method === 'initialize') {
-          h.send({
-            jsonrpc: '2.0',
-            id: msg.id,
-            result: {
-              protocolVersion: 1,
-              agentInfo: { name: 'Antigravity ACP Server', version: '1.5.15' },
-              agentCapabilities: { loadSession: true },
-            },
-          });
-        } else if (msg.method === 'session/new') {
-          newParams.push((msg.params ?? {}) as Record<string, unknown>);
-          h.send({
-            jsonrpc: '2.0',
-            id: msg.id,
-            result: { sessionId: `sess-old-${newParams.length}`, configOptions: DEFAULT_CONFIG_OPTIONS },
-          });
-        } else if (msg.method === 'session/prompt') {
-          const pid = msg.id;
-          new Promise<{ stopReason: string }>(resolve => {
-            promptResolver = resolve;
-          }).then(res => h.send({ jsonrpc: '2.0', id: pid, result: res }));
-        } else if (msg.method === 'session/close') {
-          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-          if (shuttingDown) h.crash(0);
-        } else if (msg.id !== undefined) {
-          h.send({ jsonrpc: '2.0', id: msg.id, result: {} });
-        }
-      });
-
-      const controller = new AppController({
-        cli: parseCliArgs([]),
-        config: { ...DEFAULT_CONFIG, ui: { ...DEFAULT_CONFIG.ui, todo_provider: 'native' } },
-        cwd: tmp,
-        session,
-        output: host.safeOutput,
-        acpSpawn: acp.createSpawnFn(),
-        previewStore: new PreviewStore({ sessionsDir: join(tmp, 'sessions') }),
-        configPath,
-        agySettingsPath: join(tmp, 'settings.json'),
-        workspaceSkillsDir: join(tmp, 'empty-ws'),
-        globalSkillsDir: join(tmp, 'empty-global'),
-        agentsGlobalSkillsDir: join(tmp, 'empty-agents-global'),
-        dataDir: join(tmp, 'data'),
-        gitExec: async () => ({ exitCode: 128, stdout: '' }),
-        installSignals: false,
-        throttleMs: 5,
-      });
-      const runPromise = controller.run();
-      await controller.readyPromise;
-      await waitFor(() => controller.store.getState().isReady);
-
-      expect(newParams[0]?.mcpServers).toEqual([]);
-      expect(newParams[0]?._meta).toBeUndefined();
-
-      await controller.submitInput('Check suppressed plan on 1.5.15');
-      await waitFor(() => promptResolver !== null);
-      acp.send({
-        jsonrpc: '2.0',
-        method: 'session/update',
-        params: {
-          sessionId: controller.store.getState().sessionId,
-          update: {
-            sessionUpdate: 'plan',
-            entries: [{ content: 'Should stay hidden when fallback off', status: 'in_progress' }],
-          },
+      const ctx = await createTestController({
+        tmp,
+        agentVersion: '1.5.15',
+        todoProvider: 'native',
+        controllerOptions: { configPath },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
         },
       });
+      await ctx.boot();
+      expect(ctx.acp.newParams[0]?.['mcpServers']).toEqual([]);
+
+      await ctx.controller.submitInput('Check suppressed plan on 1.5.15');
+      await waitFor(() => promptResolver !== null);
+      ctx.acp.sendUpdate(ctx.controller.store.getState().sessionId!, { sessionUpdate: 'plan', entries: [{ content: 'Should stay hidden when fallback off', status: 'in_progress' }] });
       promptResolver!({ stopReason: 'end_turn' });
       promptResolver = null;
-      await waitFor(() => !controller.store.getState().isStreaming);
-      expect(replayWireFor(host).has('dock.activity.todo')).toBe(false);
-      expect(replayWireFor(host).has('main.plan')).toBe(false);
+      await waitFor(() => !ctx.controller.store.getState().isStreaming);
+      expect(ctx.replayWire().has('dock.activity.todo')).toBe(false);
+      expect(ctx.replayWire().has('main.plan')).toBe(false);
 
-      await controller.submitInput('/settings interface');
-      await waitFor(() => Boolean(findTodoProviderRow(replayWireFor(host))));
-      const rowOld = findTodoProviderRow(replayWireFor(host));
+      await ctx.controller.submitInput('/settings interface');
+      await waitFor(() => Boolean(findTodoProviderRow(ctx.replayWire())));
+      const rowOld = findTodoProviderRow(ctx.replayWire());
       expect(rowOld?.control?.options?.map(o => o.value)).toEqual(['off', 'mcp']);
       expect(rowOld?.control?.value).toBe('off');
       expect(rowOld?.warning).toContain('1.5.16');
 
-      // Attempting to select 'native' on 1.5.15 is rejected with warning toast
-      host.input.emitTspEvent({
-        ev: 'change',
-        sf: 'oma',
-        id: 'layer.settings',
-        item: 'ui.todo_provider',
-        value: 'native',
-      });
-      await waitFor(() =>
-        controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('1.5.16')),
-      );
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'native' });
+      await waitFor(() => ctx.controller.store.getState().toasts.some(t => t.tone === 'warning' && t.text.includes('1.5.16')));
       expect(existsSync(configPath)).toBe(false);
 
-      // Switching to 'mcp' persists and enables oma_todo on /new
-      host.input.emitTspEvent({
-        ev: 'change',
-        sf: 'oma',
-        id: 'layer.settings',
-        item: 'ui.todo_provider',
-        value: 'mcp',
-      });
+      ctx.testHost!.input.emitTspEvent({ ev: 'change', sf: 'oma', id: 'layer.settings', item: 'ui.todo_provider', value: 'mcp' });
       await waitFor(() => existsSync(configPath) && readFileSync(configPath, 'utf8').includes('todo_provider = "mcp"'));
-      host.input.emit('\x1b');
-      await waitFor(() => controller.store.getState().settings === null);
+      ctx.testHost!.input.emit('\x1b');
+      await waitFor(() => ctx.controller.store.getState().settings === null);
 
-      await controller.submitInput('/new');
-      await waitFor(() => newParams.length === 2);
-      const mcpServers = newParams[1]?.mcpServers as Array<{ name?: string }> | undefined;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.acp.newParams.length === 2);
+      const mcpServers = ctx.acp.newParams[1]?.['mcpServers'] as Array<{ name?: string }> | undefined;
       expect(mcpServers?.some(s => s.name === 'oma_todo')).toBe(true);
+      await ctx.shutdown();
+    }
+  });
 
-      shuttingDown = true;
-      await controller.shutdown({ cleanExit: true });
+  test('P1 regression: OSC 1337/7501 sequences across queued /todo saves, initialization sendable gating, and unsendable recovery UI', async () => {
+    {
+      const tmp = makeTempDir();
+      const previewStore = new PreviewStore({ sessionsDir: join(tmp, 'sessions') });
+      const origSave = previewStore.save.bind(previewStore);
+      const ctxQuit = await createTestController({ tmp, previewStore, todoProvider: 'mcp', newSessionId: 'sess-quit-todo' });
+      await ctxQuit.boot();
+
+      let blockFirst = true;
+      const entered = Promise.withResolvers<void>();
+      const gate = Promise.withResolvers<void>();
+      previewStore.save = async input => {
+        if (blockFirst) {
+          blockFirst = false;
+          entered.resolve();
+          await gate.promise;
+        }
+        return origSave(input);
+      };
+
+      await ctxQuit.controller.submitInput('/todo append "Phase 1" First queued');
+      await entered.promise;
+      await ctxQuit.controller.submitInput('/todo append "Phase 1" Second before quit');
+      const quitPromise = ctxQuit.shutdown();
+      gate.resolve();
+      await quitPromise;
+
+      const persisted = await previewStore.load('sess-quit-todo');
+      expect(persisted?.todoState?.phases[0]?.tasks.map(t => t.content)).toEqual(['First queued', 'Second before quit']);
+      expect(ctxQuit.host.osc1337.filter(v => v.startsWith('omp_session_file=')).at(-1)).toBe('omp_session_file=');
+      expect(ctxQuit.host.osc7501.length).toBeGreaterThan(0);
+    }
+
+    {
+      const tmp = makeTempDir();
+      let bootNewId: string | number | undefined;
+      let failNextNew = false;
+      let failPrevLoad = false;
+
+      const ctx = await createTestController({
+        tmp,
+        todoProvider: 'mcp',
+        onRpc: (msg, acp) => {
+          if (msg.method === 'session/new') {
+            acp.newCount += 1;
+            if (acp.newCount === 1) {
+              bootNewId = msg.id;
+              return true;
+            }
+            if (failNextNew) {
+              acp.replyError(msg.id, -32603, 'backend unavailable');
+              return true;
+            }
+            acp.reply(msg.id, { sessionId: `sess-new-${acp.newCount}`, configOptions: [] });
+            return true;
+          }
+          if (msg.method === 'session/load' && failPrevLoad) {
+            acp.replyError(msg.id, -32603, 'reload failed');
+            return true;
+          }
+        },
+      });
+
+      const runPromise = ctx.start();
+      await waitFor(() => bootNewId !== undefined && replayWire(ctx.host).has(EDITOR_NODE_ID));
+      expect(replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['sendable']).toBe(false);
+      expect(replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['placeholder']).toBe('Connecting to agy acp… (you can start typing)');
+
+      ctx.acp.reply(bootNewId, { sessionId: 'sess-new-1', configOptions: [] });
+      await ctx.controller.readyPromise;
+      await waitFor(() => ctx.controller.store.getState().isReady && replayWire(ctx.host).get(EDITOR_NODE_ID)?.p['sendable'] === true);
+
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => ctx.controller.store.getState().sessionId === 'sess-new-2' && ctx.controller.store.getState().isReady);
+      const lastSessionB64 = ctx.host.osc1337.filter(v => v.startsWith('omp_session_file=')).at(-1)?.slice('omp_session_file='.length) ?? '';
+      expect(Buffer.from(lastSessionB64, 'base64').toString('utf8')).toContain('sess-new-2.json');
+
+      failNextNew = true;
+      failPrevLoad = true;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => {
+        const st = ctx.controller.store.getState();
+        const ed = replayWire(ctx.host).get(EDITOR_NODE_ID);
+        return st.sessionId === null && st.connectionStatus === 'ready' && !st.isReady && ed?.p['sendable'] === false && ed?.p['typeahead'] === false && ed?.p['placeholder'] === 'No active session — use /new or /resume';
+      });
+
+      await ctx.controller.submitInput('Blocked while unsendable');
+      expect(ctx.acp.sentPrompts).toHaveLength(0);
+      expect(ctx.controller.store.getState().activeToast?.text).toBe('No active session — use /new or /resume');
+
+      failNextNew = false;
+      failPrevLoad = false;
+      await ctx.controller.submitInput('/new');
+      await waitFor(() => {
+        const ed = replayWire(ctx.host).get(EDITOR_NODE_ID);
+        return ctx.controller.store.getState().sessionId === 'sess-new-4' && ctx.controller.store.getState().isReady && ed?.p['sendable'] === true && ed?.p['typeahead'] === false;
+      });
+
+      await ctx.shutdown();
       await runPromise;
+    }
+  });
+
+  test('P1 regression: oma_todo and update_steps failure preview isolation, multi-line error spans, and HUD auto-dismiss in UI', async () => {
+    {
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctxMcp = await createTestController({
+        tmp: makeTempDir(),
+        todoProvider: 'mcp',
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctxMcp.boot();
+      const sessionId = ctxMcp.controller.store.getState().sessionId!;
+      const mcpUrl = ctxMcp.acp.mcpUrls[0]!;
+
+      await ctxMcp.controller.submitInput('Check MCP failure card rendering');
+      await waitFor(() => promptResolver !== null);
+
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-fail-nosnap', name: 'mcp_oma_todo_todo', status: 'in_progress', rawInput: { op: 'init', items: ['Task'] }, rawOutput: { output: 'Transient preview' } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-nosnap', status: 'failed', rawOutput: {} });
+      await waitFor(() => ctxMcp.replayWire().get('main.t0-tc-fail-nosnap')?.p['status'] === 'error');
+      expect(ctxMcp.replayWire().has('main.t0-tc-fail-nosnap.err')).toBe(false);
+
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-nosnap', status: 'failed', rawOutput: { error: 'Actual failure' } });
+      await waitFor(() => Boolean(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap.err')));
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap')?.p['collapsed']).toBe(false);
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-nosnap.err')?.p['spans']).toEqual([{ t: 'Actual failure', s: 'error' }]);
+
+      const snapRes = await callTodoMcp(mcpUrl, { op: 'init', items: ['Snap task'] });
+      expect(snapRes.status).toBe(200);
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-fail-snap', name: 'mcp_oma_todo_todo', status: 'in_progress', rawInput: { op: 'init', items: ['Snap task'] } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-snap', status: 'failed', rawOutput: { error: 'Diagnostic part 1' } });
+      ctxMcp.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-fail-snap', status: 'failed', rawOutput: { error: 'Diagnostic part 1\nDiagnostic part 2' } });
+      await waitFor(() => JSON.stringify(ctxMcp.replayWire().get('main.t0-tc-fail-snap.err')?.p['spans'] ?? '').includes('Diagnostic part 2'));
+      expect(ctxMcp.replayWire().get('main.t0-tc-fail-snap.err')?.p['spans']).toEqual([{ t: 'Diagnostic part 1\nDiagnostic part 2', s: 'error' }]);
+
+      promptResolver!({ stopReason: 'end_turn' });
+      await waitFor(() => !ctxMcp.controller.store.getState().isStreaming);
+      await ctxMcp.shutdown();
+    }
+
+    {
+      let promptResolver: ((res: { stopReason: string }) => void) | null = null;
+      const ctxNat = await createTestController({
+        tmp: makeTempDir(),
+        todoProvider: 'native',
+        controllerOptions: { todoAutoClearDelayMs: 15 },
+        onPrompt: (_rec, msg, acp) => {
+          new Promise<{ stopReason: string }>(resolve => { promptResolver = resolve; }).then(res => acp.reply(msg.id, res));
+          return true;
+        },
+      });
+      await ctxNat.boot();
+      const sessionId = ctxNat.controller.store.getState().sessionId!;
+
+      await ctxNat.controller.submitInput('Check native failure card and HUD auto-dismiss');
+      await waitFor(() => promptResolver !== null);
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-fail', name: 'update_steps', status: 'in_progress', rawInput: { steps: [{ title: 'Preview only', status: 'in_progress' }] }, rawOutput: { output: 'Pre-failure progress' } });
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-steps-fail', status: 'failed', rawOutput: { error: 'Native step schema rejected' } });
+      await waitFor(() => Boolean(ctxNat.replayWire().get('main.t0-tc-steps-fail.err')));
+      const failedStepsNode = ctxNat.replayWire().get('main.t0-tc-steps-fail');
+      expect(failedStepsNode?.p['status']).toBe('error');
+      expect(failedStepsNode?.p['frame']).toBe('card');
+      expect(failedStepsNode?.p['collapsed']).toBe(false);
+      expect(ctxNat.replayWire().has('main.t0-tc-steps-fail.checklist')).toBe(false);
+      expect(ctxNat.replayWire().get('main.t0-tc-steps-fail.err')?.p['spans']).toEqual([{ t: 'Native step schema rejected', s: 'error' }]);
+      expect(ctxNat.replayWire().has('dock.activity.todo')).toBe(false);
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-open', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 1', status: 'in_progress' }] } });
+      await waitFor(() => ctxNat.replayWire().has('dock.activity.todo'));
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-done', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 1', status: 'done' }] } });
+      await waitFor(() => !ctxNat.replayWire().has('dock.activity.todo'));
+
+      ctxNat.acp.sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tc-steps-reopen', name: 'update_steps', status: 'completed', rawInput: { steps: [{ title: 'Step 2', status: 'in_progress' }] } });
+      await waitFor(() => ctxNat.replayWire().has('dock.activity.todo'));
+
+      promptResolver!({ stopReason: 'end_turn' });
+      await waitFor(() => !ctxNat.controller.store.getState().isStreaming);
+      await ctxNat.shutdown();
     }
   });
 });

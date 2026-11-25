@@ -433,6 +433,7 @@ export interface AppState {
   readonly isReady: boolean;
   readonly isStreaming: boolean;
   readonly isReplaying: boolean;
+  readonly isCreatingSession: boolean;
   /** True when transcript has any in-flight tool call or detached background task still running. */
   readonly hasActiveBackgroundTasks: boolean;
   /** Latest background-polled swarm board snapshot for the active session, if any. */
@@ -613,7 +614,7 @@ export class AppStore {
 
   private _connectionStatus: ConnectionStatus = 'initializing';
   private _isStreaming = false;
-  private _isReplaying = false;
+  private _sessionPhase: 'none' | 'creating' | 'replaying' | 'ready' = 'none';
   private _sessionId: string | null = null;
   private _sessionTitle: string | null = null;
   private _cwd: string;
@@ -1096,11 +1097,17 @@ export class AppStore {
     const isSwarmWorking = Boolean(this._swarmSnapshot?.isSwarmActive);
     const swarmWorkingNames = this._swarmSnapshot?.workingMembers ?? [];
     const isBusy = this._isStreaming || hasActiveBackgroundTasks || isSwarmWorking;
+    const isReplaying = this._sessionPhase === 'replaying';
+    const isCreatingSession = this._sessionPhase === 'creating';
     return {
       connectionStatus: this._connectionStatus,
-      isReady: this._connectionStatus === 'ready',
+      isReady:
+        this._connectionStatus === 'ready' &&
+        this._sessionId !== null &&
+        this._sessionPhase === 'ready',
       isStreaming: this._isStreaming,
-      isReplaying: this._isReplaying,
+      isReplaying,
+      isCreatingSession,
       hasActiveBackgroundTasks,
       swarmSnapshot: this._swarmSnapshot,
       hasSwarm,
@@ -1176,10 +1183,28 @@ export class AppStore {
 
   setConnectionStatus(status: ConnectionStatus): void {
     this._connectionStatus = status;
-    if (status === 'ready') {
+    if (status === 'ready' || status === 'initializing') {
       this._crashError = null;
       this._authRequired = null;
     }
+    this.emit();
+  }
+
+  private settledSessionPhase(): 'none' | 'ready' {
+    return this._sessionId !== null ? 'ready' : 'none';
+  }
+
+  markSessionReady(): void {
+    this._connectionStatus = 'ready';
+    this._sessionPhase = this.settledSessionPhase();
+    this._crashError = null;
+    this._authRequired = null;
+    this.emit();
+  }
+
+  setSessionPhase(phase: 'none' | 'creating' | 'replaying' | 'ready'): void {
+    if (this._sessionPhase === phase) return;
+    this._sessionPhase = phase;
     this.emit();
   }
 
@@ -1205,7 +1230,19 @@ export class AppStore {
   }
 
   setReplaying(replaying: boolean): void {
-    this._isReplaying = replaying;
+    if (replaying) this._sessionPhase = 'replaying';
+    else if (this._sessionPhase === 'replaying') this._sessionPhase = this.settledSessionPhase();
+    this.emit();
+  }
+
+  setCreatingSession(creating: boolean): void {
+    const next = creating
+      ? 'creating'
+      : this._sessionPhase === 'creating'
+        ? this.settledSessionPhase()
+        : this._sessionPhase;
+    if (this._sessionPhase === next) return;
+    this._sessionPhase = next;
     this.emit();
   }
 
@@ -1219,6 +1256,7 @@ export class AppStore {
     if (err) {
       this._connectionStatus = 'crashed';
       this._isStreaming = false;
+      this._sessionPhase = this.settledSessionPhase();
     }
     this.emit();
   }
@@ -1228,6 +1266,7 @@ export class AppStore {
     if (auth) {
       this._connectionStatus = 'auth_required';
       this._isStreaming = false;
+      this._sessionPhase = this.settledSessionPhase();
     }
     this.emit();
   }
@@ -1251,6 +1290,9 @@ export class AppStore {
 
   applySessionSnapshot(snapshot: SessionSnapshotInput): void {
     this._sessionId = snapshot.sessionId;
+    if (this._sessionPhase === 'none') {
+      this._sessionPhase = 'ready';
+    }
     if (snapshot.cwd !== undefined) {
       this._cwd = snapshot.cwd;
     }
@@ -1335,9 +1377,10 @@ export class AppStore {
    * configOptions, mode, and session info.
    */
   applySessionUpdate(update: SessionUpdate | UnknownSessionUpdate): TranscriptUpdateOutcome {
+    const isReplaying = this._sessionPhase === 'replaying';
     const outcome = this.transcript.applySessionUpdate(update, {
       autoCollapseThought: this._autoCollapseThought,
-      isReplaying: this._isReplaying,
+      isReplaying,
       showThinking: this._showThinking,
       expandAllTools: this._expandAllTools,
     });
@@ -1360,7 +1403,7 @@ export class AppStore {
 
     // Automatically enter swarm mode hint if a `swarm` tool call is observed in live stream
     if (
-      !this._isReplaying &&
+      !isReplaying &&
       (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
     ) {
       const uName =
@@ -1385,6 +1428,9 @@ export class AppStore {
    */
   resetSessionState(options: { keepCommands?: boolean } = {}): void {
     this._sessionId = null;
+    if (this._sessionPhase === 'ready') {
+      this._sessionPhase = 'none';
+    }
     this.approvals.cancelAll();
     this.cancelAllQuestions();
     this.transcript.clear();

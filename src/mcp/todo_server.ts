@@ -23,7 +23,15 @@ export interface TodoServerUpdateEvent {
 
 export interface EmbeddedTodoMcpServerOptions {
   readonly version?: string;
+  readonly requireSessionRoute?: boolean;
   readonly onTodoChanged?: (event: TodoServerUpdateEvent) => void;
+}
+
+interface ActiveSessionRoute {
+  readonly epoch: number;
+  readonly token: string;
+  readonly path: string;
+  sessionId: string | null;
 }
 
 const TODO_TOOL_DECLARATION = {
@@ -107,11 +115,14 @@ export class EmbeddedTodoMcpServer {
   readonly #server: ReturnType<typeof Bun.serve>;
   readonly #endpointUrl: string;
   readonly #sessionTodos = new Map<string, TodoPhase[]>();
+  #requireSessionRoute: boolean;
+  #activeRoute: ActiveSessionRoute | null = null;
   #activeSessionId: string | null = null;
   #disposed = false;
 
   constructor(options: EmbeddedTodoMcpServerOptions = {}) {
     this.#version = options.version ?? '0.3.2';
+    this.#requireSessionRoute = Boolean(options.requireSessionRoute);
     this.#onTodoChanged = options.onTodoChanged;
     this.#secretPath = `/mcp/${crypto.randomUUID()}`;
 
@@ -128,8 +139,45 @@ export class EmbeddedTodoMcpServer {
     return this.#endpointUrl;
   }
 
+  get committedSessionId(): string | null {
+    return this.#activeRoute?.sessionId ?? null;
+  }
+
   setActiveSessionId(sessionId: string | null): void {
     this.#activeSessionId = sessionId;
+  }
+
+  openSessionRoute(epoch: number): McpServerConfig {
+    this.#requireSessionRoute = true;
+    const token = crypto.randomUUID();
+    this.#activeRoute = {
+      epoch,
+      token,
+      path: `${this.#secretPath}/${token}`,
+      sessionId: null,
+    };
+    this.#activeSessionId = null;
+    return {
+      type: 'http',
+      name: OMA_TODO_MCP_SERVER_NAME,
+      url: `http://127.0.0.1:${this.#server.port}${this.#activeRoute.path}`,
+    };
+  }
+
+  commitSessionRoute(epoch: number, sessionId: string): boolean {
+    const cleanId = sessionId.trim();
+    if (!cleanId || !this.#activeRoute || this.#activeRoute.epoch !== epoch) {
+      return false;
+    }
+    this.#activeRoute.sessionId = cleanId;
+    this.#activeSessionId = cleanId;
+    return true;
+  }
+
+  revokeSessionRoute(): void {
+    this.#requireSessionRoute = true;
+    this.#activeRoute = null;
+    this.#activeSessionId = null;
   }
 
   getMcpServerConfig(): McpServerConfig {
@@ -164,6 +212,8 @@ export class EmbeddedTodoMcpServer {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#activeRoute = null;
+    this.#activeSessionId = null;
     this.#sessionTodos.clear();
     try {
       this.#server.stop(true);
@@ -181,7 +231,13 @@ export class EmbeddedTodoMcpServer {
     if (url.pathname.startsWith('/.well-known/')) {
       return new Response('Not Found', { status: 404 });
     }
-    if (url.pathname !== this.#secretPath) {
+    let boundRoute: ActiveSessionRoute | null = null;
+    if (this.#requireSessionRoute) {
+      if (!this.#activeRoute || url.pathname !== this.#activeRoute.path) {
+        return new Response('Not Found', { status: 404 });
+      }
+      boundRoute = this.#activeRoute;
+    } else if (url.pathname !== this.#secretPath) {
       return new Response('Not Found', { status: 404 });
     }
     if (req.method !== 'POST') {
@@ -193,6 +249,13 @@ export class EmbeddedTodoMcpServer {
       rawBody = await req.text();
     } catch {
       return new Response('Bad Request', { status: 400 });
+    }
+
+    if (this.#disposed) {
+      return new Response('Service Unavailable', { status: 503 });
+    }
+    if (boundRoute && this.#activeRoute !== boundRoute) {
+      return new Response('Not Found', { status: 404 });
     }
 
     let msg: Record<string, unknown>;
@@ -266,7 +329,40 @@ export class EmbeddedTodoMcpServer {
         typeof params._meta === 'object' && params._meta !== null && !Array.isArray(params._meta)
           ? (params._meta as Record<string, unknown>)
           : undefined;
-      const sessionId = extractConversationSessionId(meta, this.#activeSessionId);
+      let sessionId: string;
+      if (boundRoute) {
+        if (this.#activeRoute !== boundRoute || !boundRoute.sessionId) {
+          return Response.json({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: 'Todo session is not active yet.' }],
+              isError: true,
+            },
+          });
+        }
+        const committedSessionId = boundRoute.sessionId;
+        const rawConvId = meta?.['antigravity.google/conversation_id'];
+        const rawRootId = meta?.['antigravity.google/root_conversation_id'];
+        const convId = typeof rawConvId === 'string' ? rawConvId.trim() : '';
+        const rootId = typeof rawRootId === 'string' ? rawRootId.trim() : '';
+        if (
+          (rootId && rootId !== committedSessionId) ||
+          (!rootId && convId && convId !== committedSessionId)
+        ) {
+          return Response.json({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: 'Todo session mismatch; ignoring stale tool call.' }],
+              isError: true,
+            },
+          });
+        }
+        sessionId = convId || rootId || committedSessionId;
+      } else {
+        sessionId = extractConversationSessionId(meta, this.#activeSessionId);
+      }
       const current = this.getPhases(sessionId);
       const outcome = applyTodoOperation(current, params.arguments);
 

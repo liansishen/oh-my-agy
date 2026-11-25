@@ -940,11 +940,10 @@ export async function scanLocalSkills(
   const workspaceDir = options.workspaceSkillsDir ?? join(cwd, '.agents', 'skills');
   const globalDir = options.globalSkillsDir ?? join(home, '.gemini', 'config', 'skills');
   const agentsGlobalDir =
-    options.agentsGlobalSkillsDir !== undefined
-      ? options.agentsGlobalSkillsDir
-      : options.globalSkillsDir !== undefined && options.homedir === undefined
-        ? undefined
-        : join(home, '.agents', 'skills');
+    options.agentsGlobalSkillsDir ??
+    (options.globalSkillsDir !== undefined && options.homedir === undefined
+      ? undefined
+      : join(home, '.agents', 'skills'));
 
   const [workspaceSkills, globalSkills, agentsGlobalSkills] = await Promise.all([
     scanSkillsDirectory(workspaceDir, 'workspace', maxPreviewChars),

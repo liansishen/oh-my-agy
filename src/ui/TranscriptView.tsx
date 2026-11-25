@@ -675,53 +675,60 @@ function renderToolItem(
   if (tool.isOmaTodo) {
     const snap = tool.todoSnapshot;
     const status = snap?.isError ? 'error' : isToolRunning ? 'running' : effectiveStatus;
+    const nonEmptyPhases = snap && !snap.isError ? snap.phases.filter(p => p.tasks.length > 0) : [];
+    const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
+    const done = nonEmptyPhases.reduce(
+      (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
+      0
+    );
+    const rawRec =
+      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
+        ? (tool.rawInput as Record<string, unknown>)
+        : tool.args;
+    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
+    const failedText =
+      tool.acpStatus === 'failed' ? (tool.failureOutputText?.trim() ?? '') : '';
+    const target = snap
+      ? !snap.isError && total > 0
+        ? `${done}/${total}`
+        : undefined
+      : tool.acpStatus === 'failed'
+        ? undefined
+        : inFlightOp;
+    const collapsed = snap
+      ? false
+      : tool.acpStatus === 'failed' && failedText.length > 0
+        ? false
+        : undefined;
+    const errText = snap?.isError
+      ? failedText || snap.text || 'Todo operation failed'
+      : tool.acpStatus === 'failed'
+        ? failedText
+        : '';
 
-    if (snap?.isError) {
-      return (
-        <tool
-          key={nodeKey}
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          status={status}
-          age={toolAge}
-          took={toolTook}
-          frame="card"
-          preview="none"
-          collapsed={false}
-        >
-          <text
-            key="err"
-            spans={[{ t: snap.text || 'Todo operation failed', s: 'error' }]}
-            wrap="word"
-          />
-        </tool>
-      );
-    }
-
-    if (snap) {
-      const nonEmptyPhases = snap.phases.filter(p => p.tasks.length > 0);
-      const total = nonEmptyPhases.reduce((sum, p) => sum + p.tasks.length, 0);
-      const done = nonEmptyPhases.reduce(
-        (sum, p) => sum + p.tasks.filter(isTodoTaskFinished).length,
-        0
-      );
-      return (
-        <tool
-          key={nodeKey}
-          role="omp.tool.todo"
-          name="todo"
-          title="Todo"
-          target={total > 0 ? `${done}/${total}` : undefined}
-          targetKind={total > 0 ? 'text' : undefined}
-          status={status}
-          age={toolAge}
-          took={toolTook}
-          frame="card"
-          preview="none"
-          collapsed={false}
-        >
-          {total === 0 ? (
+    return (
+      <tool
+        key={nodeKey}
+        role="omp.tool.todo"
+        name="todo"
+        title="Todo"
+        target={target}
+        targetKind={target ? 'text' : undefined}
+        status={status}
+        age={toolAge}
+        took={toolTook}
+        frame="card"
+        preview="none"
+        collapsed={collapsed}
+        confirm={isAsk ? 'card' : undefined}
+        ask={isAsk ? tool.ask : undefined}
+        approved={tool.approved}
+        onAction={approvalHandlers}
+      >
+        {errText ? (
+          <text key="err" spans={[{ t: errText, s: 'error' }]} wrap="word" />
+        ) : snap ? (
+          total === 0 ? (
             <text
               key="empty"
               spans={[{ t: snap.text || 'No todos', s: 'muted' }]}
@@ -733,39 +740,15 @@ function renderToolItem(
               mode="full"
               phases={mapTodoPhasesToChecklist(nonEmptyPhases)}
             />
-          )}
-        </tool>
-      );
-    }
-
-    const rawRec =
-      tool.rawInput && typeof tool.rawInput === 'object' && !Array.isArray(tool.rawInput)
-        ? (tool.rawInput as Record<string, unknown>)
-        : tool.args;
-    const inFlightOp = typeof rawRec?.op === 'string' ? rawRec.op.trim() : undefined;
-    return (
-      <tool
-        key={nodeKey}
-        role="omp.tool.todo"
-        name="todo"
-        title="Todo"
-        target={inFlightOp}
-        targetKind={inFlightOp ? 'text' : undefined}
-        status={status}
-        age={toolAge}
-        took={toolTook}
-        frame="card"
-        preview="none"
-        confirm={isAsk ? 'card' : undefined}
-        ask={isAsk ? tool.ask : undefined}
-        approved={tool.approved}
-        onAction={approvalHandlers}
-      />
+          )
+        ) : undefined}
+      </tool>
     );
   }
 
   if (tool.isUpdateSteps) {
-    const entries = tool.updateStepsEntries;
+    const isFailedCall = tool.acpStatus === 'failed';
+    const entries = isFailedCall ? undefined : tool.updateStepsEntries;
     const hasEntries = Boolean(entries && entries.length > 0);
     const failedCount = entries ? entries.filter(e => e.status === 'blocked').length : 0;
     const allFinished = hasEntries && entries!.every(e => isChecklistStatusFinished(e.status));
@@ -774,12 +757,18 @@ function renderToolItem(
       : effectiveStatus === 'error' || (allFinished && failedCount > 0)
         ? 'error'
         : effectiveStatus;
+    const errorText = isFailedCall
+      ? (tool.failureOutputText?.trim() ?? '')
+      : status === 'error' && !hasEntries
+        ? tool.outputText.trim()
+        : '';
     const effectiveCollapsed = isAsk
       ? false
       : tool.userToggled
         ? tool.collapsed
-        : !expandAllTools;
-    const errorText = status === 'error' && !hasEntries ? tool.outputText.trim() : '';
+        : isFailedCall && errorText.length > 0
+          ? false
+          : !expandAllTools;
     const hasBody = hasEntries || errorText.length > 0;
     const frame = isAsk || (hasBody && !effectiveCollapsed) ? 'card' : 'inline';
 

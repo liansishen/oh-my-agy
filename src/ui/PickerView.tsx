@@ -50,6 +50,7 @@ import type {
   SwarmMemberStatus,
   SwarmMessageBadgeTone,
 } from '../swarm/board';
+import { isSystemSwarmAgent } from './SwarmBoardView';
 
 export interface PickerCallbacks {
   readonly onSelect: (itemId: string) => void;
@@ -1282,7 +1283,7 @@ export function computePickerData(
     )) {
       if (seenScope.has(agentName)) continue;
       seenScope.add(agentName);
-      const isSystem = agentName.trim().toLowerCase() === 'system';
+      const isSystem = isSystemSwarmAgent(agentName);
       scopes.push({
         id: agentName,
         label: agentName,
@@ -1363,7 +1364,7 @@ export function computePickerData(
       visibleIds.push(id);
 
       const member = snapshot.memberByName[msg.agent];
-      const isSystem = !member && msg.agent.trim().toLowerCase() === 'system';
+      const isSystem = !member && isSystemSwarmAgent(msg.agent);
       const dot: Tone = member ? memberStatusDot(member.status) : isSystem ? 'info' : 'muted';
       const whenLabel = formatSwarmTimeColumn(msg.time, nowMs);
       const facts: Record<string, string> = {};

@@ -122,7 +122,7 @@ function sanitizeNodeKey(raw: string, fallback: string): string {
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
-function isSystemSwarmAgent(agent: string): boolean {
+export function isSystemSwarmAgent(agent: string): boolean {
   return agent.trim().toLowerCase() === 'system';
 }
 

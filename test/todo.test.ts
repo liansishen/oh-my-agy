@@ -355,4 +355,119 @@ describe('EmbeddedTodoMcpServer', () => {
     expect(server.getPhases('sess-root')[0]?.tasks[0]?.content).toBe('Root task');
     expect(server.getPhases('sess-sub-1')[0]?.tasks[0]?.content).toBe('Subagent task');
   });
+
+  test('enforces per-transition route tokens across uncommitted replay and slow-body transitions', async () => {
+    const events: TodoServerUpdateEvent[] = [];
+    const server = new EmbeddedTodoMcpServer({
+      version: '0.2.0-test',
+      requireSessionRoute: true,
+      onTodoChanged: event => events.push(event),
+    });
+    servers.push(server);
+
+    const postTodoRpc = async (url: string, id: number, method: string, params: Record<string, unknown> = {}) => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+      });
+      const json =
+        res.status === 200
+          ? ((await res.json()) as { result?: { isError?: boolean; content?: Array<{ text: string }> } })
+          : undefined;
+      return { status: res.status, result: json?.result };
+    };
+
+    // Base secret path returns 404 when requireSessionRoute is enabled
+    expect((await postTodoRpc(server.endpointUrl, 1, 'ping')).status).toBe(404);
+
+    // Bootstrap route allows initialize & tools/list before commit, but rejects tools/call
+    const route1 = server.openSessionRoute(1);
+    expect(typeof route1.url).toBe('string');
+    expect(route1.url).not.toBe(server.endpointUrl);
+
+    expect((await postTodoRpc(route1.url!, 2, 'initialize')).status).toBe(200);
+    expect((await postTodoRpc(route1.url!, 3, 'tools/list')).status).toBe(200);
+
+    const preCommit = await postTodoRpc(route1.url!, 4, 'tools/call', {
+      name: 'todo',
+      arguments: { op: 'init', items: ['Too early'] },
+    });
+    expect(preCommit.result?.isError).toBe(true);
+    expect(server.getPhases('sess-1')).toEqual([]);
+    expect(events).toHaveLength(0);
+
+    // Commit route 1 -> sess-1: unscoped calls succeed, foreign _meta fails, subagent root_conversation_id works
+    expect(server.commitSessionRoute(1, 'sess-1')).toBe(true);
+
+    const committed = await postTodoRpc(route1.url!, 5, 'tools/call', {
+      name: 'todo',
+      arguments: { op: 'init', items: ['Task in sess-1'] },
+    });
+    expect(committed.result?.isError).toBeUndefined();
+    expect(server.getPhases('sess-1')[0]?.tasks[0]?.content).toBe('Task in sess-1');
+
+    const foreign = await postTodoRpc(route1.url!, 6, 'tools/call', {
+      _meta: { 'antigravity.google/conversation_id': 'sess-other' },
+      name: 'todo',
+      arguments: { op: 'init', items: ['Foreign leak'] },
+    });
+    expect(foreign.result?.isError).toBe(true);
+    expect(server.getPhases('sess-other')).toEqual([]);
+
+    const subagent = await postTodoRpc(route1.url!, 7, 'tools/call', {
+      _meta: {
+        'antigravity.google/root_conversation_id': 'sess-1',
+        'antigravity.google/conversation_id': 'sess-sub-9',
+      },
+      name: 'todo',
+      arguments: { op: 'init', items: ['Subagent step'] },
+    });
+    expect(subagent.result?.isError).toBeUndefined();
+    expect(server.getPhases('sess-sub-9')[0]?.tasks[0]?.content).toBe('Subagent step');
+
+    // Slow in-flight ReadableStream body on route1 finishing AFTER transition to route2 -> 404, zero mutation on sess-2
+    const eventsBeforeSlow = events.length;
+    const encoder = new TextEncoder();
+    const payload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'tools/call',
+      params: { name: 'todo', arguments: { op: 'init', items: ['Late body leak'] } },
+    });
+    const splitAt = Math.floor(payload.length / 2);
+    let streamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    let sentFirstChunk = false;
+    const firstChunkPulled = Promise.withResolvers<void>();
+    const slowBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamCtrl = controller;
+      },
+      pull(controller) {
+        if (!sentFirstChunk) {
+          sentFirstChunk = true;
+          controller.enqueue(encoder.encode(payload.slice(0, splitAt)));
+          firstChunkPulled.resolve();
+        }
+      },
+    });
+
+    const slowFetch = fetch(route1.url!, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: slowBody,
+    });
+    await firstChunkPulled.promise;
+    await Bun.sleep(15);
+    server.revokeSessionRoute();
+    server.openSessionRoute(2);
+    expect(server.commitSessionRoute(2, 'sess-2')).toBe(true);
+    streamCtrl.enqueue(encoder.encode(payload.slice(splitAt)));
+    streamCtrl.close();
+
+    const slowOutcome = await slowFetch;
+    expect(slowOutcome.status).toBe(404);
+    expect(server.getPhases('sess-2')).toEqual([]);
+    expect(events.slice(eventsBeforeSlow)).toEqual([]);
+  });
 });

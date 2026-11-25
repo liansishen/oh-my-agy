@@ -2742,83 +2742,157 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(app.getState().picker?.modelPickerThinking).toBe('medium');
   });
 
-  test('TranscriptStore supports update_steps/extended plan statuses and maps failed/timed-out bash commands to error', () => {
+  type TestSessionUpdate = Parameters<TranscriptStore['applySessionUpdate']>[0];
+  type TestLiveTodoEvent = Parameters<TranscriptStore['applyLiveTodoToolResult']>[0];
+  type TestToolStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+  type TestTodoStatus = TestLiveTodoEvent['phases'][number]['tasks'][number]['status'];
+  type ToolHelperOpts = {
+    isUpdate?: boolean; isReplaying?: boolean; title?: string; omitName?: boolean;
+    jsonSteps?: boolean; rawInput?: unknown; rawOutput?: unknown; args?: Record<string, unknown>; text?: string;
+  };
+
+  const emitTool = (store: TranscriptStore, defaultName: string, toolCallId: string, rawInput: unknown, status?: TestToolStatus, opts: ToolHelperOpts = {}): void => {
+    const fields = {
+      toolCallId,
+      ...(!opts.isUpdate && !opts.omitName ? { name: defaultName } : {}),
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(status !== undefined ? { status } : {}),
+      ...(rawInput !== undefined ? { rawInput } : {}),
+      ...(opts.rawOutput !== undefined ? { rawOutput: opts.rawOutput } : {}),
+      ...(opts.args !== undefined ? { args: opts.args } : {}),
+      ...(opts.text !== undefined ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: opts.text } }] } : {}),
+    };
+    const update: TestSessionUpdate = opts.isUpdate ? { sessionUpdate: 'tool_call_update', ...fields } : { sessionUpdate: 'tool_call', ...fields };
+    store.applySessionUpdate(update, opts.isReplaying ? { isReplaying: true } : {});
+  };
+
+  const stepsUpdate = (store: TranscriptStore, id: string, steps?: readonly string[], status?: TestToolStatus, opts: ToolHelperOpts = {}): void => {
+    const built = steps?.map((s) => {
+      const i = s.lastIndexOf(':');
+      return i >= 0 ? { title: s.slice(0, i), status: s.slice(i + 1) } : { title: s, status: 'in_progress' };
+    });
+    const rawInput = opts.rawInput !== undefined ? opts.rawInput : built !== undefined ? { steps: opts.jsonSteps ? JSON.stringify(built) : built } : undefined;
+    emitTool(store, 'update_steps', id, rawInput, status, opts);
+  };
+
+  const mcpUpdate = (store: TranscriptStore, id: string, rawInput?: unknown, status?: TestToolStatus, opts: ToolHelperOpts = {}): void =>
+    emitTool(store, 'mcp_oma_todo_todo', id, rawInput, status, opts);
+
+  const liveMcpResult = (store: TranscriptStore, op: TestLiveTodoEvent['op'], taskSpecs: readonly string[], opts: { sessionId?: string; isError?: boolean; text?: string; rawArgs?: unknown } = {}): void => {
+    const tasks = taskSpecs.map((s): { content: string; status: TestTodoStatus } => {
+      const i = s.lastIndexOf(':');
+      const raw = i >= 0 ? s.slice(i + 1) : '';
+      return raw === 'pending' || raw === 'in_progress' || raw === 'completed' || raw === 'abandoned'
+        ? { content: s.slice(0, i), status: raw }
+        : { content: s, status: 'in_progress' };
+    });
+    store.applyLiveTodoToolResult({
+      sessionId: opts.sessionId ?? 'sess-live-todo',
+      op,
+      phases: tasks.length > 0 ? [{ name: 'Todos', tasks }] : [],
+      completedTasks: tasks.filter((t) => t.status === 'completed').map((t) => ({ phase: 'Todos', content: t.content })),
+      isError: opts.isError ?? false,
+      text: opts.text ?? 'ok',
+      rawArgs: opts.rawArgs ?? { op },
+    });
+  };
+
+  const replayScript = (options: ConstructorParameters<typeof TranscriptStore>[0], turns: ReadonlyArray<readonly [string, ...Array<(store: TranscriptStore) => void>]>): TranscriptStore => {
+    const store = new TranscriptStore(options);
+    for (const [promptText, ...actions] of turns) {
+      store.applySessionUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: promptText } }, { isReplaying: true });
+      for (const act of actions) act(store);
+    }
+    store.finalizeReplayedTurns();
+    return store;
+  };
+
+  const planTexts = (store: TranscriptStore): string[] | undefined => store.plan?.entries.map((e) => e.text);
+  const todoTexts = (store: TranscriptStore): string[] => store.todoPhases.flatMap((p) => p.tasks.map((t) => t.content));
+
+  test('TranscriptStore supports agy 1.5.16 update_steps payloads, args.steps fallback, extended statuses, and run_command error/timeout mapping', () => {
     let now = 10_000;
-    const store = new TranscriptStore({ now: () => now });
+    const store = new TranscriptStore({ now: () => now, preferNativeSteps: true });
     store.beginUserTurn('Run checks and track steps');
 
-    store.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-steps',
-      name: 'update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: [
-          { title: 'Build project', status: 'done' },
-          { title: 'Optional lint', status: 'skipped' },
-          { title: 'Run tests', status: 'failed' },
-        ],
-      },
-    });
+    stepsUpdate(store, 'tc-steps', ['Build project:done', 'Optional lint:skipped', 'Run tests:failed'], 'completed');
     expect(store.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
       'Build project:done',
       'Optional lint:dropped',
       'Run tests:blocked',
     ]);
+    expect(store.getToolById('tc-steps')?.target).toBe('1/3 (1 skipped, 1 failed)');
 
-    // Empty plan_update clears acp plan
-    store.applySessionUpdate({ sessionUpdate: 'plan_update', entries: [] });
+    // Real agy 1.5.16 shapes: omitted `name` with "Run update_steps" / "Run default_api:update_steps" + JSON string steps
+    stepsUpdate(store, 'tc-real-arr', ['Check payload:done', 'Apply fix:in_progress'], 'completed', { omitName: true, title: 'Run update_steps' });
+    const arrTool = store.getToolById('tc-real-arr');
+    expect(arrTool?.isUpdateSteps).toBe(true);
+    expect(arrTool?.displayName).toBe('todo');
+    expect(arrTool?.title).toBe('Todo');
+    expect(arrTool?.target).toBe('1/2');
+    expect(arrTool?.updateStepsEntries).toEqual([
+      { id: 'plan-0', text: 'Check payload', status: 'done' },
+      { id: 'plan-1', text: 'Apply fix', status: 'active' },
+    ]);
+
+    stepsUpdate(store, 'tc-real-json', ['Check payload:done', 'Apply fix:done'], 'completed', {
+      omitName: true,
+      title: 'Run default_api:update_steps',
+      jsonSteps: true,
+    });
+    expect(store.getToolById('tc-real-json')?.target).toBe('2/2');
+    expect(store.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual(['Check payload:done', 'Apply fix:done']);
+
+    // Streaming `tool_call` (no `name`, no `rawInput`) -> `tool_call_update` preserves `Todo` identity
+    stepsUpdate(store, 'tc-stream', undefined, 'in_progress', { omitName: true, title: 'Run update_steps' });
+    const streamTool = store.getToolById('tc-stream');
+    expect(streamTool?.isUpdateSteps).toBe(true);
+    expect(streamTool?.title).toBe('Todo');
+    stepsUpdate(store, 'tc-stream', ['Stream 1:done', 'Stream 2:done'], 'completed', { isUpdate: true });
+    expect(streamTool?.target).toBe('2/2');
+    expect(planTexts(store)).toEqual(['Stream 1', 'Stream 2']);
+
+    // `in_progress` only previews on tool row; transitioning `in_progress -> failed` clears preview & target
+    stepsUpdate(store, 'tc-fail-preview', ['Preview only:in_progress'], 'in_progress', { text: 'Pre-failure progress' });
+    expect(store.getToolById('tc-fail-preview')?.updateStepsEntries).toHaveLength(1);
+    expect(planTexts(store)).toEqual(['Stream 1', 'Stream 2']);
+    stepsUpdate(store, 'tc-fail-preview', undefined, 'failed', { isUpdate: true, text: 'Schema invalid' });
+    const failedSteps = store.getToolById('tc-fail-preview');
+    expect(failedSteps?.updateStepsEntries).toBeUndefined();
+    expect(failedSteps?.target).toBeUndefined();
+    expect(failedSteps?.failureOutputText).toBe('Schema invalid');
+    expect(planTexts(store)).toEqual(['Stream 1', 'Stream 2']);
+
+    // Empty `rawInput: {}` falls back to `args.steps`, while explicit `rawInput: { steps: [] }` clears ACP plan
+    stepsUpdate(store, 'tc-args-fallback', undefined, 'completed', {
+      rawInput: {},
+      args: { steps: [{ title: 'From Args', status: 'in_progress' }] },
+    });
+    expect(planTexts(store)).toEqual(['From Args']);
+    stepsUpdate(store, 'tc-explicit-empty', [], 'completed', { args: { steps: [{ title: 'Ignored', status: 'in_progress' }] } });
     expect(store.plan).toBeNull();
 
-    // Non-zero exit_code with ACP status=completed maps to TSP error
-    now = 12_000;
-    store.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-fail',
-      kind: 'execute',
-      name: 'run_command',
-      status: 'completed',
-      rawOutput: { output: 'Command exited with code 2.\nSyntaxError', exit_code: 2 },
-    });
-    expect(store.getToolById('tc-fail')?.status).toBe('error');
-    expect(store.getToolById('tc-fail')?.exitCode).toBe(2);
-
-    // Leading "Command timed out" output maps to TSP error even without explicit exit_code
-    now = 15_000;
-    store.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-timeout',
-      kind: 'execute',
-      name: 'run_command',
-      status: 'completed',
-      rawOutput: { output: 'Created At: 2026-11-24T00:00:00Z\nCompleted At: 2026-11-24T00:00:05Z\nCommand timed out after 5s' },
-    });
-    expect(store.getToolById('tc-timeout')?.status).toBe('error');
-    expect(store.getToolById('tc-timeout')?.timedOut).toBe(true);
-
-    // Ordinary echo containing "Command timed out" inside stdout does not false-trigger
-    now = 16_000;
-    store.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-grep',
-      kind: 'execute',
-      name: 'run_command',
-      status: 'completed',
-      rawOutput: { output: 'Command exited with code 0.\nsrc/foo.ts:10: Command timed out' },
-    });
-    expect(store.getToolById('tc-grep')?.status).toBe('done');
+    // `run_command` status mapping: non-zero exit_code & leading timeout header map to `error`; stdout text stays `done`
+    for (const c of [
+      { id: 'tc-cmd-fail', at: 12_000, out: { output: 'Command exited with code 2.\nSyntaxError', exit_code: 2 }, status: 'error', code: 2, timedOut: undefined },
+      { id: 'tc-cmd-timeout', at: 15_000, out: { output: 'Created At: 2026-11-24T00:00:00Z\nCompleted At: 2026-11-24T00:00:05Z\nCommand timed out after 5s' }, status: 'error', code: undefined, timedOut: true },
+      { id: 'tc-cmd-grep', at: 16_000, out: { output: 'Command exited with code 0.\nsrc/foo.ts:10: Command timed out' }, status: 'done', code: undefined, timedOut: undefined },
+    ] as const) {
+      now = c.at;
+      store.applySessionUpdate({ sessionUpdate: 'tool_call', toolCallId: c.id, kind: 'execute', name: 'run_command', status: 'completed', rawOutput: c.out });
+      const cmdTool = store.getToolById(c.id);
+      expect(cmdTool?.status).toBe(c.status);
+      if (c.code !== undefined) expect(cmdTool?.exitCode).toBe(c.code);
+      if (c.timedOut !== undefined) expect(cmdTool?.timedOut).toBe(c.timedOut);
+    }
   });
 
-  test('AppStore queues concurrent elicitation/create questions FIFO and promotes on resolve', () => {
+  test('P1 regression: AppStore queues concurrent elicitation/create questions FIFO and promotes on resolve', () => {
     const app = new AppStore({ cwd: '/workspace/demo' });
     const replies: Array<{ id: number; res: unknown }> = [];
 
-    app.openQuestion(101, { mode: 'form', message: 'Subagent A asks', requestedSchema: { type: 'object', properties: { q1: { type: 'string', title: 'Choice A', enum: ['x', 'y'] } } } }, (res) => {
-      replies.push({ id: 101, res });
-    });
-    app.openQuestion(102, { mode: 'form', message: 'Subagent B asks', requestedSchema: { type: 'object', properties: { q2: { type: 'string', title: 'Reason B' } } } }, (res) => {
-      replies.push({ id: 102, res });
-    });
+    app.openQuestion(101, { mode: 'form', message: 'Subagent A asks', requestedSchema: { type: 'object', properties: { q1: { type: 'string', title: 'Choice A', enum: ['x', 'y'] } } } }, (res) => replies.push({ id: 101, res }));
+    app.openQuestion(102, { mode: 'form', message: 'Subagent B asks', requestedSchema: { type: 'object', properties: { q2: { type: 'string', title: 'Reason B' } } } }, (res) => replies.push({ id: 102, res }));
 
     expect(replies).toHaveLength(0);
     expect(app.getState().activeQuestion?.requestId).toBe(101);
@@ -2830,202 +2904,269 @@ describe('P0/P1 commands, semantic icons, completion popup & state machine', () 
     expect(app.getState().queuedQuestionCount).toBe(0);
 
     expect(app.cancelAllQuestions()).toBe(1);
-    expect(replies).toEqual([
-      { id: 101, res: { action: 'accept', content: { q1: 'x' } } },
-      { id: 102, res: { action: 'cancel' } },
-    ]);
+    expect(replies).toEqual([{ id: 101, res: { action: 'accept', content: { q1: 'x' } } }, { id: 102, res: { action: 'cancel' } }]);
     expect(app.getState().activeQuestion).toBeNull();
   });
 
-  test('TranscriptStore allows update_steps to take over finished todo_tool or unfinished history when preferNativeSteps=true', () => {
-    // 1. Default (preferNativeSteps=false): unfinished todo_tool stays authoritative, finished todo_tool yields to update_steps
-    const mcpStore = new TranscriptStore({ now: () => 10_000 });
-    mcpStore.beginUserTurn('Old MCP work');
-    mcpStore.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'in_progress' }] }], {
-      source: 'todo_tool',
-    });
+  test('TranscriptStore todo_provider priority, cross-turn update_steps takeover, and empty clear boundaries', () => {
+    // 1. `preferNativeSteps=false`: unfinished MCP todo stays authoritative; finished MCP todo yields to next-turn update_steps
+    const mcpFirst = new TranscriptStore({ now: () => 10_000, preferNativeSteps: false });
+    mcpFirst.beginUserTurn('MCP turn');
+    mcpFirst.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'in_progress' }] }], { source: 'todo_tool' });
+    mcpFirst.beginUserTurn('Blocked native turn');
+    stepsUpdate(mcpFirst, 'tc-blocked', ['Native A:in_progress'], 'completed');
+    expect(mcpFirst.getToolById('tc-blocked')?.target).toBe('0/1');
+    expect(mcpFirst.plan?.source).toBe('todo_tool');
+    expect(planTexts(mcpFirst)).toEqual(['Legacy task']);
 
-    mcpStore.beginUserTurn('Follow-up step check');
-    mcpStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-steps-blocked',
-      name: 'update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: [{ title: 'Native A', status: 'in_progress' }],
-      },
-    });
-    expect(mcpStore.getToolById('tc-steps-blocked')?.target).toBe('0/1');
-    expect(mcpStore.plan?.source).toBe('todo_tool');
-    expect(mcpStore.plan?.entries[0]?.text).toBe('Legacy task');
+    mcpFirst.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'completed' }] }], { source: 'todo_tool' });
+    mcpFirst.beginUserTurn('Post-completion native turn');
+    stepsUpdate(mcpFirst, 'tc-takeover', ['Native B:done'], 'completed');
+    expect(mcpFirst.plan?.source).toBe('acp');
+    expect(planTexts(mcpFirst)).toEqual(['Native B']);
 
-    mcpStore.setTodoPhases([{ name: 'Old', tasks: [{ content: 'Legacy task', status: 'completed' }] }], {
-      source: 'todo_tool',
-    });
-    mcpStore.beginUserTurn('Next turn after completion');
-    mcpStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-steps-takeover-finished',
-      name: 'update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: [{ title: 'Native B', status: 'done' }],
-      },
-    });
-    expect(mcpStore.plan?.source).toBe('acp');
-    expect(mcpStore.plan?.entries.map((e) => e.text)).toEqual(['Native B']);
+    // 2. `preferNativeSteps=true`: same-turn active oma_todo wins, failed oma_todo does not block, cross-turn native takes over
+    const nativeFirst = replayScript({ now: () => 20_000, preferNativeSteps: true }, [[
+      'Same-turn MCP + native',
+      (s) => mcpUpdate(s, 'tc-hist-oma', { op: 'init', items: ['Unfinished old'] }, 'completed', { isReplaying: true }),
+      (s) => stepsUpdate(s, 'tc-same-turn', ['Secondary:in_progress'], 'completed', { isReplaying: true }),
+    ]]);
+    expect(nativeFirst.plan?.source).toBe('todo_tool');
 
-    // 2. Native mode (preferNativeSteps=true): unfinished todo_tool from earlier turn yields to update_steps,
-    //    while same-turn oma_todo keeps todo_tool authoritative
-    const nativeStore = new TranscriptStore({ now: () => 20_000, preferNativeSteps: true });
-    nativeStore.beginUserTurn('Historical MCP turn');
-    nativeStore.applySessionUpdate(
-      {
-        sessionUpdate: 'tool_call',
-        toolCallId: 'tc-hist-oma',
-        name: 'mcp_oma_todo_todo',
-        status: 'completed',
-        rawInput: { op: 'init', items: ['Unfinished old task'] },
-      },
-      { isReplaying: true },
-    );
-    expect(nativeStore.plan?.source).toBe('todo_tool');
+    nativeFirst.beginUserTurn('Resumed turn with failed MCP probe then native');
+    mcpUpdate(nativeFirst, 'tc-failed-mcp', { op: 'init', items: ['Failed probe'] }, 'failed', { omitName: true, title: 'Run mcp_oma_todo_todo' });
+    stepsUpdate(nativeFirst, 'tc-native-win', ['Native Step 1:done', 'Native Step 2:in_progress'], 'completed');
+    expect(nativeFirst.plan?.source).toBe('acp');
+    expect(planTexts(nativeFirst)).toEqual(['Native Step 1', 'Native Step 2']);
 
-    // Same-turn update_steps alongside oma_todo stays secondary
-    nativeStore.applySessionUpdate(
-      {
-        sessionUpdate: 'tool_call',
-        toolCallId: 'tc-same-turn-steps',
-        name: 'update_steps',
-        status: 'completed',
-        rawInput: { steps: [{ title: 'Should stay secondary', status: 'in_progress' }] },
-      },
-      { isReplaying: true },
-    );
-    expect(nativeStore.plan?.source).toBe('todo_tool');
+    // 3. Empty clear boundaries: `plan_removed` clears any plan (while preserving todoPhases), whereas empty `update_steps`/`plan` never steal active MCP plan
+    const rmOnly = replayScript({ preferNativeSteps: true }, [[
+      'Replay plan_removed',
+      (s) => mcpUpdate(s, 'tc-rm-init', { op: 'init', items: ['Kept task'] }, 'completed', { isReplaying: true }),
+      (s) => s.applySessionUpdate({ sessionUpdate: 'plan_removed' }, { isReplaying: true }),
+    ]]);
+    expect(rmOnly.plan).toBeNull();
+    expect(todoTexts(rmOnly)).toEqual(['Kept task']);
 
-    // Subsequent turn using native update_steps takes over HUD/plan
-    nativeStore.beginUserTurn('Resumed native turn');
-    nativeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-native-takeover',
-      name: 'update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: [
-          { title: 'Native Step 1', status: 'done' },
-          { title: 'Native Step 2', status: 'in_progress' },
-        ],
-      },
-    });
-    expect(nativeStore.plan?.source).toBe('acp');
-    expect(nativeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
-      'Native Step 1:done',
-      'Native Step 2:active',
+    const afterRm = replayScript({ preferNativeSteps: true }, [[
+      'Replay MCP after plan_removed',
+      (s) => mcpUpdate(s, 'tc-rm2-init', { op: 'init', items: ['Task 1'] }, 'completed', { isReplaying: true }),
+      (s) => s.applySessionUpdate({ sessionUpdate: 'plan_removed' }, { isReplaying: true }),
+      (s) => mcpUpdate(s, 'tc-rm2-app', { op: 'append', task: 'Task 2' }, 'completed', { isReplaying: true }),
+    ]]);
+    expect(afterRm.plan?.source).toBe('todo_tool');
+    expect(planTexts(afterRm)).toEqual(['Task 1', 'Task 2']);
+
+    for (const clearVariant of ['update_steps', 'plan'] as const) {
+      const guardMcp = replayScript({ preferNativeSteps: true }, [
+        ['Turn 1 inflight MCP', (s) => mcpUpdate(s, 'tc-g-init', { op: 'init', items: ['Task A'] }, 'in_progress', { isReplaying: true })],
+        ['Turn 2 empty clear', (s) => clearVariant === 'update_steps'
+          ? stepsUpdate(s, 'tc-g-empty', [], 'completed', { isReplaying: true })
+          : s.applySessionUpdate({ sessionUpdate: 'plan', entries: [] }, { isReplaying: true })],
+        ['Turn 3 MCP finishes', (s) => mcpUpdate(s, 'tc-g-init', undefined, 'completed', { isUpdate: true, isReplaying: true })],
+      ]);
+      expect(guardMcp.plan?.source).toBe('todo_tool');
+      expect(planTexts(guardMcp)).toEqual(['Task A']);
+    }
+  });
+
+  test('P1 regression: deterministic replay, staged currentTodoPhases anti-retroactive guard, and live MCP snapshot pairing', () => {
+    // 1. Replay determinism: unconfirmed/failed calls stay non-mutating, `{}` recovers on late rawInput, and identical-phase MCP re-init reclaims ACP plan
+    const replayDet = replayScript({ now: () => 30_000, preferNativeSteps: true }, [
+      [
+        'Replay mixed statuses',
+        (s) => mcpUpdate(s, 'tc-ok', { op: 'init', items: ['Confirmed'] }, 'completed', { isReplaying: true }),
+        (s) => mcpUpdate(s, 'tc-inflight', { op: 'init', items: ['Unfinished phantom'] }, 'in_progress', { isReplaying: true }),
+        (s) => mcpUpdate(s, 'tc-fail', { op: 'init', items: ['Failed phantom'] }, 'failed', { isReplaying: true, text: 'MCP transport error' }),
+        (s) => mcpUpdate(s, 'tc-recover', {}, 'completed', { isReplaying: true }),
+        (s) => mcpUpdate(s, 'tc-recover', { op: 'append', task: 'Recovered' }, undefined, { isUpdate: true, isReplaying: true }),
+        (s) => s.applySessionUpdate({ sessionUpdate: 'plan', entries: [{ content: 'Temp ACP', priority: 'high', status: 'in_progress' }] }, { isReplaying: true }),
+      ],
+      ['Reclaim MCP', (s) => mcpUpdate(s, 'tc-reinit', { op: 'init', items: ['Confirmed', 'Recovered'] }, 'completed', { isReplaying: true })],
     ]);
+    expect(replayDet.todoToolCallCount).toBe(3);
+    expect(todoTexts(replayDet)).toEqual(['Confirmed', 'Recovered']);
+    expect(replayDet.plan?.source).toBe('todo_tool');
+    expect(planTexts(replayDet)).toEqual(['Confirmed', 'Recovered']);
+    expect(replayDet.getToolById('tc-fail')?.todoSnapshot?.isError).toBe(true);
+    expect(replayDet.getToolById('tc-fail')?.todoSnapshot?.text).toBe('MCP transport error');
+    expect(replayDet.getToolById('tc-fail')?.target).toBeUndefined();
+    expect(replayDet.getToolById('tc-inflight')?.todoSnapshot).toBeUndefined();
 
-    // 3. Real agy acp 1.5.16 shape: no `name`, title "Run update_steps", JSON-string `steps`,
-    //    and a same-turn failed `Run mcp_oma_todo_todo` does NOT block takeover
-    const realShapeStore = new TranscriptStore({ now: () => 30_000, preferNativeSteps: true });
-    realShapeStore.beginUserTurn('Old MCP turn');
-    realShapeStore.applySessionUpdate(
-      {
-        sessionUpdate: 'tool_call',
-        toolCallId: 'tc-old-mcp',
-        title: 'Run mcp_oma_todo_todo',
-        status: 'completed',
-        rawInput: { op: 'init', items: ['Old MCP item'] },
-      },
-      { isReplaying: true },
-    );
-    expect(realShapeStore.plan?.source).toBe('todo_tool');
+    // 2. Staged `currentTodoPhases` anti-retroactive guard: early suppressed `update_steps` never steals plan after later `oma_todo` completion
+    const stagedStore = replayScript({ now: () => 35_000, preferNativeSteps: false }, [
+      ['T1 unfinished MCP', (s) => mcpUpdate(s, 'tc-st-init', { op: 'init', items: ['Task A'] }, 'completed', { isReplaying: true })],
+      ['T2 suppressed native', (s) => stepsUpdate(s, 'tc-st-early', ['Blocked Early:in_progress'], 'completed', { isReplaying: true })],
+      ['T3 finish MCP', (s) => mcpUpdate(s, 'tc-st-done', { op: 'done', task: 'Task A' }, 'completed', { isReplaying: true })],
+    ]);
+    expect(stagedStore.plan?.source).toBe('todo_tool');
+    expect(planTexts(stagedStore)).toEqual(['Task A']);
+    stepsUpdate(stagedStore, 'tc-st-early', undefined, undefined, { isUpdate: true, text: 'late output' });
+    expect(stagedStore.plan?.source).toBe('todo_tool');
+    stagedStore.beginUserTurn('T4 fresh native');
+    stepsUpdate(stagedStore, 'tc-st-fresh', ['Fresh Post-Done:in_progress'], 'completed');
+    expect(stagedStore.plan?.source).toBe('acp');
+    expect(planTexts(stagedStore)).toEqual(['Fresh Post-Done']);
 
-    realShapeStore.beginUserTurn('Resumed turn where model probes failed mcp_oma_todo_todo then falls back to Run update_steps');
-    realShapeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-failed-mcp',
-      title: 'Run mcp_oma_todo_todo',
-      status: 'failed',
-      rawInput: { op: 'init', items: ['Should not block'] },
-    });
-    realShapeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-real-update-steps-arr',
-      title: 'Run update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: [
-          { title: 'Check payload', status: 'done' },
-          { title: 'Apply fix', status: 'in_progress' },
-        ],
-      },
-    });
-    const arrStepsTool = realShapeStore.getToolById('tc-real-update-steps-arr');
-    expect(arrStepsTool?.isUpdateSteps).toBe(true);
-    expect(arrStepsTool?.displayName).toBe('todo');
-    expect(arrStepsTool?.title).toBe('Todo');
-    expect(arrStepsTool?.target).toBe('1/2');
-    expect(arrStepsTool?.updateStepsEntries).toEqual([
-      { id: 'plan-0', text: 'Check payload', status: 'done' },
-      { id: 'plan-1', text: 'Apply fix', status: 'active' },
-    ]);
-    expect(realShapeStore.plan?.source).toBe('acp');
-    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
-      'Check payload:done',
-      'Apply fix:active',
-    ]);
+    // 3. Live MCP snapshot pairing: replayed `in_progress`, missing/unknown `op`, and empty concurrent `in_progress` never misbind
+    replayDet.beginUserTurn('Live pairing');
+    mcpUpdate(replayDet, 'tc-empty-a', undefined, 'in_progress');
+    mcpUpdate(replayDet, 'tc-empty-b', undefined, 'in_progress');
+    liveMcpResult(replayDet, 'init', ['Queued Live:in_progress'], { rawArgs: { op: 'init', items: ['Queued Live'] } });
+    mcpUpdate(replayDet, 'tc-missing-op', { items: ['Queued Live'] }, 'completed');
+    mcpUpdate(replayDet, 'tc-bogus-op', { op: 'bogus', items: ['Queued Live'] }, 'completed');
+    expect(replayDet.getToolById('tc-inflight')?.todoSnapshot).toBeUndefined();
+    expect(replayDet.getToolById('tc-empty-a')?.todoSnapshot).toBeUndefined();
+    expect(replayDet.getToolById('tc-missing-op')?.todoSnapshot).toBeUndefined();
+    expect(replayDet.getToolById('tc-bogus-op')?.todoSnapshot).toBeUndefined();
+    expect(replayDet.todoToolCallCount).toBe(3);
 
-    realShapeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-real-update-steps-json',
-      title: 'Run default_api:update_steps',
-      status: 'completed',
-      rawInput: {
-        steps: JSON.stringify([
-          { title: 'Check payload', status: 'done' },
-          { title: 'Apply fix', status: 'done' },
-        ]),
-      },
-    });
-    expect(realShapeStore.getToolById('tc-real-update-steps-json')?.target).toBe('2/2');
-    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
-      'Check payload:done',
-      'Apply fix:done',
-    ]);
+    mcpUpdate(replayDet, 'tc-empty-b', { op: 'init', items: ['Queued Live'] }, 'completed', { isUpdate: true });
+    expect(replayDet.getToolById('tc-empty-b')?.todoSnapshot?.isError).toBe(false);
+    expect(replayDet.todoToolCallCount).toBe(4);
 
-    // Streaming `tool_call` (no `name`, no `rawInput`) followed by `tool_call_update` keeps `isUpdateSteps`
-    realShapeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'tc-real-update-steps-stream',
-      title: 'Run update_steps',
-      status: 'in_progress',
-    });
-    const streamingStepsTool = realShapeStore.getToolById('tc-real-update-steps-stream');
-    expect(streamingStepsTool?.isUpdateSteps).toBe(true);
-    expect(streamingStepsTool?.displayName).toBe('todo');
-    expect(streamingStepsTool?.title).toBe('Todo');
+    // Unconfirmed ACP `completed` binds late MCP error without counting; inflight bound call finishing `failed` unrecords count
+    mcpUpdate(replayDet, 'tc-late-err', { op: 'init', items: ['Bad'] }, 'completed');
+    expect(replayDet.todoToolCallCount).toBe(4);
+    liveMcpResult(replayDet, 'init', [], { isError: true, text: 'Late validation error', rawArgs: { op: 'init', items: ['Bad'] } });
+    expect(replayDet.getToolById('tc-late-err')?.todoSnapshot?.isError).toBe(true);
+    expect(replayDet.getToolById('tc-late-err')?.todoSnapshot?.text).toBe('Late validation error');
+    expect(replayDet.todoToolCallCount).toBe(4);
 
-    realShapeStore.applySessionUpdate({
-      sessionUpdate: 'tool_call_update',
-      toolCallId: 'tc-real-update-steps-stream',
-      status: 'completed',
-      rawInput: {
-        steps: [
-          { title: 'Stream step 1', status: 'done' },
-          { title: 'Stream step 2', status: 'done' },
-        ],
-      },
+    mcpUpdate(replayDet, 'tc-inflight-abort', { op: 'append', task: 'Abort me' }, 'in_progress');
+    liveMcpResult(replayDet, 'append', ['Queued Live:in_progress', 'Abort me:pending'], { rawArgs: { op: 'append', task: 'Abort me' } });
+    expect(replayDet.todoToolCallCount).toBe(5);
+    mcpUpdate(replayDet, 'tc-inflight-abort', undefined, 'failed', { isUpdate: true, text: 'ACP aborted after MCP call' });
+    const aborted = replayDet.getToolById('tc-inflight-abort');
+    expect(aborted?.target).toBeUndefined();
+    expect(aborted?.todoSnapshot?.isError).toBe(true);
+    expect(aborted?.todoSnapshot?.text).toBe('ACP aborted after MCP call');
+    expect(replayDet.todoToolCallCount).toBe(4);
+  });
+
+  test('P1 regression: user /todo override, _userTodoAnchorFloor preservation, and overflow anchor eviction', () => {
+    // 1. Live user `/todo` edit sets `hasUserTodoOverride`, clears on live MCP progress, and `/todo clear` clears `todo_tool` plan
+    const liveOverride = new TranscriptStore({ now: () => 40_000 });
+    liveOverride.beginUserTurn('User edit then MCP append');
+    liveOverride.setTodoPhases([{ name: 'Todos', tasks: [{ content: 'A', status: 'in_progress' }] }], { source: 'user' });
+    expect(liveOverride.hasUserTodoOverride).toBe(true);
+    expect(liveOverride.hasPersistedTodoState).toBe(true);
+    expect(liveOverride.plan?.source).toBe('todo_tool');
+
+    liveMcpResult(liveOverride, 'append', ['A:in_progress', 'B:pending'], { rawArgs: { op: 'append', task: 'B' } });
+    expect(liveOverride.hasUserTodoOverride).toBe(false);
+    expect(todoTexts(liveOverride)).toEqual(['A', 'B']);
+
+    liveOverride.setTodoPhases([], { source: 'user' });
+    expect(liveOverride.hasUserTodoOverride).toBe(true);
+    expect(liveOverride.hasPersistedTodoState).toBe(true);
+    expect(liveOverride.plan).toBeNull();
+
+    // 2. Replayed `<system-reminder>` user edit + subsequent MCP tool applies cleanly without sticking `hasUserTodoOverride`
+    const reminderReplay = replayScript({ now: () => 41_000 }, [[
+      '<system-reminder>\nThe user manually modified the todo list (user edit).\nCurrent todo list:\n\n### Todos\n- [/] A\n</system-reminder>\n\nContinue',
+      (s) => mcpUpdate(s, 'tc-rem-b', { op: 'append', task: 'B' }, 'completed', { isReplaying: true }),
+    ]]);
+    expect(reminderReplay.turns[0]?.user?.text).toBe('Continue');
+    expect(reminderReplay.hasUserTodoOverride).toBe(false);
+    expect(todoTexts(reminderReplay)).toEqual(['A', 'B']);
+
+    // 3. `_userTodoAnchorFloor` preserves higher persisted count across partial replay, and evicts restored anchor when count overflows
+    const floorStore = replayScript({ preferNativeSteps: false }, [[
+      'Partial replay',
+      (s) => mcpUpdate(s, 'tc-fl-1', { op: 'init', items: ['Task 1'] }, 'completed', { isReplaying: true }),
+      (s) => mcpUpdate(s, 'tc-fl-2', { op: 'append', task: 'Task 2' }, 'in_progress', { isReplaying: true }),
+      (s) => mcpUpdate(s, 'tc-fl-3', { op: 'append', task: 'Task 3' }, 'in_progress', { isReplaying: true }),
+    ]]);
+    expect(floorStore.todoToolCallCount).toBe(1);
+    floorStore.setTodoPhases([{ name: 'Todos', tasks: [{ content: 'Manual Keep', status: 'in_progress' }] }], {
+      source: 'user',
+      isRestoringSessionAnchor: true,
+      restoredAnchorToolCallCount: 2,
     });
-    expect(streamingStepsTool?.isUpdateSteps).toBe(true);
-    expect(streamingStepsTool?.title).toBe('Todo');
-    expect(streamingStepsTool?.target).toBe('2/2');
-    expect(streamingStepsTool?.updateStepsEntries).toEqual([
-      { id: 'plan-0', text: 'Stream step 1', status: 'done' },
-      { id: 'plan-1', text: 'Stream step 2', status: 'done' },
-    ]);
-    expect(realShapeStore.plan?.entries.map((e) => `${e.text}:${e.status}`)).toEqual([
-      'Stream step 1:done',
-      'Stream step 2:done',
-    ]);
+    expect(floorStore.hasUserTodoOverride).toBe(true);
+    expect(floorStore.persistedTodoToolCallCount).toBe(2);
+    expect(todoTexts(floorStore)).toEqual(['Manual Keep']);
+
+    mcpUpdate(floorStore, 'tc-fl-2', undefined, 'completed', { isUpdate: true });
+    expect(floorStore.todoToolCallCount).toBe(2);
+    expect(floorStore.hasUserTodoOverride).toBe(true);
+    expect(todoTexts(floorStore)).toEqual(['Manual Keep']);
+
+    mcpUpdate(floorStore, 'tc-fl-3', undefined, 'completed', { isUpdate: true });
+    expect(floorStore.todoToolCallCount).toBe(3);
+    expect(floorStore.hasUserTodoOverride).toBe(false);
+    expect(floorStore.persistedTodoToolCallCount).toBe(3);
+    expect(todoTexts(floorStore)).toEqual(['Task 1', 'Task 2', 'Task 3']);
+  });
+
+  test('P1 regression: monotonic update_steps event sealing and failureOutputText diagnostic isolation/merge', () => {
+    // 1. Overlapping `update_steps` advance in creation order (`A -> B -> C`) while sealing late edits/completions on older tools
+    const orderStore = new TranscriptStore({ now: () => 50_000, preferNativeSteps: true });
+    orderStore.beginUserTurn('Overlapping update_steps');
+    stepsUpdate(orderStore, 'tc-ord-a', ['Step A:in_progress'], 'in_progress');
+    stepsUpdate(orderStore, 'tc-ord-b', ['Step B:in_progress'], 'in_progress');
+    stepsUpdate(orderStore, 'tc-ord-c', ['Step C:in_progress'], 'in_progress');
+
+    stepsUpdate(orderStore, 'tc-ord-a', ['Step A:in_progress'], 'completed', { isUpdate: true });
+    expect(planTexts(orderStore)).toEqual(['Step A']);
+    stepsUpdate(orderStore, 'tc-ord-b', ['Step B:in_progress'], 'completed', { isUpdate: true });
+    expect(planTexts(orderStore)).toEqual(['Step B']);
+
+    stepsUpdate(orderStore, 'tc-ord-a', ['Stale A2:done'], 'completed', { isUpdate: true });
+    stepsUpdate(orderStore, 'tc-ord-a', [], 'completed', { isUpdate: true });
+    stepsUpdate(orderStore, 'tc-ord-a', [':done'], 'completed', { isUpdate: true });
+    expect(planTexts(orderStore)).toEqual(['Step B']);
+
+    stepsUpdate(orderStore, 'tc-ord-c', ['Step C:done'], 'completed', { isUpdate: true });
+    expect(planTexts(orderStore)).toEqual(['Step C']);
+
+    // 2. Reverse completion sealing: older `in_progress` completing after newer `steps: []`, `plan_removed`, or empty `plan` stays sealed
+    for (const sealKind of ['steps_empty', 'plan_removed', 'plan_empty'] as const) {
+      const s = new TranscriptStore({ preferNativeSteps: true });
+      s.beginUserTurn('Seal older inflight');
+      stepsUpdate(s, 'tc-seed', ['Seed:in_progress'], 'completed');
+      stepsUpdate(s, 'tc-old-a', ['Stale A:in_progress'], 'in_progress');
+      if (sealKind === 'steps_empty') stepsUpdate(s, 'tc-clear-b', [], 'completed');
+      else if (sealKind === 'plan_removed') s.applySessionUpdate({ sessionUpdate: 'plan_removed' });
+      else s.applySessionUpdate({ sessionUpdate: 'plan', entries: [] });
+      stepsUpdate(s, 'tc-old-a', ['Stale A:done'], 'completed', { isUpdate: true });
+      expect(s.plan).toBeNull();
+      stepsUpdate(s, 'tc-newer-c', ['Fresh C:in_progress'], 'completed');
+      expect(planTexts(s)).toEqual(['Fresh C']);
+    }
+
+    // 3. `failureOutputText` isolates pre-failure preview text and merges distinct post-failure diagnostics without duplication
+    const errStore = new TranscriptStore({ now: () => 55_000 });
+    errStore.applySessionUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Replay preview' } }, { isReplaying: true });
+    mcpUpdate(errStore, 'tc-rep-pre', { op: 'init', items: ['Preview'] }, 'in_progress', { isReplaying: true, text: 'Preview ok' });
+    mcpUpdate(errStore, 'tc-rep-pre', undefined, 'failed', { isUpdate: true, isReplaying: true });
+    expect(errStore.getToolById('tc-rep-pre')?.failureOutputText).toBe('');
+    expect(errStore.getToolById('tc-rep-pre')?.todoSnapshot?.text).toBe('Todo tool call failed.');
+    mcpUpdate(errStore, 'tc-rep-pre', undefined, undefined, { isUpdate: true, isReplaying: true, text: 'Real replay error' });
+    expect(errStore.getToolById('tc-rep-pre')?.failureOutputText).toBe('Real replay error');
+    expect(errStore.getToolById('tc-rep-pre')?.todoSnapshot?.text).toBe('Real replay error');
+    errStore.finalizeReplayedTurns();
+
+    errStore.beginUserTurn('Live multi-line and dual diagnostics');
+    mcpUpdate(errStore, 'tc-live-pre', { op: 'init', items: ['Task M'] }, 'in_progress');
+    liveMcpResult(errStore, 'init', ['Task M:in_progress'], { text: 'Ok preview', rawArgs: { op: 'init', items: ['Task M'] } });
+    mcpUpdate(errStore, 'tc-live-pre', undefined, undefined, { isUpdate: true, text: 'Ok preview' });
+    mcpUpdate(errStore, 'tc-live-pre', undefined, 'failed', { isUpdate: true });
+    expect(errStore.getToolById('tc-live-pre')?.failureOutputText).toBe('');
+    expect(errStore.getToolById('tc-live-pre')?.todoSnapshot?.text).toBe('Todo tool call failed.');
+
+    mcpUpdate(errStore, 'tc-live-pre', undefined, undefined, { isUpdate: true, text: 'Error line 1' });
+    mcpUpdate(errStore, 'tc-live-pre', undefined, undefined, { isUpdate: true, text: 'Error line 2' });
+    expect(errStore.getToolById('tc-live-pre')?.failureOutputText).toBe('Error line 1\nError line 2');
+    expect(errStore.getToolById('tc-live-pre')?.todoSnapshot?.text).toBe('Error line 1\nError line 2');
+
+    for (const d of [
+      { id: 'tc-diag-distinct', text: 'Summary failed', err: 'Detailed root cause', expected: 'Summary failed\nDetailed root cause' },
+      { id: 'tc-diag-dedup', text: 'Duplicate error', err: 'Duplicate error', expected: 'Duplicate error' },
+    ] as const) {
+      mcpUpdate(errStore, d.id, undefined, 'failed', { text: d.text, rawOutput: { error: d.err } });
+      expect(errStore.getToolById(d.id)?.failureOutputText).toBe(d.expected);
+    }
   });
 });
