@@ -1723,9 +1723,6 @@ export class AppController {
         modes: loaded.modes,
         ...(loadedTier ? { tier: loadedTier } : {}),
       });
-      if (this.scheduler.suspended) {
-        this.scheduler.resumeAfterReplay(true);
-      }
 
       this.#bindSessionMetrics(loaded.sessionId, false);
       await this.#syncSessionMetricsFromTranscript();
